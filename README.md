@@ -12,10 +12,11 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
 [![Tokio](https://img.shields.io/badge/async-tokio-blue.svg?style=flat-square)](https://tokio.rs/)
 [![Live venues](https://img.shields.io/badge/live-7_venues-6e40c9.svg?style=flat-square)](#venue-coverage)
-[![Roadmap](https://img.shields.io/badge/roadmap-27+_venues-555.svg?style=flat-square)](#venue-coverage)
+[![Beta venues](https://img.shields.io/badge/beta-2_venues-f5a623.svg?style=flat-square)](#venue-coverage)
+[![Roadmap](https://img.shields.io/badge/roadmap-25+_venues-555.svg?style=flat-square)](#venue-coverage)
 
 > **One execution core. One risk layer. Every venue.**
-> Ten strategy bots run on a single battle-tested engine and a venue-agnostic adapter stack. Adding a market means writing **one adapter** — not rebuilding a bot. Seven venues are live in production today; the rest of the prediction-market universe is adapter-driven roadmap.
+> Ten strategy bots run on a single battle-tested engine and a venue-agnostic adapter stack. Adding a market means writing **one adapter** — not rebuilding a bot. Seven venues are live in production today, two more are in beta with live market data, and the rest of the prediction-market universe is adapter-driven roadmap.
 
 [Strategies](#strategies) • [Venue Coverage](#venue-coverage) • [Engine](#engine) • [Safety](#safety) • [Contact](#contact)
 
@@ -36,7 +37,7 @@ A complete suite of ten production-grade trading bots, each engineered around a 
 |---|----------|------------------|----------|
 | 1 | 🎯 **Copy Trading** | Mirror wallets that already proved they have alpha | Multi-wallet · FAK/GTD · circuit breaker |
 | 2 | ⚡ **BTC 5m / 15m / 1hr Arbitrage** | Speed on short-window BTC Up/Down | ~42ms end-to-end · FAK |
-| 3 | 💰 **Cross-Market Arbitrage** | Lock the spread, not the direction | Polymarket ↔ Kalshi · hedged legs |
+| 3 | 💰 **Cross-Market Arbitrage** | Lock the spread, not the direction | Polymarket ↔ Kalshi ↔ PredictIt · hedged legs |
 | 4 | 🎯 **Directional Arbitrage** | Arb base (Up + Down < $1), then tilt toward the side with more edge | Hedged base · limit-only |
 | 5 | 📈 **Spread Farming** | A thousand 0.5¢ wins compound into one number | Bid-ask capture · per-trade P&L |
 | 6 | 🏆 **Sports Execution** | Click. Filled. Done — under 50ms | NBA / NFL / Soccer · &lt;50ms FAK |
@@ -55,6 +56,10 @@ the rest of the prediction-market landscape is on the adapter-driven roadmap.
 
 **Legend:** 🟢 Live · 🟡 Beta (adapter in testing) · ⚪ Roadmap (adapter-driven)
 
+> 🟡 **Beta = live, verified price data wired into the cross-venue arbitrage engine;
+> full strategy execution still in testing.** PredictIt (real-money) and Manifold
+> (play-money consensus signal) now feed live prices alongside Polymarket and Kalshi.
+
 ### 🟢 Live today
 
 | Venue | Type | Strategies running |
@@ -67,7 +72,7 @@ the rest of the prediction-market landscape is on the adapter-driven roadmap.
 | [**Azuro**](https://github.com/HarrierOnChain/Azuro) | Decentralized protocol | Sports · OBI |
 | [**Myriad Markets**](https://github.com/HarrierOnChain/Myriad-Markets) | Crypto | OBI · Directional Arb |
 
-### Traditional / Regulated — roadmap
+### Traditional / Regulated
 
 | Venue | Type | Status | Best-fit strategies |
 |---|---|---|---|
@@ -78,9 +83,9 @@ the rest of the prediction-market landscape is on the adapter-driven roadmap.
 | [**FanDuel Predicts**](https://github.com/HarrierOnChain/FanDuel-Predicts) | Sports | ⚪ Roadmap | Sports Execution |
 | [**Fanatics Markets**](https://github.com/HarrierOnChain/Fanatics-Markets) | Sports / entertainment | ⚪ Roadmap | Sports Execution |
 | [**Interactive Brokers ForecastTrader**](https://github.com/HarrierOnChain/Interactive-Brokers-ForecastTrader) | Financial events | ⚪ Roadmap | Resolution Sniper · Spread · Market Making |
-| [**PredictIt**](https://github.com/HarrierOnChain/PredictIt) | Academic / US politics | ⚪ Roadmap | Resolution Sniper (research-only, bet caps) |
+| [**PredictIt**](https://github.com/HarrierOnChain/PredictIt) | Academic / US politics | 🟡 Beta | **Cross-Venue Arb — live price data** · Resolution Sniper (research-only, bet caps) |
 
-### Crypto / Decentralized — roadmap
+### Crypto / Decentralized
 
 | Venue | Chain / Type | Status | Best-fit strategies |
 |---|---|---|---|
@@ -88,7 +93,7 @@ the rest of the prediction-market landscape is on the adapter-driven roadmap.
 | [**Zeitgeist**](https://github.com/HarrierOnChain/Zeitgeist) | Polkadot | ⚪ Roadmap | OBI · Market Making |
 | [**Projection Finance**](https://github.com/HarrierOnChain/Projection-Finance) | Volatility / sims | ⚪ Roadmap | Directional Arb · Spread |
 | [**Better Fan**](https://github.com/HarrierOnChain/Better-Fan) | Sports / esports | ⚪ Roadmap | Sports Execution |
-| [**Manifold Markets**](https://github.com/HarrierOnChain/Manifold-Markets) | Play-money | ⚪ Roadmap | Directional Arb (backtest / research sandbox) |
+| [**Manifold Markets**](https://github.com/HarrierOnChain/Manifold-Markets) | Play-money | 🟡 Beta | **Consensus signal — live probability feed** · Directional Arb backtest |
 
 > **Want a venue prioritized?** Adapter work is demand-driven — if you trade a
 > platform not yet live, [reach out](https://t.me/HarrierOnChain) and it can move
