@@ -63,10 +63,30 @@ interface Stat {
   unit: string;
 }
 
+interface ManagedFeature {
+  icon: string;
+  title: string;
+  body: string;
+}
+
+interface ManagedPlan {
+  name: string;
+  price: string;
+  fee: string;
+  forWho: string;
+  highlight?: boolean;
+}
+
+interface ManagedStat {
+  value: string;
+  label: string;
+}
+
 export interface Messages {
   langName: { en: string; zh: string; ru: string };
   nav: {
     strategies: string;
+    managed: string;
     venues: string;
     engine: string;
     safety: string;
@@ -81,13 +101,28 @@ export interface Messages {
     headline: string;
     description: string;
     statusLive: string;
+    statusBeta: string;
     statusRoadmap: string;
+    betaNote: string;
     groupLive: string;
     groupTraditional: string;
     groupCrypto: string;
     cardCta: string;
     footnote: string;
     footnoteCta: string;
+  };
+  managed: {
+    eyebrow: string;
+    headline: string;
+    description: string;
+    statusNote: string;
+    stats: ManagedStat[];
+    featuresTitle: string;
+    features: ManagedFeature[];
+    plansTitle: string;
+    plans: ManagedPlan[];
+    plansNote: string;
+    cta: string;
   };
   hero: {
     badge: string;
@@ -172,6 +207,7 @@ const messages: Record<Lang, Messages> = {
     langName: { en: 'English', zh: '简体中文', ru: 'Русский' },
     nav: {
       strategies: 'Strategies',
+      managed: 'Managed',
       venues: 'Venues',
       engine: 'Engine',
       safety: 'Safety',
@@ -185,15 +221,47 @@ const messages: Record<Lang, Messages> = {
       eyebrow: 'Venue Coverage',
       headline: 'One engine. Every venue.',
       description:
-        'The engine is venue-agnostic — any platform with an order book or position feed plugs in through a single adapter. Seven venues are live in production today; the rest of the prediction-market universe is adapter-driven roadmap. Each venue has its own dedicated bot repo.',
+        'The engine is venue-agnostic — any platform with an order book or position feed plugs in through a single adapter. Seven venues are live in production today, two more are in beta with live market data, and the rest of the prediction-market universe is adapter-driven roadmap. Each venue has its own dedicated bot repo.',
       statusLive: 'Live',
+      statusBeta: 'Beta',
       statusRoadmap: 'Roadmap',
+      betaNote: '🟡 Beta = live, verified price data wired into the cross-venue arbitrage engine; full strategy execution still in testing. PredictIt (real-money) and Manifold (play-money consensus signal) now feed live prices alongside Polymarket and Kalshi.',
       groupLive: '🟢 Live today',
-      groupTraditional: 'Traditional / Regulated — roadmap',
-      groupCrypto: 'Crypto / Decentralized — roadmap',
+      groupTraditional: 'Traditional / Regulated',
+      groupCrypto: 'Crypto / Decentralized',
       cardCta: 'Open repo →',
       footnote: 'Want a venue prioritized? Adapter work is demand-driven — if you trade a platform not yet live, it can move up the queue.',
       footnoteCta: 'Request a venue →',
+    },
+    managed: {
+      eyebrow: 'Managed & Copy-Trading',
+      headline: "Don't want to run infrastructure? Let us.",
+      description:
+        'Trade the same engine as a service. Open a managed account, pick a proven leader from the on-chain leaderboard or a strategy, and let the hosted bots run — you watch balance, P&L, and fees on a live dashboard.',
+      statusNote:
+        '🧪 Early-access beta — paper trading (simulated funds). Explore the full product, the leaderboard, and the economics today with zero capital at risk. Managed live trading with real funds is gated behind the waitlist and not open yet — custody, security audit, and licensing come first.',
+      stats: [
+        { value: '359+', label: 'GitHub stars' },
+        { value: '7 (+2 beta)', label: 'Live venues' },
+        { value: '10', label: 'Strategies' },
+        { value: 'Paper', label: 'Beta mode' },
+      ],
+      featuresTitle: 'What you get',
+      features: [
+        { icon: '📈', title: 'On-chain leaderboard', body: 'Real Polymarket wallets ranked by verifiable on-chain P&L (profit or volume, 1d/7d/30d/all-time). One click to copy a proven trader.' },
+        { icon: '🤖', title: 'Hosted strategy bots', body: 'The same 10-strategy engine, run for you. No keys, no servers, no ops.' },
+        { icon: '💰', title: 'Cross-venue arbitrage', body: 'Live pricing across Polymarket ↔ Kalshi ↔ PredictIt, with Manifold as a play-money consensus signal.' },
+        { icon: '🛡️', title: 'Same safety layer', body: 'Circuit breaker, depth guard, trade floor — the guardrails from the open-source engine, applied to every managed account.' },
+      ],
+      plansTitle: 'Early-access plans',
+      plans: [
+        { name: 'Starter', price: 'Free', fee: 'No performance fee', forWho: 'Learn the bots in paper mode, zero risk' },
+        { name: 'Pro', price: '$49 / mo', fee: '10% (high-water mark)', forWho: 'Hosted bots + more strategies', highlight: true },
+        { name: 'Managed', price: '$199 / mo', fee: '20% (high-water mark)', forWho: 'Full copy-trading, hands-off' },
+      ],
+      plansNote:
+        'Performance fees use a high-water mark — charged only on new profit above your prior peak, never on deposits or on recovering a drawdown. Pricing shown is early-access and paper-beta.',
+      cta: 'Join the early-access waitlist',
     },
     hero: {
       badge: '10 strategies · one battle-tested engine',
@@ -268,14 +336,14 @@ const messages: Record<Lang, Messages> = {
           ],
         },
         'cross-arb': {
-          title: 'Polymarket ↔ Kalshi Cross-Venue Arb',
-          tagline: 'Cross-venue pricing inefficiencies on 15-min windows.',
+          title: 'Cross-Venue Arbitrage',
+          tagline: 'Cross-venue pricing inefficiencies across real-money books.',
           hook: 'Lock the spread, not the direction.',
           description:
-            'Both legs hedged — your P&L is the price gap itself. Monitors the same market on both venues and executes hedged legs when a configurable price delta is detected.',
+            'The same contract is matched across Polymarket, Kalshi and PredictIt (strict matching — no false pairs), and the gap is captured only when it beats round-trip fees. Both legs hedged — your P&L is the price gap itself.',
           specs: [
-            { label: 'Venues', value: 'Polymarket ↔ Kalshi' },
-            { label: 'Edge threshold', value: '≥ 0.8¢ configurable' },
+            { label: 'Venues', value: 'Polymarket ↔ Kalshi ↔ PredictIt' },
+            { label: 'Edge threshold', value: '≥ fees, configurable' },
             { label: 'Logging', value: 'Full P&L tracking' },
           ],
         },
@@ -496,6 +564,7 @@ const messages: Record<Lang, Messages> = {
     langName: { en: 'English', zh: '简体中文', ru: 'Русский' },
     nav: {
       strategies: '策略',
+      managed: '托管服务',
       venues: '平台',
       engine: '引擎',
       safety: '安全',
@@ -509,15 +578,47 @@ const messages: Record<Lang, Messages> = {
       eyebrow: '平台覆盖',
       headline: '一套引擎。覆盖所有平台。',
       description:
-        '引擎与平台无关——任何带订单簿或仓位数据的平台都能通过单个适配器接入。今天有七个平台已在生产环境上线；预测市场宇宙的其余部分都是适配器驱动的路线图。每个平台都有自己专属的机器人仓库。',
+        '引擎与平台无关——任何带订单簿或仓位数据的平台都能通过单个适配器接入。今天有七个平台已在生产环境上线，另有两个平台处于测试阶段并已接入实时市场数据；预测市场宇宙的其余部分都是适配器驱动的路线图。每个平台都有自己专属的机器人仓库。',
       statusLive: '已上线',
+      statusBeta: '测试中',
       statusRoadmap: '路线图',
+      betaNote: '🟡 测试中 = 已接入并验证的实时价格数据，已连入跨平台套利引擎；完整策略执行仍在测试。PredictIt（真钱）与 Manifold（虚拟币共识信号）现已与 Polymarket、Kalshi 一并提供实时价格。',
       groupLive: '🟢 已上线',
-      groupTraditional: '传统 / 合规平台 — 路线图',
-      groupCrypto: '加密 / 去中心化平台 — 路线图',
+      groupTraditional: '传统 / 合规平台',
+      groupCrypto: '加密 / 去中心化平台',
       cardCta: '打开仓库 →',
       footnote: '想优先接入某个平台？适配器开发是需求驱动的——如果你交易的平台尚未上线，它可以往队列前面挪。',
       footnoteCta: '申请接入平台 →',
+    },
+    managed: {
+      eyebrow: '托管与跟单交易',
+      headline: '不想自己运维基础设施？交给我们。',
+      description:
+        '把同一套引擎当作服务来用。开一个托管账户，从链上排行榜挑一位已被验证的领投者或一个策略，让托管机器人替你运行——你只需在实时仪表盘上看余额、P&L 和费用。',
+      statusNote:
+        '🧪 抢先体验测试阶段——纸面交易（模拟资金）。今天就能零风险体验完整产品、排行榜与费用经济模型。使用真实资金的托管实盘交易由候补名单管控、尚未开放——托管、安全审计与合规牌照优先。',
+      stats: [
+        { value: '359+', label: 'GitHub Star' },
+        { value: '7（+2 测试中）', label: '已上线平台' },
+        { value: '10', label: '策略' },
+        { value: '纸面', label: '测试模式' },
+      ],
+      featuresTitle: '你能获得什么',
+      features: [
+        { icon: '📈', title: '链上排行榜', body: '真实的 Polymarket 钱包按可核验的链上 P&L 排名（利润或成交量，1 天 / 7 天 / 30 天 / 全期）。一键跟单已被验证的交易者。' },
+        { icon: '🤖', title: '托管策略机器人', body: '同一套十策略引擎，替你运行。无密钥、无服务器、无运维。' },
+        { icon: '💰', title: '跨平台套利', body: 'Polymarket ↔ Kalshi ↔ PredictIt 的实时价格，并以 Manifold 作为虚拟币共识信号。' },
+        { icon: '🛡️', title: '同一套安全层', body: '熔断器、深度护卫、下单底线——来自开源引擎的护栏，同样应用于每个托管账户。' },
+      ],
+      plansTitle: '抢先体验方案',
+      plans: [
+        { name: 'Starter', price: '免费', fee: '无绩效费', forWho: '在纸面模式下零风险学习机器人' },
+        { name: 'Pro', price: '$49 / 月', fee: '10%（高水位线）', forWho: '托管机器人 + 更多策略', highlight: true },
+        { name: 'Managed', price: '$199 / 月', fee: '20%（高水位线）', forWho: '全策略跟单、彻底放手' },
+      ],
+      plansNote:
+        '绩效费采用高水位线——只对超过历史峰值的新利润收费，绝不对入金或回撤修复收费。所示价格为抢先体验与纸面测试期定价。',
+      cta: '加入抢先体验候补名单',
     },
     hero: {
       badge: '十款策略 · 同一套久经实战的引擎',
@@ -592,14 +693,14 @@ const messages: Record<Lang, Messages> = {
           ],
         },
         'cross-arb': {
-          title: 'Polymarket ↔ Kalshi 跨平台套利',
-          tagline: '15 分钟窗口下的跨平台定价偏差。',
+          title: '跨平台套利',
+          tagline: '真钱订单簿之间的跨平台定价偏差。',
           hook: '锁定的是价差，不是方向。',
           description:
-            '双腿对冲——你的盈亏来自价差本身。同时监控两个平台上的同一市场，价差达到阈值时执行对冲腿。',
+            '在 Polymarket、Kalshi 与 PredictIt 之间严格匹配同一份合约（严格匹配——不制造虚假配对），仅在价差覆盖来回手续费时才捕获。双腿对冲——你的盈亏来自价差本身。',
           specs: [
-            { label: '平台', value: 'Polymarket ↔ Kalshi' },
-            { label: '价差阈值', value: '≥ 0.8¢ 可配置' },
+            { label: '平台', value: 'Polymarket ↔ Kalshi ↔ PredictIt' },
+            { label: '价差阈值', value: '≥ 手续费，可配置' },
             { label: '日志', value: '完整盈亏追踪' },
           ],
         },
@@ -818,6 +919,7 @@ const messages: Record<Lang, Messages> = {
     langName: { en: 'English', zh: '简体中文', ru: 'Русский' },
     nav: {
       strategies: 'Стратегии',
+      managed: 'Сервис',
       venues: 'Площадки',
       engine: 'Движок',
       safety: 'Безопасность',
@@ -831,15 +933,47 @@ const messages: Record<Lang, Messages> = {
       eyebrow: 'Покрытие площадок',
       headline: 'Один движок. Все площадки.',
       description:
-        'Движок не зависит от площадки — любая платформа со стаканом заявок или фидом позиций подключается через один адаптер. Семь площадок уже работают в продакшене; остальная вселенная рынков предсказаний — план, управляемый адаптерами. У каждой площадки свой отдельный репозиторий бота.',
+        'Движок не зависит от площадки — любая платформа со стаканом заявок или фидом позиций подключается через один адаптер. Семь площадок уже работают в продакшене, ещё две — в бете с живыми рыночными данными; остальная вселенная рынков предсказаний — план, управляемый адаптерами. У каждой площадки свой отдельный репозиторий бота.',
       statusLive: 'Активна',
+      statusBeta: 'Бета',
       statusRoadmap: 'В плане',
+      betaNote: '🟡 Бета = живые, проверенные ценовые данные, подключённые к движку межплощадочного арбитража; полное исполнение стратегий ещё в тестировании. PredictIt (реальные деньги) и Manifold (сигнал консенсуса на игровые деньги) теперь дают живые цены наряду с Polymarket и Kalshi.',
       groupLive: '🟢 Активны сегодня',
-      groupTraditional: 'Традиционные / регулируемые — план',
-      groupCrypto: 'Крипто / децентрализованные — план',
+      groupTraditional: 'Традиционные / регулируемые',
+      groupCrypto: 'Крипто / децентрализованные',
       cardCta: 'Открыть репозиторий →',
       footnote: 'Хотите приоритет для площадки? Работа над адаптерами определяется спросом — если вы торгуете на платформе, которой ещё нет, она может подняться в очереди.',
       footnoteCta: 'Запросить площадку →',
+    },
+    managed: {
+      eyebrow: 'Управляемый сервис и копи-трейдинг',
+      headline: 'Не хотите держать инфраструктуру? Доверьте нам.',
+      description:
+        'Торгуйте на том же движке как на сервисе. Откройте управляемый счёт, выберите проверенного лидера из ончейн-рейтинга или стратегию, и пусть боты на хостинге работают за вас — вы следите за балансом, P&L и комиссиями на живой панели.',
+      statusNote:
+        '🧪 Ранний доступ, бета — бумажная торговля (симулированные средства). Уже сегодня можно изучить весь продукт, рейтинг и экономику без риска капитала. Управляемая реальная торговля с настоящими деньгами закрыта списком ожидания и пока не открыта — сначала кастодиан, аудит безопасности и лицензирование.',
+      stats: [
+        { value: '359+', label: 'звёзд GitHub' },
+        { value: '7 (+2 бета)', label: 'активных площадок' },
+        { value: '10', label: 'стратегий' },
+        { value: 'Бумага', label: 'режим беты' },
+      ],
+      featuresTitle: 'Что вы получаете',
+      features: [
+        { icon: '📈', title: 'Ончейн-рейтинг', body: 'Реальные кошельки Polymarket, ранжированные по проверяемому ончейн P&L (прибыль или объём, 1д/7д/30д/всё время). Копирование проверенного трейдера в один клик.' },
+        { icon: '🤖', title: 'Управляемые боты стратегий', body: 'Тот же движок из 10 стратегий, запущенный за вас. Без ключей, серверов и эксплуатации.' },
+        { icon: '💰', title: 'Межплощадочный арбитраж', body: 'Живые цены на Polymarket ↔ Kalshi ↔ PredictIt, с Manifold как сигналом консенсуса на игровые деньги.' },
+        { icon: '🛡️', title: 'Тот же слой безопасности', body: 'Предохранитель, защита глубины, минимум сделки — гардрейлы из открытого движка, применённые к каждому управляемому счёту.' },
+      ],
+      plansTitle: 'Планы раннего доступа',
+      plans: [
+        { name: 'Starter', price: 'Бесплатно', fee: 'Без комиссии за результат', forWho: 'Освоить ботов в бумажном режиме, без риска' },
+        { name: 'Pro', price: '$49 / мес', fee: '10% (high-water mark)', forWho: 'Боты на хостинге + больше стратегий', highlight: true },
+        { name: 'Managed', price: '$199 / мес', fee: '20% (high-water mark)', forWho: 'Полный копи-трейдинг, без рук' },
+      ],
+      plansNote:
+        'Комиссия за результат считается по high-water mark — берётся только с новой прибыли выше прежнего пика, никогда с депозитов или с восстановления просадки. Указанные цены — для раннего доступа и бумажной беты.',
+      cta: 'Встать в список раннего доступа',
     },
     hero: {
       badge: '10 стратегий · один проверенный в бою движок',
@@ -914,14 +1048,14 @@ const messages: Record<Lang, Messages> = {
           ],
         },
         'cross-arb': {
-          title: 'Межплощадочный арбитраж Polymarket ↔ Kalshi',
-          tagline: 'Ценовые неэффективности между площадками на 15-минутных окнах.',
+          title: 'Межплощадочный арбитраж',
+          tagline: 'Ценовые неэффективности между реально-денежными стаканами.',
           hook: 'Фиксируйте спред, а не направление.',
           description:
-            'Обе ноги хеджированы — ваш P&L и есть ценовой разрыв. Мониторит один и тот же рынок на обеих площадках и исполняет хеджированные ноги при заданной разнице цен.',
+            'Один и тот же контракт сопоставляется между Polymarket, Kalshi и PredictIt (строгое сопоставление — без ложных пар), и разрыв захватывается только когда он превышает комиссии на оба конца. Обе ноги хеджированы — ваш P&L и есть ценовой разрыв.',
           specs: [
-            { label: 'Площадки', value: 'Polymarket ↔ Kalshi' },
-            { label: 'Порог преимущества', value: '≥ 0.8¢ настраиваемо' },
+            { label: 'Площадки', value: 'Polymarket ↔ Kalshi ↔ PredictIt' },
+            { label: 'Порог преимущества', value: '≥ комиссий, настраиваемо' },
             { label: 'Логи', value: 'Полный учёт P&L' },
           ],
         },

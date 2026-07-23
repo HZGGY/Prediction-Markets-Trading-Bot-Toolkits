@@ -25,10 +25,14 @@ export function VenuesSection() {
   return (
     <section id="venues" className="py-24 border-t border-border-subtle">
       <div className="container-x">
-        <div className="max-w-3xl mb-16">
+        <div className="max-w-3xl mb-10">
           <div className="text-sm font-semibold text-emerald-400 uppercase tracking-wider mb-3">{t.venues.eyebrow}</div>
           <h2 className="text-4xl md:text-5xl font-bold tracking-tight mb-5">{t.venues.headline}</h2>
           <p className="text-lg text-zinc-400 leading-relaxed">{t.venues.description}</p>
+        </div>
+
+        <div className="max-w-3xl mb-14 rounded-xl border border-amber-500/25 bg-amber-500/5 px-5 py-4 text-sm text-amber-200/90 leading-relaxed">
+          {t.venues.betaNote}
         </div>
 
         <div className="space-y-12">
@@ -62,8 +66,16 @@ export function VenuesSection() {
 function VenueCard({ venue }: { venue: VenueMeta }) {
   const t = useT();
   const { lang } = useLang();
-  const live = venue.status === 'live';
-  const statusLabel = live ? t.venues.statusLive : t.venues.statusRoadmap;
+  const status = venue.status;
+  const statusLabel =
+    status === 'live' ? t.venues.statusLive : status === 'beta' ? t.venues.statusBeta : t.venues.statusRoadmap;
+  const pillClass =
+    status === 'live'
+      ? 'bg-emerald-500/10 text-emerald-400'
+      : status === 'beta'
+        ? 'bg-amber-500/10 text-amber-400'
+        : 'bg-zinc-500/10 text-zinc-400';
+  const dotClass = status === 'live' ? 'bg-emerald-400' : status === 'beta' ? 'bg-amber-400' : 'bg-zinc-500';
 
   return (
     <a
@@ -85,11 +97,9 @@ function VenueCard({ venue }: { venue: VenueMeta }) {
           <h4 className="font-bold text-white leading-tight truncate">{venue.name}</h4>
         </div>
         <span
-          className={`shrink-0 inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] font-semibold ${
-            live ? 'bg-emerald-500/10 text-emerald-400' : 'bg-zinc-500/10 text-zinc-400'
-          }`}
+          className={`shrink-0 inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] font-semibold ${pillClass}`}
         >
-          <span className={`w-1.5 h-1.5 rounded-full ${live ? 'bg-emerald-400' : 'bg-zinc-500'}`} />
+          <span className={`w-1.5 h-1.5 rounded-full ${dotClass}`} />
           {statusLabel}
         </span>
       </div>

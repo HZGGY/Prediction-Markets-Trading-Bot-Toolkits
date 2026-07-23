@@ -36,7 +36,7 @@ export const TELEGRAM_URL = 'https://t.me/HarrierOnChain';
 export const GITHUB_OWNER = 'HarrierOnChain';
 export const GITHUB_URL = `https://github.com/${GITHUB_OWNER}/Prediction-Markets-Trading-Bot-Toolkits`;
 
-export type VenueStatus = 'live' | 'roadmap';
+export type VenueStatus = 'live' | 'beta' | 'roadmap';
 export type VenueGroup = 'live' | 'traditional' | 'crypto';
 
 export interface VenueMeta {
@@ -88,8 +88,8 @@ export const venues: VenueMeta[] = [
   { repo: 'Interactive-Brokers-ForecastTrader', name: 'Interactive Brokers ForecastTrader', group: 'traditional', status: 'roadmap', domain: 'interactivebrokers.com',
     strategies: ['resolution-sniper', 'spread-farming', 'market-making'],
     type: { en: 'Financial events', zh: '金融事件', ru: 'Финансовые события' } },
-  { repo: 'PredictIt', name: 'PredictIt', group: 'traditional', status: 'roadmap', domain: 'predictit.org',
-    strategies: ['resolution-sniper'],
+  { repo: 'PredictIt', name: 'PredictIt', group: 'traditional', status: 'beta', domain: 'predictit.org',
+    strategies: ['cross-arb', 'resolution-sniper'],
     type: { en: 'Academic / US politics', zh: '学术 / 美国政治', ru: 'Академическая / политика США' } },
 
   { repo: 'Drift-BET', name: 'Drift BET', group: 'live', status: 'live', domain: 'drift.trade',
@@ -116,9 +116,9 @@ export const venues: VenueMeta[] = [
   { repo: 'Better-Fan', name: 'Better Fan', group: 'crypto', status: 'roadmap', domain: 'better.fan',
     strategies: ['sports'],
     type: { en: 'Sports / esports', zh: '体育 / 电竞', ru: 'Спорт / киберспорт' } },
-  { repo: 'Manifold-Markets', name: 'Manifold Markets', group: 'crypto', status: 'roadmap', domain: 'manifold.markets',
+  { repo: 'Manifold-Markets', name: 'Manifold Markets', group: 'crypto', status: 'beta', domain: 'manifold.markets',
     strategies: ['directional-arb'],
-    type: { en: 'Play-money', zh: '虚拟币（玩乐性质）', ru: 'Игровые деньги' } },
+    type: { en: 'Play-money · consensus signal', zh: '虚拟币 · 共识信号', ru: 'Игровые деньги · сигнал консенсуса' } },
 ];
 
 export interface AccentSet {
