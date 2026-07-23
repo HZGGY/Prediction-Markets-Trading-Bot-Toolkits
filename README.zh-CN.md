@@ -9,6 +9,7 @@
 
 [![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 [![Rust CI](https://github.com/HarrierOnChain/Prediction-Markets-Trading-Bot-Toolkits/actions/workflows/rust.yml/badge.svg)](https://github.com/HarrierOnChain/Prediction-Markets-Trading-Bot-Toolkits/actions/workflows/rust.yml)
+[![Stars](https://img.shields.io/github/stars/HarrierOnChain/Prediction-Markets-Trading-Bot-Toolkits?style=flat-square&color=6e40c9)](https://github.com/HarrierOnChain/Prediction-Markets-Trading-Bot-Toolkits/stargazers)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
 [![Tokio](https://img.shields.io/badge/async-tokio-blue.svg?style=flat-square)](https://tokio.rs/)
 [![Live venues](https://img.shields.io/badge/已上线-7_平台-6e40c9.svg?style=flat-square)](#平台覆盖)
@@ -18,9 +19,76 @@
 > **一套执行核心。一套风控层。覆盖所有平台。**
 > 十款策略机器人运行在同一套久经实战的引擎与平台无关的适配层之上。接入一个新市场只需写**一个适配器**——而不是重建一个机器人。今天有七个平台已在生产环境上线，另有两个平台处于测试阶段并已接入实时市场数据；预测市场宇宙的其余部分都是适配器驱动的路线图。
 
-[策略](#策略) • [平台覆盖](#平台覆盖) • [引擎](#引擎) • [安全](#安全) • [联系方式](#联系方式)
+<br/>
+
+[![在 Telegram 联系](https://img.shields.io/badge/💬_在_Telegram_联系-@HarrierOnChain-229ED9?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/HarrierOnChain)
+&nbsp;
+[![抢先体验](https://img.shields.io/badge/🚀_托管_%2F_跟单交易-抢先体验-a855f7?style=for-the-badge)](https://t.me/HarrierOnChain)
+
+**[快速开始](#-快速开始) • [策略](#策略) • [托管服务](#-托管与跟单交易抢先体验) • [平台覆盖](#平台覆盖) • [引擎](#引擎) • [安全](#安全) • [联系方式](#联系方式)**
 
 **🌐 Language / 语言 / Язык:** [English](README.md) • [简体中文](#预测市场工具包) • [Русский](README.ru.md)
+
+</div>
+
+---
+
+## 🚀 快速开始
+
+用本工具包交易有两种方式——**自己运行**，或**让我们替你运行**。
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+### 🛠️ 自己运行机器人
+
+开源引擎，你的密钥，你的钱包。
+
+```bash
+# 1. 克隆一个平台仓库（以 Polymarket 为例）
+git clone https://github.com/HarrierOnChain/Polymarket
+cd Polymarket
+
+# 2. 配置——复制示例
+cp config.example.yaml config.yaml
+
+# 3. 先空跑（不真正下单）
+cargo run --release -- run copy-trading
+```
+
+每款机器人默认 `enable_trading: false`——完整执行链路会一直空跑，直到**你**亲手打开实盘。各平台配置与图文讲解见对应的[平台仓库](#平台覆盖)。
+
+</td>
+<td width="50%" valign="top">
+
+### 💼 让我们替你运行
+
+托管账户 + 跟单交易，全程托管。无需搭建，无需管理密钥。
+
+- 从链上排行榜挑一位**已被验证的领投者**，或挑一个策略
+- 我们运行机器人；你只需盯着仪表盘
+- 分级订阅 + 绩效费——[查看方案](#-托管与跟单交易抢先体验)
+
+> 🧪 **处于抢先体验测试阶段（纸面交易）。** 目前为模拟资金；托管实盘交易正在向候补名单逐步开放。
+
+**[→ 在 Telegram 加入抢先体验候补名单](https://t.me/HarrierOnChain)**
+
+</td>
+</tr>
+</table>
+
+---
+
+## 数据一览
+
+<div align="center">
+
+| ⭐ Star | 🍴 Fork | 🟢 已上线平台 | 🎯 策略 | ⚙️ 引擎 | 🧪 空跑 |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| **359+** | **239+** | **7**（+2 测试中） | **10** | **Rust · <1ms/事件** | **全链路** |
+
+*只用真实、诚实的信号——上方的 [GitHub Star](https://github.com/HarrierOnChain/Prediction-Markets-Trading-Bot-Toolkits/stargazers)、CI 状态与平台数量都可自行核验。没有虚假好评，没有挑拣过的 P&L。*
 
 </div>
 
@@ -29,7 +97,6 @@
 ## 策略
 
 完整的十款生产级交易机器人组合，每一款都围绕一个清晰、独立的市场优势精心打造。所有策略共享同一套久经实战的执行核心、风控层与平台无关的适配层——你获得的是一致的性能表现、统一的风险控制、以及覆盖全部玩法的统一运维界面。挑一个匹配你判断的优势上场；底层基础设施已经为你搭好了。
-
 
 > 📦 **完整的图文讲解、截图与各平台配置都放在每个市场各自的专属仓库里** —— 目录见 [平台覆盖](#平台覆盖)。下表是策略索引；每款机器人都运行在共享引擎与[安全层](#安全)之上，并完整支持空跑模式。
 
@@ -45,6 +112,62 @@
 | 8 | 📊 **订单簿失衡** | 信号本身就是订单簿——无需外部数据源 | 实时 OBI · 500ms 刷新 |
 | 9 | 💰 **做市商** | 当庄家，不当赌客 | 双边 GTD · 库存倾斜 |
 | 10 | ⚡ **链上鲸鱼信号** | 比公开仓位 API 早 3–30 秒 | Polygon 区块订阅 · ABI calldata 解码 |
+
+<details>
+<summary><b>几款旗舰优势的实际原理</b>（点击展开）</summary>
+
+<br/>
+
+**🎯 跟单交易 ——** 把机器人指向一个或多个链上战绩过硬的钱包，它会按你设定的规模镜像其成交，配有每钱包上限、FAK/GTD 订单类型，以及在异常爆发时暂停的熔断器。搭配[链上排行榜](#-托管与跟单交易抢先体验)来挑选跟谁。
+
+**💰 跨平台套利 ——** 同一个现实问题常常同时挂在 Polymarket、Kalshi *和* PredictIt 上，价格略有差异。引擎会在各平台间**严格匹配同一份合约**（严格匹配——不制造虚假配对），并**仅在价差覆盖来回手续费时**才捕获它。跨平台市场大多是有效的，所以这是耐心游戏：它等待真正的错位，而不是硬凑交易。
+
+**🎯 方向性套利 ——** 当 Yes + No 组合价低于 \$1 时买入（结构性套利底仓），再把额外仓位向更有上行空间的一侧倾斜。仅限价单、对冲底仓——用结构而非直觉来提升期望值。
+
+**🎯 结算狙击 ——** 扫描近乎确定（如 95¢+）、市场实质已定但尚未派息的合约，持有到 \$1.00。高胜率、单笔低收益——靠成交量复利，而不是靠大幅波动。
+
+**📊 订单簿失衡 ——** 无外部数据源、无预言机：信号本身就是订单簿。近盘口买卖深度的倾斜成为短线方向判断，每 500ms 刷新一次。
+
+</details>
+
+<div align="center">
+
+💬 **想针对你的平台或资金规模详解某个策略？** → **[t.me/HarrierOnChain](https://t.me/HarrierOnChain)**
+
+</div>
+
+---
+
+## 💼 托管与跟单交易（抢先体验）
+
+**不想自己运维基础设施？** 把同一套引擎当作服务来用。开一个托管账户，挑一位已被验证的领投者或一个策略，让托管机器人替你运行——你只需在实时仪表盘上看余额、P&L 和费用的变化。
+
+> 🧪 **状态：抢先体验测试阶段——纸面交易（模拟资金）。** 你今天就能零风险地体验完整产品、排行榜与费用经济模型。**使用真实资金的托管*实盘*交易由候补名单管控，尚未开放**——托管、安全审计与合规牌照优先。在这些完成之前，我们绝不碰真钱。
+
+### 你能获得什么
+
+| | |
+|---|---|
+| 📈 **链上排行榜** | 真实的 Polymarket 钱包按可核验的**链上 P&L**排名（利润或成交量，1 天 / 7 天 / 30 天 / 全期）。一键跟单已被验证的交易者。 |
+| 🤖 **托管策略机器人** | 同一套十策略引擎，替你运行。无密钥、无服务器、无运维。 |
+| 💰 **跨平台套利** | **Polymarket ↔ Kalshi ↔ PredictIt** 的实时价格，并以 Manifold 作为虚拟币共识信号。 |
+| 🛡️ **同一套安全层** | 熔断器、深度护卫、下单底线——来自开源引擎的护栏，同样应用于每个托管账户。 |
+
+### 抢先体验方案
+
+| 方案 | 价格 | 绩效费 | 适合谁 |
+|---|---|---|---|
+| 🆓 **Starter** | 免费 | — | 在**纸面模式**下零风险学习机器人 |
+| 🔥 **Pro** | \$49 / 月 | 10%（高水位线） | 想要托管机器人 + 更多策略的自主交易者 |
+| 💎 **Managed** | \$199 / 月 | 20%（高水位线） | 全策略跟单、彻底放手 |
+
+*绩效费采用**高水位线**——只对超过历史峰值的新利润收费，绝不对你自己的入金或回撤修复收费。所示价格为抢先体验与纸面测试期定价。*
+
+<div align="center">
+
+[![加入候补名单](https://img.shields.io/badge/🚀_加入抢先体验候补名单-Telegram-229ED9?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/HarrierOnChain)
+
+</div>
 
 ---
 
@@ -94,11 +217,13 @@
 | **Manifold Markets** | 虚拟币（玩乐性质） | 🟡 测试中 | **共识信号——实时概率数据** · 方向性套利回测 |
 
 > **想优先接入某个平台？** 适配器开发是需求驱动的——如果你交易的平台尚未上线，
-> [联系我](https://t.me/HarrierOnChain)，它就能往队列前面挪。
+> [在 Telegram 联系我](https://t.me/HarrierOnChain)，它就能往队列前面挪。
 
 ---
 
 ## 引擎
+
+Rust 编写，基于 Tokio 异步，一套执行核心支撑所有策略与所有平台。适配层意味着接入新市场只需一个适配器——而不是一个新机器人。
 
 ### 性能
 
@@ -137,16 +262,18 @@
 
 ## 联系方式
 
-项目正在持续维护与开发中。如果你也在做 Polymarket 工具、算法策略，或想合作：
+项目正在持续维护与开发中。无论你想**运行机器人**、**加入托管抢先体验候补名单**、请求**新的平台适配器**，还是想聊聊 Polymarket 工具与算法策略——都欢迎联系。
 
 <div align="center">
 
+[![在 Telegram 联系](https://img.shields.io/badge/💬_Telegram-@HarrierOnChain-229ED9?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/HarrierOnChain)
+
 | 平台 | 链接 |
 |------|------|
+| **Telegram** | [t.me/HarrierOnChain](https://t.me/HarrierOnChain) |
 | **讨论区** | [GitHub Discussions](../../discussions) |
-| **Telegram** | [@HarrierOnChain](https://t.me/HarrierOnChain) |
 
-*响应时间通常在数小时内。欢迎提问、反馈与正经合作。*
+*响应时间通常在数小时内。欢迎提问、反馈、平台请求与正经合作。*
 
 </div>
 
@@ -154,13 +281,14 @@
 
 ## 免责声明
 
-> 在预测市场交易涉及真实的财务风险。本软件按"原样"提供，不附带任何形式的担保或对结果的保证，且不构成投资建议。投入真实资金前，请务必先以 `enable_trading: false` 进行充分测试。请确保遵守 Polymarket 的服务条款以及你所在司法管辖区的相关法规。
+> 在预测市场交易涉及真实的财务风险。本软件按"原样"提供，不附带任何形式的担保或对结果的保证，且不构成投资建议。投入真实资金前，请务必先以 `enable_trading: false` 进行充分测试。**托管 / 跟单交易服务处于抢先体验测试阶段，运行于纸面模式（模拟资金）**——它不托管真实资金，任何实盘上线都将先行完成托管、审计与合规牌照。请确保遵守各平台的服务条款以及你所在司法管辖区的相关法规。
 
 ---
 
 <div align="center">
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
+[![Telegram](https://img.shields.io/badge/💬_Telegram-@HarrierOnChain-229ED9?style=flat-square&logo=telegram&logoColor=white)](https://t.me/HarrierOnChain)
 
 **为 Polymarket、Kalshi、Limitless 等预测市场社区而构建**
 

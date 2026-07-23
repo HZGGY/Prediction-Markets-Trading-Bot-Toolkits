@@ -9,6 +9,7 @@
 
 [![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 [![Rust CI](https://github.com/HarrierOnChain/Prediction-Markets-Trading-Bot-Toolkits/actions/workflows/rust.yml/badge.svg)](https://github.com/HarrierOnChain/Prediction-Markets-Trading-Bot-Toolkits/actions/workflows/rust.yml)
+[![Stars](https://img.shields.io/github/stars/HarrierOnChain/Prediction-Markets-Trading-Bot-Toolkits?style=flat-square&color=6e40c9)](https://github.com/HarrierOnChain/Prediction-Markets-Trading-Bot-Toolkits/stargazers)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
 [![Tokio](https://img.shields.io/badge/async-tokio-blue.svg?style=flat-square)](https://tokio.rs/)
 [![Live venues](https://img.shields.io/badge/live-7_venues-6e40c9.svg?style=flat-square)](#venue-coverage)
@@ -18,9 +19,76 @@
 > **One execution core. One risk layer. Every venue.**
 > Ten strategy bots run on a single battle-tested engine and a venue-agnostic adapter stack. Adding a market means writing **one adapter** — not rebuilding a bot. Seven venues are live in production today, two more are in beta with live market data, and the rest of the prediction-market universe is adapter-driven roadmap.
 
-[Strategies](#strategies) • [Venue Coverage](#venue-coverage) • [Engine](#engine) • [Safety](#safety) • [Contact](#contact)
+<br/>
+
+[![Chat on Telegram](https://img.shields.io/badge/💬_Chat_on_Telegram-@HarrierOnChain-229ED9?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/HarrierOnChain)
+&nbsp;
+[![Get Early Access](https://img.shields.io/badge/🚀_Managed_%2F_Copy--Trading-Early_Access-a855f7?style=for-the-badge)](https://t.me/HarrierOnChain)
+
+**[Quick Start](#-quick-start) • [Strategies](#strategies) • [Managed Service](#-managed--copy-trading--early-access) • [Venue Coverage](#venue-coverage) • [Engine](#engine) • [Safety](#safety) • [Contact](#contact)**
 
 **🌐 Language / 语言 / Язык:** [English](#prediction-market-toolkits) • [简体中文](README.zh-CN.md) • [Русский](README.ru.md)
+
+</div>
+
+---
+
+## 🚀 Quick Start
+
+Two ways to trade with the toolkit — **run it yourself**, or **let us run it for you**.
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+### 🛠️ Run the bots yourself
+
+Open-source engine, your keys, your wallet.
+
+```bash
+# 1. Grab a venue repo (Polymarket shown)
+git clone https://github.com/HarrierOnChain/Polymarket
+cd Polymarket
+
+# 2. Configure — copy the example
+cp config.example.yaml config.yaml
+
+# 3. Dry-run first (no real orders)
+cargo run --release -- run copy-trading
+```
+
+Every bot ships with `enable_trading: false` by default — the full execution path runs in dry-run until *you* flip it. Per-venue configs and walkthroughs live in each [venue repo](#venue-coverage).
+
+</td>
+<td width="50%" valign="top">
+
+### 💼 Let us run them for you
+
+Managed accounts + copy-trading, hosted. No setup, no keys to manage.
+
+- Pick a **proven leader** from the on-chain leaderboard, or a strategy
+- We run the bots; you keep an eye on the dashboard
+- Tiered subscription + performance fee — [see plans](#-managed--copy-trading--early-access)
+
+> 🧪 **In early-access beta (paper trading).** Simulated funds today; managed live trading is rolling out to the waitlist.
+
+**[→ Join the early-access waitlist on Telegram](https://t.me/HarrierOnChain)**
+
+</td>
+</tr>
+</table>
+
+---
+
+## By the numbers
+
+<div align="center">
+
+| ⭐ Stars | 🍴 Forks | 🟢 Live venues | 🎯 Strategies | ⚙️ Engine | 🧪 Dry-run |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| **359+** | **239+** | **7** (+2 beta) | **10** | **Rust · <1ms/event** | **Every path** |
+
+*Real, honest signals only — [GitHub stars](https://github.com/HarrierOnChain/Prediction-Markets-Trading-Bot-Toolkits/stargazers), CI status, and venue counts you can verify above. No fake testimonials, no cherry-picked P&L.*
 
 </div>
 
@@ -29,7 +97,6 @@
 ## Strategies
 
 A complete suite of ten production-grade trading bots, each engineered around a distinct, well-defined market edge. Every strategy runs on the same battle-tested execution core, risk layer, and venue-agnostic adapter stack — so you get consistent performance, unified risk controls, and a single operational surface across every play in the book. Pick the edge that fits your thesis; the infrastructure is already built.
-
 
 > 📦 **Full walkthroughs, screenshots, and per-venue configs live in each market's dedicated repo** — see [Venue Coverage](#venue-coverage) for the directory. The table below is the strategy index; every bot runs on the shared engine and [safety layer](#safety), with full dry-run support.
 
@@ -45,6 +112,62 @@ A complete suite of ten production-grade trading bots, each engineered around a 
 | 8 | 📊 **Orderbook Imbalance** | The signal *is* the order book — no external feeds | Live OBI · 500ms refresh |
 | 9 | 💰 **Market Making** | Be the house, not the gambler | Two-sided GTD · inventory skew |
 | 10 | ⚡ **On-Chain Whale Signal** | 3–30s ahead of the public positions API | Polygon block sub · ABI calldata decode |
+
+<details>
+<summary><b>How the flagship edges actually work</b> (click to expand)</summary>
+
+<br/>
+
+**🎯 Copy Trading —** Point the bot at one or more wallets with a proven on-chain record. It mirrors their fills at your chosen scale, with per-wallet caps, FAK/GTD order types, and a circuit breaker that halts on abnormal bursts. Pair it with the [on-chain leaderboard](#-managed--copy-trading--early-access) to pick who to follow.
+
+**💰 Cross-Market Arbitrage —** The same real-world question is often listed on Polymarket, Kalshi *and* PredictIt at slightly different prices. The engine matches the same contract across venues (strict matching — no fuzzy false pairs), and captures the gap **only when it beats round-trip fees**. Cross-listed markets are mostly efficient, so this is a patience game: it waits for a real dislocation instead of forcing trades.
+
+**🎯 Directional Arbitrage —** Buy the Yes + No basket while it costs under \$1 (a structural arb base), then tilt extra size onto the side with more upside. Limit-only, hedged base — structure improves expected value instead of betting on a hunch.
+
+**🎯 Resolution Sniper —** Scan for near-certainty contracts (e.g. 95¢+) where the market has effectively resolved but hasn't paid out, and hold to \$1.00. High win-rate, low per-trade return — it compounds on volume, not on swings.
+
+**📊 Orderbook Imbalance —** No external feeds, no oracle: the signal *is* the book. Near-touch bid/ask depth skew becomes a short-term directional read, refreshed every 500ms.
+
+</details>
+
+<div align="center">
+
+💬 **Want a strategy explained for your venue or capital size?** → **[t.me/HarrierOnChain](https://t.me/HarrierOnChain)**
+
+</div>
+
+---
+
+## 💼 Managed & Copy-Trading — Early Access
+
+**Don't want to run infrastructure?** Trade the same engine as a service. Open a managed account, pick a proven leader or a strategy, and let the hosted bots run — you watch balance, P&L, and fees update on a live dashboard.
+
+> 🧪 **Status: early-access beta — paper trading (simulated funds).** You can explore the full product, the leaderboard, and the economics today with zero capital at risk. **Managed *live* trading with real funds is gated behind the waitlist** and is not open yet — custody, security audit, and licensing come first. We will not touch real money before that's done.
+
+### What you get
+
+| | |
+|---|---|
+| 📈 **On-chain leaderboard** | Real Polymarket wallets ranked by verifiable **on-chain P&L** (profit or volume, 1d/7d/30d/all-time). One click to copy a proven trader. |
+| 🤖 **Hosted strategy bots** | The same 10-strategy engine, run for you. No keys, no servers, no ops. |
+| 💰 **Cross-venue arbitrage** | Live pricing across **Polymarket ↔ Kalshi ↔ PredictIt**, with Manifold as a play-money consensus signal. |
+| 🛡️ **Same safety layer** | Circuit breaker, depth guard, trade floor — the guardrails from the open-source engine, applied to every managed account. |
+
+### Early-access plans
+
+| Plan | Price | Performance fee | Best for |
+|---|---|---|---|
+| 🆓 **Starter** | Free | — | Learn the bots in **paper mode**, zero risk |
+| 🔥 **Pro** | \$49 / mo | 10% (high-water mark) | Self-directed traders who want hosted bots + more strategies |
+| 💎 **Managed** | \$199 / mo | 20% (high-water mark) | Full copy-trading across all strategies, hands-off |
+
+*Performance fees use a **high-water mark** — you're only charged on new profit above your prior peak, never on your own deposits or on recovering a drawdown. Pricing shown is early-access and paper-beta.*
+
+<div align="center">
+
+[![Join the waitlist](https://img.shields.io/badge/🚀_Join_the_Early--Access_Waitlist-Telegram-229ED9?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/HarrierOnChain)
+
+</div>
 
 ---
 
@@ -96,12 +219,14 @@ the rest of the prediction-market landscape is on the adapter-driven roadmap.
 | [**Manifold Markets**](https://github.com/HarrierOnChain/Manifold-Markets) | Play-money | 🟡 Beta | **Consensus signal — live probability feed** · Directional Arb backtest |
 
 > **Want a venue prioritized?** Adapter work is demand-driven — if you trade a
-> platform not yet live, [reach out](https://t.me/HarrierOnChain) and it can move
+> platform not yet live, [reach out on Telegram](https://t.me/HarrierOnChain) and it can move
 > up the queue.
 
 ---
 
 ## Engine
+
+Rust, async on Tokio, one execution core behind every strategy and venue. The adapter stack means a new market is one adapter — not a new bot.
 
 ### Performance
 
@@ -140,16 +265,18 @@ The circuit breaker fires when consecutive large trades exceed the configured th
 
 ## Contact
 
-Built and maintained actively. If you're working on Polymarket tooling, algorithmic strategies, or want to collaborate:
+Built and maintained actively. Whether you want to **run the bots**, **join the managed early-access waitlist**, request a **new venue adapter**, or just talk Polymarket tooling and algorithmic strategies — reach out.
 
 <div align="center">
 
+[![Chat on Telegram](https://img.shields.io/badge/💬_Telegram-@HarrierOnChain-229ED9?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/HarrierOnChain)
+
 | Platform | Link |
 |----------|------|
+| **Telegram** | [t.me/HarrierOnChain](https://t.me/HarrierOnChain) |
 | **Discussions** | [GitHub Discussions](../../discussions) |
-| **Telegram** | [@HarrierOnChain](https://t.me/HarrierOnChain) |
 
-*Response time is typically within a few hours. Open to questions, feedback, and serious collaborations.*
+*Response time is typically within a few hours. Open to questions, feedback, venue requests, and serious collaborations.*
 
 </div>
 
@@ -157,13 +284,14 @@ Built and maintained actively. If you're working on Polymarket tooling, algorith
 
 ## Disclaimer
 
-> Trading prediction markets involves real financial risk. This software is provided as-is, without warranty or guarantee of any outcome. It is not financial advice. Always test with `enable_trading: false` before deploying real capital. Ensure compliance with Polymarket's terms of service and applicable regulations in your jurisdiction.
+> Trading prediction markets involves real financial risk. This software is provided as-is, without warranty or guarantee of any outcome. It is not financial advice. Always test with `enable_trading: false` before deploying real capital. The **managed / copy-trading service is in early-access beta and operates in paper mode (simulated funds)** — it does not custody real money, and any live-trading rollout will follow proper custody, audit, and licensing. Ensure compliance with each venue's terms of service and applicable regulations in your jurisdiction.
 
 ---
 
 <div align="center">
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
+[![Telegram](https://img.shields.io/badge/💬_Telegram-@HarrierOnChain-229ED9?style=flat-square&logo=telegram&logoColor=white)](https://t.me/HarrierOnChain)
 
 **Built for the Prediction Markets including Polymarket, Kalshi, Limitless etc**
 
