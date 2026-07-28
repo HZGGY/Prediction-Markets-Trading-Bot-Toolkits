@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://harrieronchain.github.io/Prediction-Markets-Trading-Bot-Toolkits/sitemap.xml
