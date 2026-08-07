@@ -23,7 +23,7 @@
 
 [![在 Telegram 联系](https://img.shields.io/badge/💬_在_Telegram_联系-@HarrierOnChain-229ED9?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/HarrierOnChain)
 &nbsp;
-[![抢先体验](https://img.shields.io/badge/🚀_托管_%2F_跟单交易-抢先体验-a855f7?style=for-the-badge)](https://t.me/HarrierOnChain)
+[![PnL Profit 已上线](https://img.shields.io/badge/🚀_PnL_Profit-访问_pnlpro.fit-16a34a?style=for-the-badge)](https://pnlpro.fit)
 
 **[快速开始](#-快速开始) • [策略](#策略) • [托管服务](#-托管与跟单交易抢先体验) • [平台覆盖](#平台覆盖) • [引擎](#引擎) • [安全](#安全) • [联系方式](#联系方式)**
 

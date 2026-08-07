@@ -23,7 +23,7 @@
 
 [![Chat on Telegram](https://img.shields.io/badge/💬_Chat_on_Telegram-@HarrierOnChain-229ED9?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/HarrierOnChain)
 &nbsp;
-[![Get Early Access](https://img.shields.io/badge/🚀_Managed_%2F_Copy--Trading-Early_Access-a855f7?style=for-the-badge)](https://t.me/HarrierOnChain)
+[![PnL Profit — live](https://img.shields.io/badge/🚀_PnL_Profit-Live_at_pnlpro.fit-16a34a?style=for-the-badge)](https://pnlpro.fit)
 
 **[Quick Start](#-quick-start) • [Strategies](#strategies) • [Managed Service](#-managed--copy-trading--early-access) • [Venue Coverage](#venue-coverage) • [Engine](#engine) • [Safety](#safety) • [Contact](#contact)**
 
