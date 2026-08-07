@@ -10,3 +10,6 @@ test-ledger
 config.yaml
 
 .env
+
+# lockfile intentionally untracked (CI builds non-locked)
+Cargo.lock
