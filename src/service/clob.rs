@@ -13,6 +13,7 @@
 use crate::config::{AppConfig, ExchangeConfig};
 use crate::models::{OrderType, PlannedOrder, Side};
 use alloy_primitives::{Address, B256, U256};
+use alloy_primitives_v1::B256 as SignerB256;
 use alloy_signer::Signer;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{eip712_domain, sol, Eip712Domain, SolStruct};
@@ -128,7 +129,7 @@ impl ClobClient {
     pub fn new(cfg: &AppConfig) -> Result<Self> {
         let pk = parse_private_key(&cfg.credentials.private_key)
             .context("loading private key")?;
-        let signer = PrivateKeySigner::from_bytes(&B256::from(pk))
+        let signer = PrivateKeySigner::from_bytes(&SignerB256::from(pk))
             .context("creating EOA signer from private key")?;
         let funder = Address::from_str(&cfg.credentials.funder_address)
             .context("parsing funder address")?;
@@ -143,7 +144,7 @@ impl ClobClient {
                 "signature type {signature_type_value} is not supported in the EOA-only phase"
             ));
         }
-        if funder != signer.address() {
+        if funder.as_slice() != signer.address().as_slice() {
             return Err(anyhow!(
                 "EOA funder_address must match the signer address"
             ));
@@ -165,7 +166,7 @@ impl ClobClient {
     }
 
     pub fn signer_address(&self) -> Address {
-        self.signer.address()
+        Address::from_slice(self.signer.address().as_slice())
     }
 
     /// Build, sign, and prepare an order without posting it. Useful for unit
@@ -210,7 +211,7 @@ impl ClobClient {
         let order = Order {
             salt: context.salt,
             maker: self.funder,
-            signer: self.signer.address(),
+            signer: self.signer_address(),
             tokenId: token_id_u256,
             makerAmount: maker_amount,
             takerAmount: taker_amount,
@@ -234,9 +235,10 @@ impl ClobClient {
             verifying_contract: verifying_contract,
         };
         let digest: B256 = order.eip712_signing_hash(&domain);
+        let signer_digest = SignerB256::from_slice(digest.as_slice());
         let sig = self
             .signer
-            .sign_hash(&digest)
+            .sign_hash(&signer_digest)
             .await
             .context("signing order digest")?;
 
@@ -653,15 +655,16 @@ mod tests {
             "0x49a3c751eb94c4e96efa077ef503eee0892bbe8df6790e3139fb528bdca214903dce18b94802352eb25cfd9644bb032a164fac51c686bac42831f90fd69d20411b"
         );
 
-        let signer = PrivateKeySigner::from_bytes(&B256::from([
+        let signer = PrivateKeySigner::from_bytes(&SignerB256::from([
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
             0, 0, 0, 0, 0, 1,
         ]))
         .unwrap();
+        let signer_address = Address::from_slice(signer.address().as_slice());
         let order = Order {
             salt: U256::from(42u64),
-            maker: signer.address(),
-            signer: signer.address(),
+            maker: signer_address,
+            signer: signer_address,
             tokenId: U256::from(12_345_678_901_234_567_890u128),
             makerAmount: U256::from(500_000u64),
             takerAmount: U256::from(1_000_000u64),
@@ -687,7 +690,7 @@ mod tests {
             alloy_primitives::PrimitiveSignature::from_str(&signed.signature).unwrap();
         assert_eq!(
             signature.recover_address_from_prehash(&digest).unwrap(),
-            signer.address()
+            signer_address
         );
     }
 

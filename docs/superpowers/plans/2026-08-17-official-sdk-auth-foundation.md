@@ -2,16 +2,16 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add Polymarket's official Rust V2 SDK as an isolated L1 authentication adapter, expose explicit create/derive API-key commands, and atomically update an existing credentials YAML without exposing secrets or touching the existing order path.
+**Goal:** Add Polymarket's official Rust V2 SDK as an isolated L1 authentication adapter, expose explicit create/derive API-key commands, and atomically update an existing credentials YAML without exposing secrets or changing existing order behavior.
 
-**Architecture:** Keep `src/service/clob.rs` unchanged in this phase. Add `src/service/clob_auth.rs` as the only module that imports official SDK types, keep credential persistence in `src/config.rs`, and let `src/main.rs` orchestrate explicit auth commands. Production authentication is restricted to the exact official V2 host; tests inject a loopback host and never access the public internet.
+**Architecture:** Add `src/service/clob_auth.rs` as the only module that imports official SDK business types, keep credential persistence in `src/config.rs`, and let `src/main.rs` orchestrate explicit auth commands. Because SDK 0.6 and the existing Signer 0.5 pull mutually exclusive `c-kzg` native links, align only `alloy-signer` / `alloy-signer-local` to 1.6.3, bridge their 1.x primitive types explicitly, and permit only mechanical type/API adjustments in `src/service/clob.rs`; fixed digest/signature vectors must remain byte-for-byte unchanged. Production authentication is restricted to the exact official V2 host; tests inject a loopback host and never access the public internet.
 
 **Tech Stack:** Rust 1.97.1, Tokio, Clap 4, Serde YAML, `tempfile`, `polymarket_client_sdk_v2` 0.6 with CLOB support, existing Anyhow/Tracing test conventions.
 
 ## Global Constraints
 
 - This plan implements only phase 1 of the confirmed three-phase official SDK migration.
-- Do not replace or modify the existing order construction, EIP-712 order signing, L2 HMAC, POST, position, TP/SL, dry-run, or risk paths in `src/service/clob.rs`.
+- Do not replace or behaviorally modify the existing order construction, EIP-712 order signing, L2 HMAC, POST, position, TP/SL, dry-run, or risk paths. `src/service/clob.rs` may receive only the Alloy 1.x compatibility edits required to compile with the official SDK dependency graph, guarded by the existing fixed digest/signature tests.
 - Support EOA accounts only: `signature_type=0`, and funder must equal the signer address.
 - Production L1 authentication must reject every host except exact `https://clob-v2.polymarket.com`.
 - `create-api-key` and `derive-api-key` are explicit operations; never fall back from one to the other.
@@ -31,12 +31,13 @@
 - Modify: `config.json`
 - Modify: `config.dryrun-public.json`
 - Modify/Test: `src/config.rs`
+- Modify/Test only if required by Alloy 1.x compilation: `src/service/clob.rs`, `src/service/parse.rs`
 
 **Interfaces:**
 - Consumes: existing `AppConfig`, `config.json`, and `config.dryrun-public.json`.
 - Produces: `OFFICIAL_CLOB_V2_HOST: &str` and a committed configuration invariant used by the auth adapter in Task 3.
 
-- [ ] **Step 1: Add a failing committed-config invariant test**
+- [x] **Step 1: Add a failing committed-config invariant test**
 
 Append this test module to `src/config.rs`:
 
@@ -66,7 +67,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [x] **Step 2: Run the focused test and verify RED**
 
 Run:
 
@@ -76,7 +77,7 @@ cargo test --offline config::tests::committed_configs_use_official_v2_host_and_r
 
 Expected: FAIL because both committed configs still contain `https://clob.polymarket.com`.
 
-- [ ] **Step 3: Update the V2 host and add the two approved dependencies**
+- [x] **Step 3: Update the V2 host and add the two approved dependencies**
 
 Change only `site.clob_api_base` in both JSON files:
 
@@ -90,7 +91,7 @@ Add the shared production constant near `SiteConfig`:
 pub const OFFICIAL_CLOB_V2_HOST: &str = "https://clob-v2.polymarket.com";
 ```
 
-Add to `Cargo.toml`:
+Align `alloy-signer` and `alloy-signer-local` to 1.6.3, add an explicitly named Alloy 1.x primitive bridge while retaining the existing 0.8 EIP-712 core types, then add to `Cargo.toml`:
 
 ```toml
 # Official Polymarket V2 SDK — phase 1 uses only L1 CLOB authentication.
@@ -100,9 +101,9 @@ polymarket_client_sdk_v2 = { version = "0.6", default-features = false, features
 tempfile = "3"
 ```
 
-Do not alter `clob_wss_url`, order code, or trading flags.
+Do not alter `clob_wss_url`, order semantics, or trading flags.
 
-- [ ] **Step 4: Fetch dependencies only after explicit network approval**
+- [x] **Step 4: Fetch dependencies only after explicit network approval**
 
 Run with the tool's network escalation and explain that this contacts Cargo registries only:
 
@@ -112,7 +113,19 @@ cargo fetch
 
 Do not run an auth command and do not contact a Polymarket endpoint.
 
-- [ ] **Step 5: Run the focused test offline and verify GREEN**
+- [x] **Step 5: Resolve only compiler-level Alloy 1.x API differences under existing vectors**
+
+Run the focused existing regressions immediately after dependency resolution:
+
+```powershell
+cargo test --offline service::clob::tests::v2_fixed_order_matches_known_digest_and_signature
+cargo test --offline service::clob::tests::v2_domain_and_metadata_changes_signature
+cargo test --offline service::parse::tests
+```
+
+If compilation reports Alloy type/API differences, make the smallest source adaptation needed. The expected digest, signature, addresses, and serialized order literals must not be changed to make tests pass.
+
+- [x] **Step 6: Run Task 1 tests offline and verify GREEN**
 
 Run:
 
@@ -122,10 +135,10 @@ cargo test --offline config::tests::committed_configs_use_official_v2_host_and_r
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit Task 1**
+- [x] **Step 7: Commit Task 1**
 
 ```powershell
-git add -- Cargo.toml config.json config.dryrun-public.json src/config.rs
+git add -- Cargo.toml config.json config.dryrun-public.json src/config.rs src/service/clob.rs docs/superpowers/specs/2026-08-17-official-sdk-auth-foundation-design.md docs/superpowers/plans/2026-08-17-official-sdk-auth-foundation.md
 git commit -m "build: add official Polymarket V2 SDK"
 ```
 
@@ -1338,7 +1351,7 @@ After fresh verification, offer exactly the supported local merge / PR / keep-br
 ## Plan Self-Review Checklist
 
 - [ ] Every in-scope design requirement maps to a task: dependency/host (Task 1), atomic persistence (Task 2), SDK L1 adapter (Task 3), explicit CLI/redaction (Task 4), docs (Task 5), verification/memory (Task 6).
-- [ ] No task changes the existing order path or trading safety gates.
+- [ ] No task changes existing order behavior or trading safety gates; Task 1 Alloy compatibility edits preserve the fixed digest/signature vectors.
 - [ ] All new behavior starts with a failing test and records RED before GREEN.
 - [ ] SDK types remain confined to `clob_auth.rs` except the minimal `ExposeSecret` accessor used at the CLI persistence boundary.
 - [ ] The official fixed L1 signature vector is exercised through a loopback SDK request with fixed server time and nonce.

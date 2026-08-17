@@ -8,6 +8,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+pub const OFFICIAL_CLOB_V2_HOST: &str = "https://clob-v2.polymarket.com";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub bot: BotConfig,
@@ -258,4 +260,25 @@ impl AppConfig {
 
 fn default_true() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn committed_configs_use_official_v2_host_and_remain_locked() {
+        for raw in [
+            include_str!("../config.json"),
+            include_str!("../config.dryrun-public.json"),
+        ] {
+            let cfg: AppConfig = serde_json::from_str(raw).unwrap();
+            assert_eq!(cfg.site.clob_api_base, "https://clob-v2.polymarket.com");
+            assert!(!cfg.bot.enable_trading);
+            assert!(cfg.bot.mock_trading);
+            assert!(cfg.credentials.api_key.is_none());
+            assert!(cfg.credentials.api_secret.is_none());
+            assert!(cfg.credentials.api_passphrase.is_none());
+        }
+    }
 }

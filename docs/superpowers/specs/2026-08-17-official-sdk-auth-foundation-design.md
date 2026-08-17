@@ -2,7 +2,7 @@
 
 ## Goal
 
-完整迁移到 Polymarket 官方 Rust V2 SDK 分为三个可独立验收的阶段。本设计只覆盖第 1 阶段：引入官方 SDK 的 L1 API 凭据创建/派生能力，提供明确的 CLI，安全更新现有 `config.yaml`，并将公共 HTTP 配置切换到官方 V2 主机。本阶段不替换现有订单执行路径，不运行真实认证命令，不发送订单。
+完整迁移到 Polymarket 官方 Rust V2 SDK 分为三个可独立验收的阶段。本设计只覆盖第 1 阶段：引入官方 SDK 的 L1 API 凭据创建/派生能力，提供明确的 CLI，安全更新现有 `config.yaml`，并将公共 HTTP 配置切换到官方 V2 主机。本阶段不替换现有订单执行路径；但由于官方 SDK 0.6 与旧 Signer 0.5 存在不可并存的 `c-kzg` 链接冲突，允许将现有 Alloy 组件对齐到 1.x 并做最小类型适配。订单语义与签名输出必须由既有固定向量证明完全不变。不运行真实认证命令，不发送订单。
 
 后续阶段分别为：
 
@@ -17,7 +17,7 @@
 - 成功取得凭据后原子更新现有 `config.yaml`；不在 stdout、日志或错误上下文中输出完整 API Key、Secret、Passphrase 或私钥。
 - `create-api-key` 与 `derive-api-key` 保持显式、独立，不使用静默 create-or-derive fallback。
 - 公共 HTTP 主机更新为官方 V2 `https://clob-v2.polymarket.com`；WebSocket 主机本阶段不改。
-- 现有自定义 `clob.rs` 订单路径、EOA-only 规则、dry-run、风控和下单安全门本阶段不改。
+- 现有自定义 `clob.rs` 订单语义、EOA-only 规则、dry-run、风控和下单安全门本阶段不改；仅允许解除 SDK 依赖冲突所必需的 Alloy 1.x 机械性类型适配。
 
 ## Scope
 
@@ -34,7 +34,7 @@
 ### Out of Scope
 
 - 本阶段不调用真实 CLOB API，不创建或派生真实凭据。
-- 不替换现有 V2 订单 EIP-712、L2 HMAC、POST、持仓或 TP/SL 逻辑。
+- 不替换现有 V2 订单 EIP-712、L2 HMAC、POST、持仓或 TP/SL 逻辑；Alloy 类型升级不得改变摘要、签名或 wire payload。
 - 不实现 Proxy、Safe 或 POLY_1271 认证；仍仅允许 EOA `signature_type=0`。
 - 不查询余额或授权，不批准 token，不 wrap pUSD，不下单、不撤单。
 - 不自动启用 `enable_trading`，不关闭 `mock_trading`。
@@ -44,7 +44,7 @@
 
 ### Dependencies
 
-`Cargo.toml` 增加官方 `polymarket_client_sdk_v2` 0.6 系列并启用 CLOB 功能。该 SDK 的最低 Rust 版本是 1.88；本地 Rust 1.97.1 满足要求。现有 Alloy 0.8/Signer 0.5 继续服务自定义订单路径；官方 SDK 的 Alloy 类型被限制在新认证模块内部，避免跨版本类型扩散。
+`Cargo.toml` 增加官方 `polymarket_client_sdk_v2` 0.6 系列并启用 CLOB 功能。该 SDK 的最低 Rust 版本是 1.88；本地 Rust 1.97.1 满足要求。SDK 0.6 依赖 Alloy 1.6.3，而旧 Signer 0.5 引入 `c-kzg` 1.x，两者无法在同一 Cargo 图中与 SDK 所需 `c-kzg` 2.x 并存。因此只将 `alloy-signer` / `alloy-signer-local` 对齐到 1.6.3，保留现有 0.8 核心 EIP-712 类型，并通过显式命名的 1.x primitive 桥接做最小类型转换。已有固定 EIP-712 摘要和签名向量是强制回归门。官方 SDK 的业务类型仍限制在新认证模块内部。
 
 增加 `tempfile` 用于在凭据文件同目录创建临时文件并原子持久化。临时文件和目标文件位于同一文件系统，避免跨文件系统 rename 失去原子性。
 
