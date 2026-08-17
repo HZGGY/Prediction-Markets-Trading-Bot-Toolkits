@@ -153,8 +153,7 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let cfg = AppConfig::load(&cli.config, &cli.credentials)
-        .context("loading configuration")?;
+    let cfg = AppConfig::load(&cli.config, &cli.credentials).context("loading configuration")?;
     let credentials_path = cli.credentials.clone();
 
     info!(
@@ -218,14 +217,10 @@ mod tests {
         let cfg: AppConfig = serde_json::from_str(include_str!("../config.json")).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("config.yaml");
-        let error = run_auth(
-            &cfg,
-            &missing,
-            AuthCommand::CreateApiKey { nonce: None },
-        )
-        .await
-        .unwrap_err()
-        .to_string();
+        let error = run_auth(&cfg, &missing, AuthCommand::CreateApiKey { nonce: None })
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("must already exist"));
     }
 }

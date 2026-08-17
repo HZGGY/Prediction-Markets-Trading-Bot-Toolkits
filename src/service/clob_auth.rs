@@ -1,9 +1,7 @@
 use std::str::FromStr as _;
 
 use anyhow::{anyhow, Context as _, Result};
-use polymarket_client_sdk_v2::auth::{
-    Credentials, ExposeSecret as _, LocalSigner, Signer as _,
-};
+use polymarket_client_sdk_v2::auth::{Credentials, ExposeSecret as _, LocalSigner, Signer as _};
 use polymarket_client_sdk_v2::clob::{Client, Config as SdkConfig};
 use polymarket_client_sdk_v2::types::Address;
 use polymarket_client_sdk_v2::POLYGON;
@@ -32,10 +30,7 @@ pub fn ensure_official_v2_host(host: &str) -> Result<()> {
     }
 }
 
-pub async fn obtain_api_credentials(
-    cfg: &AppConfig,
-    request: AuthRequest,
-) -> Result<Credentials> {
+pub async fn obtain_api_credentials(cfg: &AppConfig, request: AuthRequest) -> Result<Credentials> {
     ensure_official_v2_host(&cfg.site.clob_api_base)?;
     if cfg.exchange.chain_id != POLYGON {
         return Err(anyhow!("L1 authentication requires Polygon chain id 137"));
@@ -49,12 +44,10 @@ pub async fn obtain_api_credentials(
     let signer = LocalSigner::from_str(cfg.credentials.private_key.trim())
         .context("loading EOA signer")?
         .with_chain_id(Some(POLYGON));
-    let funder = Address::from_str(&cfg.credentials.funder_address)
-        .context("parsing EOA funder address")?;
+    let funder =
+        Address::from_str(&cfg.credentials.funder_address).context("parsing EOA funder address")?;
     if signer.address() != funder {
-        return Err(anyhow!(
-            "EOA funder_address must match the signer address"
-        ));
+        return Err(anyhow!("EOA funder_address must match the signer address"));
     }
 
     let client = Client::new(&cfg.site.clob_api_base, SdkConfig::default())?;
@@ -139,9 +132,7 @@ mod tests {
                 let headers = lines
                     .take_while(|line| !line.is_empty())
                     .filter_map(|line| line.split_once(':'))
-                    .map(|(name, value)| {
-                        (name.to_ascii_lowercase(), value.trim().to_owned())
-                    })
+                    .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
                     .collect();
                 captured.push(CapturedRequest {
                     request_line,
@@ -167,9 +158,7 @@ mod tests {
                 let headers = lines
                     .take_while(|line| !line.is_empty())
                     .filter_map(|line| line.split_once(':'))
-                    .map(|(name, value)| {
-                        (name.to_ascii_lowercase(), value.trim().to_owned())
-                    })
+                    .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
                     .collect();
                 captured.push(CapturedRequest {
                     request_line,
@@ -198,8 +187,7 @@ mod tests {
     fn fixture_config() -> AppConfig {
         let mut cfg: AppConfig = serde_json::from_str(include_str!("../../config.json")).unwrap();
         cfg.credentials.private_key = PUBLIC_HARDHAT_KEY.to_owned();
-        cfg.credentials.funder_address =
-            "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_owned();
+        cfg.credentials.funder_address = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_owned();
         cfg.credentials.signature_type = Some(0);
         cfg
     }
@@ -239,8 +227,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_uses_only_post_api_key_with_l1_headers_and_nonce() {
-        let (host, server) =
-            spawn_scripted_server(vec![("200 OK", CREDENTIAL_RESPONSE)]).await;
+        let (host, server) = spawn_scripted_server(vec![("200 OK", CREDENTIAL_RESPONSE)]).await;
         let client = Client::new(&host, SdkConfig::default()).unwrap();
         let signer = hardhat_signer(POLYGON);
 
@@ -270,8 +257,7 @@ mod tests {
 
     #[tokio::test]
     async fn derive_uses_only_get_derive_api_key_with_l1_headers_and_nonce() {
-        let (host, server) =
-            spawn_scripted_server(vec![("200 OK", CREDENTIAL_RESPONSE)]).await;
+        let (host, server) = spawn_scripted_server(vec![("200 OK", CREDENTIAL_RESPONSE)]).await;
         let client = Client::new(&host, SdkConfig::default()).unwrap();
         let signer = hardhat_signer(POLYGON);
 
@@ -298,8 +284,7 @@ mod tests {
     #[tokio::test]
     async fn create_status_error_does_not_fall_back_to_derive() {
         let leaked_body = r#"{"error":"fixture-secret-must-not-leak"}"#;
-        let (host, server) =
-            spawn_scripted_server(vec![("409 Conflict", leaked_body)]).await;
+        let (host, server) = spawn_scripted_server(vec![("409 Conflict", leaked_body)]).await;
         let client = Client::new(&host, SdkConfig::default()).unwrap();
         let signer = hardhat_signer(POLYGON);
 

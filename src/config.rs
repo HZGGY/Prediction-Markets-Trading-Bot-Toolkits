@@ -189,9 +189,15 @@ impl Default for TpSlConfig {
     }
 }
 
-fn default_tp_pct() -> f64 { 50.0 }
-fn default_sl_pct() -> f64 { 30.0 }
-fn default_monitor_secs() -> u64 { 15 }
+fn default_tp_pct() -> f64 {
+    50.0
+}
+fn default_sl_pct() -> f64 {
+    30.0
+}
+fn default_monitor_secs() -> u64 {
+    15
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct Credentials {
@@ -215,7 +221,7 @@ fn yaml_key(name: &str) -> Value {
 
 fn required_mapping<'a>(mapping: &'a mut Mapping, key: &str) -> Result<&'a mut Mapping> {
     mapping
-        .get_mut(&yaml_key(key))
+        .get_mut(yaml_key(key))
         .and_then(Value::as_mapping_mut)
         .ok_or_else(|| anyhow!("credentials YAML must contain a '{key}' mapping"))
 }
@@ -237,12 +243,9 @@ struct CredentialsBot {
 
 impl AppConfig {
     pub fn load(config_path: &Path, credentials_path: &Path) -> Result<Self> {
-        let raw =
-            std::fs::read_to_string(config_path).with_context(|| {
-                format!("reading public config from {}", config_path.display())
-            })?;
-        let mut cfg: AppConfig =
-            serde_json::from_str(&raw).context("parsing config.json")?;
+        let raw = std::fs::read_to_string(config_path)
+            .with_context(|| format!("reading public config from {}", config_path.display()))?;
+        let mut cfg: AppConfig = serde_json::from_str(&raw).context("parsing config.json")?;
 
         // Credentials file is optional — without it we can still run in mock mode.
         if credentials_path.exists() {
@@ -319,7 +322,7 @@ where
     let bot = required_mapping(root_mapping, "bot")?;
 
     for required in ["private_key", "funder_address", "signature_type"] {
-        if !bot.contains_key(&yaml_key(required)) {
+        if !bot.contains_key(yaml_key(required)) {
             return Err(anyhow!("credentials YAML is missing bot.{required}"));
         }
     }

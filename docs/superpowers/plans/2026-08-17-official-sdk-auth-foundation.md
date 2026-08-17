@@ -1283,7 +1283,7 @@ git commit -m "docs: explain official SDK credential flow"
 - Consumes: the complete phase-1 branch.
 - Produces: verification evidence, a clean feature branch, and a credential-free durable project record.
 
-- [ ] **Step 1: Format only intentionally changed Rust files**
+- [x] **Step 1: Format only intentionally changed Rust files**
 
 Run targeted rustfmt through Cargo's configured edition without formatting untouched files:
 
@@ -1293,7 +1293,7 @@ rustfmt --edition 2021 src/config.rs src/service/clob_auth.rs src/service/mod.rs
 
 Then rerun focused tests changed by formatting.
 
-- [ ] **Step 2: Run the full offline test suite**
+- [x] **Step 2: Run the full offline test suite**
 
 ```powershell
 cargo test --offline
@@ -1301,7 +1301,7 @@ cargo test --offline
 
 Expected: all prior 47 tests plus the new config, adapter, persistence, and CLI tests PASS with zero failures.
 
-- [ ] **Step 3: Run release and lint gates offline**
+- [x] **Step 3: Run release and lint gates offline**
 
 ```powershell
 cargo build --release --offline
@@ -1310,7 +1310,7 @@ cargo clippy --all-targets --offline -- -D warnings
 
 Expected: both PASS.
 
-- [ ] **Step 4: Record the repository-wide formatting baseline**
+- [x] **Step 4: Record the repository-wide formatting baseline**
 
 ```powershell
 cargo fmt --check
@@ -1318,7 +1318,7 @@ cargo fmt --check
 
 Expected: if it still fails only on known pre-existing unrelated formatting differences, record that fact and do not run whole-repository formatting. If it identifies a newly changed file, format that file only and rerun its tests.
 
-- [ ] **Step 5: Run final diff, branch, and secret safety checks**
+- [x] **Step 5: Run final diff, branch, and secret safety checks**
 
 ```powershell
 git diff --check

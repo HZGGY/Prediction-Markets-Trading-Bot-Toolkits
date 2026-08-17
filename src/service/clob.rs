@@ -127,12 +127,11 @@ pub struct ClobClient {
 
 impl ClobClient {
     pub fn new(cfg: &AppConfig) -> Result<Self> {
-        let pk = parse_private_key(&cfg.credentials.private_key)
-            .context("loading private key")?;
+        let pk = parse_private_key(&cfg.credentials.private_key).context("loading private key")?;
         let signer = PrivateKeySigner::from_bytes(&SignerB256::from(pk))
             .context("creating EOA signer from private key")?;
-        let funder = Address::from_str(&cfg.credentials.funder_address)
-            .context("parsing funder address")?;
+        let funder =
+            Address::from_str(&cfg.credentials.funder_address).context("parsing funder address")?;
 
         let signature_type_value = cfg
             .credentials
@@ -145,9 +144,7 @@ impl ClobClient {
             ));
         }
         if funder.as_slice() != signer.address().as_slice() {
-            return Err(anyhow!(
-                "EOA funder_address must match the signer address"
-            ));
+            return Err(anyhow!("EOA funder_address must match the signer address"));
         }
 
         Ok(Self {
@@ -288,8 +285,7 @@ impl ClobClient {
                 text
             ));
         }
-        let parsed: OrderResponse =
-            serde_json::from_str(&text).context("parsing CLOB response")?;
+        let parsed: OrderResponse = serde_json::from_str(&text).context("parsing CLOB response")?;
         Ok(parsed)
     }
 
@@ -426,21 +422,26 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
 fn sha256(input: &[u8]) -> [u8; 32] {
     // Minimal SHA-256 (FIPS-180-4) — small and dependency-free.
     const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
-        0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
-        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
-        0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
-        0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
-        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
-        0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
-        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
     ];
     let mut h = [
-        0x6a09e667u32, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c,
-        0x1f83d9ab, 0x5be0cd19,
+        0x6a09e667u32,
+        0xbb67ae85,
+        0x3c6ef372,
+        0xa54ff53a,
+        0x510e527f,
+        0x9b05688c,
+        0x1f83d9ab,
+        0x5be0cd19,
     ];
     // Pre-processing
     let bit_len = (input.len() as u64) * 8;
@@ -465,8 +466,14 @@ fn sha256(input: &[u8]) -> [u8; 32] {
                 .wrapping_add(w[i - 7])
                 .wrapping_add(s1);
         }
-        let mut a = h[0]; let mut b = h[1]; let mut c = h[2]; let mut d = h[3];
-        let mut e = h[4]; let mut f = h[5]; let mut g = h[6]; let mut hh = h[7];
+        let mut a = h[0];
+        let mut b = h[1];
+        let mut c = h[2];
+        let mut d = h[3];
+        let mut e = h[4];
+        let mut f = h[5];
+        let mut g = h[6];
+        let mut hh = h[7];
         for i in 0..64 {
             let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
             let ch = (e & f) ^ (!e & g);
@@ -478,13 +485,23 @@ fn sha256(input: &[u8]) -> [u8; 32] {
             let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
             let maj = (a & b) ^ (a & c) ^ (b & c);
             let temp2 = s0.wrapping_add(maj);
-            hh = g; g = f; f = e; e = d.wrapping_add(temp1);
-            d = c; c = b; b = a; a = temp1.wrapping_add(temp2);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
         }
-        h[0] = h[0].wrapping_add(a); h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c); h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e); h[5] = h[5].wrapping_add(f);
-        h[6] = h[6].wrapping_add(g); h[7] = h[7].wrapping_add(hh);
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
     }
     let mut out = [0u8; 32];
     for i in 0..8 {
@@ -502,8 +519,7 @@ mod tests {
         let mut cfg: AppConfig = serde_json::from_str(include_str!("../../config.json")).unwrap();
         cfg.credentials.private_key =
             "0000000000000000000000000000000000000000000000000000000000000001".into();
-        cfg.credentials.funder_address =
-            "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf".into();
+        cfg.credentials.funder_address = "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf".into();
         cfg.credentials.signature_type = signature_type;
         cfg
     }
@@ -552,18 +568,12 @@ mod tests {
     #[test]
     fn parses_all_known_polymarket_signature_types() {
         assert_eq!(SignatureType::from_u8(0).unwrap(), SignatureType::Eoa);
-        assert_eq!(
-            SignatureType::from_u8(1).unwrap(),
-            SignatureType::PolyProxy
-        );
+        assert_eq!(SignatureType::from_u8(1).unwrap(), SignatureType::PolyProxy);
         assert_eq!(
             SignatureType::from_u8(2).unwrap(),
             SignatureType::PolyGnosisSafe
         );
-        assert_eq!(
-            SignatureType::from_u8(3).unwrap(),
-            SignatureType::Poly1271
-        );
+        assert_eq!(SignatureType::from_u8(3).unwrap(), SignatureType::Poly1271);
     }
 
     #[test]
@@ -603,8 +613,7 @@ mod tests {
     #[test]
     fn rejects_eoa_when_funder_differs_from_signer() {
         let mut cfg = fixture_config(Some(0));
-        cfg.credentials.funder_address =
-            "0x1111111111111111111111111111111111111111".into();
+        cfg.credentials.funder_address = "0x1111111111111111111111111111111111111111".into();
         let error = match ClobClient::new(&cfg) {
             Ok(_) => panic!("EOA client unexpectedly accepted a different funder"),
             Err(error) => error,
@@ -620,7 +629,10 @@ mod tests {
         let order = json.as_object().unwrap();
 
         for legacy in ["taker", "nonce", "feeRateBps"] {
-            assert!(!order.contains_key(legacy), "legacy field remained: {legacy}");
+            assert!(
+                !order.contains_key(legacy),
+                "legacy field remained: {legacy}"
+            );
         }
         for v2 in ["timestamp", "metadata", "builder", "expiration"] {
             assert!(order.contains_key(v2), "V2 wire field missing: {v2}");
@@ -656,8 +668,8 @@ mod tests {
         );
 
         let signer = PrivateKeySigner::from_bytes(&SignerB256::from([
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 1,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 1,
         ]))
         .unwrap();
         let signer_address = Address::from_slice(signer.address().as_slice());
@@ -686,8 +698,7 @@ mod tests {
             "0xf50c40827be812ab26c5e9e3558946824a450ba302e8231a36f8316ac18c424e"
         );
 
-        let signature =
-            alloy_primitives::PrimitiveSignature::from_str(&signed.signature).unwrap();
+        let signature = alloy_primitives::PrimitiveSignature::from_str(&signed.signature).unwrap();
         assert_eq!(
             signature.recover_address_from_prehash(&digest).unwrap(),
             signer_address
@@ -803,12 +814,9 @@ mod tests {
 
     #[test]
     fn serializes_v2_request_with_owner_and_order_type() {
-        let body = serialize_order_request(
-            fixture_signed_order(),
-            "api-key-fixture",
-            OrderType::Gtc,
-        )
-        .unwrap();
+        let body =
+            serialize_order_request(fixture_signed_order(), "api-key-fixture", OrderType::Gtc)
+                .unwrap();
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
 
         assert_eq!(json["owner"], "api-key-fixture");
@@ -844,8 +852,7 @@ mod tests {
     fn l2_hmac_decodes_api_secret_and_keeps_base64_padding() {
         // Official clients treat the API secret as URL-safe base64 encoded.
         // "c2VjcmV0a2V5" decodes to the HMAC key "secretkey".
-        let signature =
-            hmac_sha256_base64url("c2VjcmV0a2V5", "1000POST/order{}").unwrap();
+        let signature = hmac_sha256_base64url("c2VjcmV0a2V5", "1000POST/order{}").unwrap();
 
         assert_eq!(signature, "l_GD1L6lBLUTXQ4OwhciHGDBd2nw2iP7K2dGQkYW4ls=");
     }
