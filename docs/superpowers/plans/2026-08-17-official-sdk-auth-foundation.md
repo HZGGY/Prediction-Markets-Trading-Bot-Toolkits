@@ -1346,7 +1346,7 @@ Update the project-index row to the same stable status. Never include fixture se
 
 Added a pre-network check that the target YAML account matches the effective account after environment overrides; preserved only safe HTTP status/method/path diagnostics with an explicit derive suggestion for create conflicts; pinned the tested SDK/Alloy versions; tracked `Cargo.lock`; and switched final gates to `--locked`.
 
-- [ ] **Step 8: Use the finishing-development-branch workflow**
+- [x] **Step 8: Use the finishing-development-branch workflow**
 
 After fresh verification, offer exactly the supported local merge / PR / keep-branch options. Do not merge, push, or delete the branch without the user's explicit selection.
 
