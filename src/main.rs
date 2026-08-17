@@ -3,7 +3,10 @@ use clap::{Parser, Subcommand};
 use polymarket_client_sdk_v2::auth::ExposeSecret as _;
 use polymarket_toolkits::{
     bot::{self, BotKind},
-    config::{persist_api_credentials, ApiCredentialUpdate, AppConfig},
+    config::{
+        ensure_credentials_file_account_matches, persist_api_credentials, ApiCredentialUpdate,
+        AppConfig,
+    },
     service::clob_auth::{obtain_api_credentials, ApiKeyAction, AuthRequest},
     ui,
 };
@@ -107,6 +110,7 @@ async fn run_auth(
             credentials_path.display()
         ));
     }
+    ensure_credentials_file_account_matches(credentials_path, &cfg.credentials)?;
 
     let request = match command {
         AuthCommand::CreateApiKey { nonce } => AuthRequest {
@@ -222,5 +226,34 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("must already exist"));
+    }
+
+    #[tokio::test]
+    async fn auth_refuses_yaml_account_mismatch_before_signing_or_network() {
+        let mut cfg: AppConfig = serde_json::from_str(include_str!("../config.json")).unwrap();
+        cfg.credentials.private_key = "effective-private-key".to_owned();
+        cfg.credentials.funder_address = "0x1111111111111111111111111111111111111111".to_owned();
+        cfg.credentials.signature_type = Some(0);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            r#"bot:
+  private_key: disk-private-key
+  funder_address: 0x1111111111111111111111111111111111111111
+  signature_type: 0
+"#,
+        )
+        .unwrap();
+
+        let error = run_auth(&cfg, &path, AuthCommand::CreateApiKey { nonce: None })
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("does not match the effective account"));
+        assert!(!error.contains("effective-private-key"));
+        assert!(!error.contains("disk-private-key"));
     }
 }

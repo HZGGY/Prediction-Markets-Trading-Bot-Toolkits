@@ -4,7 +4,7 @@
 
 **Goal:** Add Polymarket's official Rust V2 SDK as an isolated L1 authentication adapter, expose explicit create/derive API-key commands, and atomically update an existing credentials YAML without exposing secrets or changing existing order behavior.
 
-**Architecture:** Add `src/service/clob_auth.rs` as the only module that imports official SDK business types, keep credential persistence in `src/config.rs`, and let `src/main.rs` orchestrate explicit auth commands. Because SDK 0.6 and the existing Signer 0.5 pull mutually exclusive `c-kzg` native links, align only `alloy-signer` / `alloy-signer-local` to 1.6.3, bridge their 1.x primitive types explicitly, and permit only mechanical type/API adjustments in `src/service/clob.rs`; fixed digest/signature vectors must remain byte-for-byte unchanged. Production authentication is restricted to the exact official V2 host; tests inject a loopback host and never access the public internet.
+**Architecture:** Add `src/service/clob_auth.rs` as the only module that imports official SDK business types, keep credential persistence in `src/config.rs`, and let `src/main.rs` orchestrate explicit auth commands. Because SDK 0.6 and the existing Signer 0.5 pull mutually exclusive `c-kzg` native links, align only `alloy-signer` / `alloy-signer-local` to the tested 1.8.3 release, bridge their 1.x primitive types explicitly with `alloy-primitives` 1.6.1, and permit only mechanical type/API adjustments in `src/service/clob.rs`; fixed digest/signature vectors must remain byte-for-byte unchanged. Production authentication is restricted to the exact official V2 host; tests inject a loopback host and never access the public internet. Exact direct versions plus the tracked `Cargo.lock` make the binary build reproducible.
 
 **Tech Stack:** Rust 1.97.1, Tokio, Clap 4, Serde YAML, `tempfile`, `polymarket_client_sdk_v2` 0.6 with CLOB support, existing Anyhow/Tracing test conventions.
 
@@ -91,11 +91,11 @@ Add the shared production constant near `SiteConfig`:
 pub const OFFICIAL_CLOB_V2_HOST: &str = "https://clob-v2.polymarket.com";
 ```
 
-Align `alloy-signer` and `alloy-signer-local` to 1.6.3, add an explicitly named Alloy 1.x primitive bridge while retaining the existing 0.8 EIP-712 core types, then add to `Cargo.toml`:
+Align `alloy-signer` and `alloy-signer-local` to the tested 1.8.3 release, add an explicitly named Alloy 1.6.1 primitive bridge while retaining the existing 0.8 EIP-712 core types, then add to `Cargo.toml`:
 
 ```toml
 # Official Polymarket V2 SDK — phase 1 uses only L1 CLOB authentication.
-polymarket_client_sdk_v2 = { version = "0.6", default-features = false, features = ["clob"] }
+polymarket_client_sdk_v2 = { version = "=0.6.0", default-features = false, features = ["clob"] }
 
 # Same-directory atomic persistence for the gitignored credentials YAML.
 tempfile = "3"
@@ -1329,7 +1329,7 @@ rg -n '"enable_trading"\s*:\s*true|"mock_trading"\s*:\s*false|api_key:\s*"[^\"]+
 
 Expected: no diff-check errors, no real credentials, no permissive trading flags, and no uncommitted production changes after the final documentation commit.
 
-- [ ] **Step 6: Update Obsidian without storing credentials**
+- [x] **Step 6: Update Obsidian without storing credentials**
 
 In `20-Prediction-Markets-Trading-Bot-Toolkits.md`, record only:
 
@@ -1342,7 +1342,11 @@ In `20-Prediction-Markets-Trading-Bot-Toolkits.md`, record only:
 
 Update the project-index row to the same stable status. Never include fixture secrets, user credentials, private keys, complete API keys, or raw HTTP output.
 
-- [ ] **Step 7: Use the finishing-development-branch workflow**
+- [x] **Step 7: Address independent review findings**
+
+Added a pre-network check that the target YAML account matches the effective account after environment overrides; preserved only safe HTTP status/method/path diagnostics with an explicit derive suggestion for create conflicts; pinned the tested SDK/Alloy versions; tracked `Cargo.lock`; and switched final gates to `--locked`.
+
+- [ ] **Step 8: Use the finishing-development-branch workflow**
 
 After fresh verification, offer exactly the supported local merge / PR / keep-branch options. Do not merge, push, or delete the branch without the user's explicit selection.
 
@@ -1350,13 +1354,15 @@ After fresh verification, offer exactly the supported local merge / PR / keep-br
 
 ## Plan Self-Review Checklist
 
-- [ ] Every in-scope design requirement maps to a task: dependency/host (Task 1), atomic persistence (Task 2), SDK L1 adapter (Task 3), explicit CLI/redaction (Task 4), docs (Task 5), verification/memory (Task 6).
-- [ ] No task changes existing order behavior or trading safety gates; Task 1 Alloy compatibility edits preserve the fixed digest/signature vectors.
-- [ ] All new behavior starts with a failing test and records RED before GREEN.
-- [ ] SDK types remain confined to `clob_auth.rs` except the minimal `ExposeSecret` accessor used at the CLI persistence boundary.
-- [ ] The official fixed L1 signature vector is exercised through a loopback SDK request with fixed server time and nonce.
-- [ ] SDK status errors are sanitized without attaching or formatting the server response body.
-- [ ] The CLI rejects a missing credentials file before constructing a signer or request.
-- [ ] Production host restriction and loopback-only tests are both explicit.
-- [ ] Complete credentials never appear in logs, docs, Git, Obsidian, or final output.
-- [ ] No placeholder instructions remain.
+- [x] Every in-scope design requirement maps to a task: dependency/host (Task 1), atomic persistence (Task 2), SDK L1 adapter (Task 3), explicit CLI/redaction (Task 4), docs (Task 5), verification/memory (Task 6).
+- [x] No task changes existing order behavior or trading safety gates; Task 1 Alloy compatibility edits preserve the fixed digest/signature vectors.
+- [x] All new behavior starts with a failing test and records RED before GREEN.
+- [x] SDK types remain confined to `clob_auth.rs` except the minimal `ExposeSecret` accessor used at the CLI persistence boundary.
+- [x] The official fixed L1 signature vector is exercised through a loopback SDK request with fixed server time and nonce.
+- [x] SDK status errors are sanitized without attaching or formatting the server response body.
+- [x] The CLI rejects a missing credentials file before constructing a signer or request.
+- [x] The CLI rejects a target-YAML/effective-account mismatch before signing or networking.
+- [x] Exact SDK/Alloy direct versions and the tracked `Cargo.lock` reproduce the verified dependency graph.
+- [x] Production host restriction and loopback-only tests are both explicit.
+- [x] Real credentials never appear in logs, docs, Git, Obsidian, or final output; committed credential values are public test fixtures only.
+- [x] No placeholder instructions remain.

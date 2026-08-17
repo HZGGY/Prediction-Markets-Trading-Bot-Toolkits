@@ -280,6 +280,34 @@ impl AppConfig {
     }
 }
 
+fn normalized_hex(value: &str) -> &str {
+    let trimmed = value.trim();
+    trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed)
+}
+
+/// Refuse to persist API credentials when environment overrides changed the
+/// account that is stored in the target YAML file.
+pub fn ensure_credentials_file_account_matches(path: &Path, effective: &Credentials) -> Result<()> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading credentials from {}", path.display()))?;
+    let stored: CredentialsFile = serde_yaml::from_str(&raw).context("parsing config.yaml")?;
+    let account_matches = normalized_hex(&stored.bot.private_key)
+        .eq_ignore_ascii_case(normalized_hex(&effective.private_key))
+        && normalized_hex(&stored.bot.funder_address)
+            .eq_ignore_ascii_case(normalized_hex(&effective.funder_address))
+        && stored.bot.signature_type == effective.signature_type;
+
+    if !account_matches {
+        return Err(anyhow!(
+            "credentials file account does not match the effective account; remove PM_PRIVATE_KEY/PM_FUNDER_ADDRESS overrides or update the YAML before authentication"
+        ));
+    }
+    Ok(())
+}
+
 pub fn persist_api_credentials(path: &Path, update: ApiCredentialUpdate<'_>) -> Result<()> {
     persist_api_credentials_with(path, update, |temp, target| {
         temp.persist(target)

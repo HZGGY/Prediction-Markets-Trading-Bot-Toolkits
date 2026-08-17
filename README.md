@@ -77,7 +77,7 @@ After copying `config.yaml.example` to an existing `config.yaml` and filling the
   auth derive-api-key
 ```
 
-These commands contact only `https://clob-v2.polymarket.com`. Create and derive are explicit and never silently fall back to each other. On success, only the three API credential fields in the existing YAML are atomically updated; terminal/log output shows only a redacted API-key summary. Obtaining credentials does not enable trading or disable mock mode. This development phase validated the flow with local loopback tests and did not execute either command against the real CLOB.
+These commands contact only `https://clob-v2.polymarket.com`. Create and derive are explicit and never silently fall back to each other. If `PM_PRIVATE_KEY` or `PM_FUNDER_ADDRESS` is set, its effective account must match the account already stored in the target YAML; otherwise the command stops before signing or networking. On success, only the three API credential fields in the existing YAML are atomically updated; terminal/log output shows only a redacted API-key summary. HTTP failures expose only safe status/method/path details, and a create conflict tells you to run `derive-api-key` explicitly. Obtaining credentials does not enable trading or disable mock mode. The tested SDK dependency graph is fixed by the tracked `Cargo.lock`. This development phase validated the flow with local loopback tests and did not execute either command against the real CLOB.
 
 </td>
 <td width="50%" valign="top">

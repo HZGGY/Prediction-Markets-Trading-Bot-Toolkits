@@ -77,7 +77,7 @@ cargo run --release -- run copy-trading
   auth derive-api-key
 ```
 
-这两个命令只允许连接 `https://clob-v2.polymarket.com`。Create 和 Derive 严格分离，不会静默 fallback。成功后只会原子更新既有 YAML 中的三个 API 凭据字段；终端和日志只显示脱敏后的 API Key 摘要。获取凭据不会自动开启交易，也不会关闭 mock 模式。本开发阶段只通过本地回环测试验证，未对真实 CLOB 执行任何一个命令。
+这两个命令只允许连接 `https://clob-v2.polymarket.com`。Create 和 Derive 严格分离，不会静默 fallback。如果设置了 `PM_PRIVATE_KEY` 或 `PM_FUNDER_ADDRESS`，其生效账户必须与目标 YAML 中已有账户一致，否则命令会在签名和联网前停止。成功后只会原子更新既有 YAML 中的三个 API 凭据字段；终端和日志只显示脱敏后的 API Key 摘要。HTTP 失败仅暴露安全的状态码、方法和端点信息；Create 冲突会明确提示手动运行 `derive-api-key`。获取凭据不会自动开启交易，也不会关闭 mock 模式；已测试的 SDK 依赖图由纳入版本控制的 `Cargo.lock` 固定。本开发阶段只通过本地回环测试验证，未对真实 CLOB 执行任何一个命令。
 
 </td>
 <td width="50%" valign="top">

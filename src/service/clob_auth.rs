@@ -3,6 +3,7 @@ use std::str::FromStr as _;
 use anyhow::{anyhow, Context as _, Result};
 use polymarket_client_sdk_v2::auth::{Credentials, ExposeSecret as _, LocalSigner, Signer as _};
 use polymarket_client_sdk_v2::clob::{Client, Config as SdkConfig};
+use polymarket_client_sdk_v2::error::{Status as SdkStatus, StatusCode as SdkStatusCode};
 use polymarket_client_sdk_v2::types::Address;
 use polymarket_client_sdk_v2::POLYGON;
 
@@ -68,6 +69,19 @@ async fn obtain_with_client<S: polymarket_client_sdk_v2::auth::Signer>(
             ApiKeyAction::Create => ("POST", "/auth/api-key"),
             ApiKeyAction::Derive => ("GET", "/auth/derive-api-key"),
         };
+        if let Some(status) = error.downcast_ref::<SdkStatus>() {
+            let suggestion = if request.action == ApiKeyAction::Create
+                && status.status_code == SdkStatusCode::CONFLICT
+            {
+                "; the API key may already exist—run `auth derive-api-key` explicitly"
+            } else {
+                ""
+            };
+            return anyhow!(
+                "CLOB L1 {method} {path} failed with HTTP {}{suggestion}",
+                status.status_code
+            );
+        }
         anyhow!("CLOB L1 {method} {path} failed ({:?})", error.kind())
     })?;
     validate_credentials(&credentials)?;
@@ -303,6 +317,8 @@ mod tests {
 
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].request_line, "POST /auth/api-key HTTP/1.1");
+        assert!(error.contains("409 Conflict"));
+        assert!(error.contains("derive-api-key"));
         assert!(!error.contains("fixture-secret-must-not-leak"));
     }
 
@@ -343,5 +359,9 @@ mod tests {
         let empty_secret =
             Credentials::new(Uuid::nil(), String::new(), "fixture-passphrase".to_owned());
         assert!(validate_credentials(&empty_secret).is_err());
+
+        let empty_passphrase =
+            Credentials::new(Uuid::nil(), "fixture-secret".to_owned(), String::new());
+        assert!(validate_credentials(&empty_passphrase).is_err());
     }
 }
