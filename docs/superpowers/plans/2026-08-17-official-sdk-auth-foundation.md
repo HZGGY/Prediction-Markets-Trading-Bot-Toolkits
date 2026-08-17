@@ -153,7 +153,7 @@ git commit -m "build: add official Polymarket V2 SDK"
 - Consumes: an existing credentials YAML path and `ApiCredentialUpdate<'_>`.
 - Produces: `pub fn persist_api_credentials(path: &Path, update: ApiCredentialUpdate<'_>) -> Result<()>`.
 
-- [ ] **Step 1: Write a failing success-path persistence test**
+- [x] **Step 1: Write a failing success-path persistence test**
 
 Add a test that uses the complete wished-for API; do not add the production type or function yet:
 
@@ -198,7 +198,7 @@ top_level_custom: 42
 }
 ```
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [x] **Step 2: Run the focused test and verify RED**
 
 ```powershell
 cargo test --offline config::tests::persists_api_credentials_without_changing_account_or_unknown_fields
@@ -206,7 +206,7 @@ cargo test --offline config::tests::persists_api_credentials_without_changing_ac
 
 Expected: compile failure because `persist_api_credentials` does not exist.
 
-- [ ] **Step 3: Implement only the success path**
+- [x] **Step 3: Implement only the success path**
 
 Add these imports and helpers in `src/config.rs`:
 
@@ -279,7 +279,7 @@ pub fn persist_api_credentials(path: &Path, update: ApiCredentialUpdate<'_>) -> 
 }
 ```
 
-- [ ] **Step 4: Run the focused success test and verify GREEN**
+- [x] **Step 4: Run the focused success test and verify GREEN**
 
 ```powershell
 cargo test --offline config::tests::persists_api_credentials_without_changing_account_or_unknown_fields
@@ -287,7 +287,7 @@ cargo test --offline config::tests::persists_api_credentials_without_changing_ac
 
 Expected: PASS.
 
-- [ ] **Step 5: Write a failing missing-file test**
+- [x] **Step 5: Write a failing missing-file test**
 
 ```rust
 #[test]
@@ -307,7 +307,7 @@ fn refuses_to_create_a_missing_credentials_file() {
 }
 ```
 
-- [ ] **Step 6: Run the missing-file test and verify RED**
+- [x] **Step 6: Run the missing-file test and verify RED**
 
 ```powershell
 cargo test --offline config::tests::refuses_to_create_a_missing_credentials_file
@@ -315,7 +315,7 @@ cargo test --offline config::tests::refuses_to_create_a_missing_credentials_file
 
 Expected: FAIL because the current read error does not provide the required precondition message.
 
-- [ ] **Step 7: Add the explicit existing-file precondition and verify GREEN**
+- [x] **Step 7: Add the explicit existing-file precondition and verify GREEN**
 
 Add this at the start of `persist_api_credentials`:
 
@@ -330,7 +330,7 @@ if !path.is_file() {
 
 Run the focused test again. Expected: PASS.
 
-- [ ] **Step 8: Write a failing empty-field rollback test**
+- [x] **Step 8: Write a failing empty-field rollback test**
 
 ```rust
 
@@ -353,7 +353,7 @@ fn rejects_empty_api_fields_without_changing_original_bytes() {
 }
 ```
 
-- [ ] **Step 9: Run the empty-field test and verify RED**
+- [x] **Step 9: Run the empty-field test and verify RED**
 
 ```powershell
 cargo test --offline config::tests::rejects_empty_api_fields_without_changing_original_bytes
@@ -361,7 +361,7 @@ cargo test --offline config::tests::rejects_empty_api_fields_without_changing_or
 
 Expected: FAIL because the success-path implementation writes an empty API key.
 
-- [ ] **Step 10: Add non-empty validation and verify GREEN**
+- [x] **Step 10: Add non-empty validation and verify GREEN**
 
 Add before reading the file:
 
@@ -379,7 +379,7 @@ for (name, value) in [
 
 Run the focused test again. Expected: PASS.
 
-- [ ] **Step 11: Write a failing persist-failure rollback test**
+- [x] **Step 11: Write a failing persist-failure rollback test**
 
 This test introduces the wished-for internal injection seam, which does not exist yet:
 
@@ -406,7 +406,7 @@ fn simulated_persist_failure_keeps_original_and_cleans_tempfile() {
 }
 ```
 
-- [ ] **Step 12: Run the persist-failure test and verify RED**
+- [x] **Step 12: Run the persist-failure test and verify RED**
 
 ```powershell
 cargo test --offline config::tests::simulated_persist_failure_keeps_original_and_cleans_tempfile
@@ -414,7 +414,7 @@ cargo test --offline config::tests::simulated_persist_failure_keeps_original_and
 
 Expected: compile failure because `persist_api_credentials_with` does not exist.
 
-- [ ] **Step 13: Extract the injectable persist seam and verify GREEN**
+- [x] **Step 13: Extract the injectable persist seam and verify GREEN**
 
 Make the public function delegate to the private helper without changing successful behavior:
 
@@ -491,7 +491,7 @@ where
 }
 ```
 
-- [ ] **Step 14: Run all config tests and verify GREEN**
+- [x] **Step 14: Run all config tests and verify GREEN**
 
 ```powershell
 cargo test --offline config::tests
@@ -499,7 +499,7 @@ cargo test --offline config::tests
 
 Expected: all config tests PASS.
 
-- [ ] **Step 15: Commit Task 2**
+- [x] **Step 15: Commit Task 2**
 
 ```powershell
 git add -- src/config.rs

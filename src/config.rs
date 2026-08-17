@@ -4,8 +4,10 @@
 //! - `config.json` — public settings (committed)
 //! - `config.yaml` — credentials (gitignored, must never be committed)
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_yaml::{Mapping, Value};
+use std::io::Write as _;
 use std::path::Path;
 
 pub const OFFICIAL_CLOB_V2_HOST: &str = "https://clob-v2.polymarket.com";
@@ -201,6 +203,23 @@ pub struct Credentials {
     pub api_passphrase: Option<String>,
 }
 
+pub struct ApiCredentialUpdate<'a> {
+    pub api_key: &'a str,
+    pub api_secret: &'a str,
+    pub api_passphrase: &'a str,
+}
+
+fn yaml_key(name: &str) -> Value {
+    Value::String(name.to_owned())
+}
+
+fn required_mapping<'a>(mapping: &'a mut Mapping, key: &str) -> Result<&'a mut Mapping> {
+    mapping
+        .get_mut(&yaml_key(key))
+        .and_then(Value::as_mapping_mut)
+        .ok_or_else(|| anyhow!("credentials YAML must contain a '{key}' mapping"))
+}
+
 #[derive(Debug, Deserialize)]
 struct CredentialsFile {
     bot: CredentialsBot,
@@ -258,6 +277,82 @@ impl AppConfig {
     }
 }
 
+pub fn persist_api_credentials(path: &Path, update: ApiCredentialUpdate<'_>) -> Result<()> {
+    persist_api_credentials_with(path, update, |temp, target| {
+        temp.persist(target)
+            .map(|_| ())
+            .map_err(|error| anyhow!(error.error))
+    })
+}
+
+fn persist_api_credentials_with<F>(
+    path: &Path,
+    update: ApiCredentialUpdate<'_>,
+    persist: F,
+) -> Result<()>
+where
+    F: FnOnce(tempfile::NamedTempFile, &Path) -> Result<()>,
+{
+    for (name, value) in [
+        ("api_key", update.api_key),
+        ("api_secret", update.api_secret),
+        ("api_passphrase", update.api_passphrase),
+    ] {
+        if value.trim().is_empty() {
+            return Err(anyhow!("{name} must not be empty"));
+        }
+    }
+
+    if !path.is_file() {
+        return Err(anyhow!(
+            "credentials file must already exist: {}",
+            path.display()
+        ));
+    }
+
+    let original = std::fs::read(path)
+        .with_context(|| format!("reading credentials from {}", path.display()))?;
+    let mut root: Value = serde_yaml::from_slice(&original).context("parsing config.yaml")?;
+    let root_mapping = root
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow!("credentials YAML root must be a mapping"))?;
+    let bot = required_mapping(root_mapping, "bot")?;
+
+    for required in ["private_key", "funder_address", "signature_type"] {
+        if !bot.contains_key(&yaml_key(required)) {
+            return Err(anyhow!("credentials YAML is missing bot.{required}"));
+        }
+    }
+    bot.insert(
+        yaml_key("api_key"),
+        Value::String(update.api_key.to_owned()),
+    );
+    bot.insert(
+        yaml_key("api_secret"),
+        Value::String(update.api_secret.to_owned()),
+    );
+    bot.insert(
+        yaml_key("api_passphrase"),
+        Value::String(update.api_passphrase.to_owned()),
+    );
+
+    let rendered = serde_yaml::to_string(&root).context("serializing config.yaml")?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("credentials path has no parent directory"))?;
+    let mut temp = tempfile::Builder::new()
+        .prefix(".polymarket-credentials-")
+        .tempfile_in(parent)
+        .context("creating temporary credentials file")?;
+    temp.as_file()
+        .set_permissions(std::fs::metadata(path)?.permissions())?;
+    temp.write_all(rendered.as_bytes())?;
+    temp.flush()?;
+    temp.as_file().sync_all()?;
+    persist(temp, path)?;
+    Ok(())
+}
+
 fn default_true() -> bool {
     true
 }
@@ -280,5 +375,104 @@ mod tests {
             assert!(cfg.credentials.api_secret.is_none());
             assert!(cfg.credentials.api_passphrase.is_none());
         }
+    }
+
+    #[test]
+    fn persists_api_credentials_without_changing_account_or_unknown_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        let before = r#"bot:
+  private_key: fixture-private-key
+  funder_address: 0x1111111111111111111111111111111111111111
+  signature_type: 0
+  custom_field: keep-me
+top_level_custom: 42
+"#;
+        std::fs::write(&path, before).unwrap();
+
+        persist_api_credentials(
+            &path,
+            ApiCredentialUpdate {
+                api_key: "00000000-0000-0000-0000-000000000000",
+                api_secret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                api_passphrase: "fixture-passphrase",
+            },
+        )
+        .unwrap();
+
+        let value: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["bot"]["private_key"], "fixture-private-key");
+        assert_eq!(value["bot"]["custom_field"], "keep-me");
+        assert_eq!(value["top_level_custom"], 42);
+        assert_eq!(
+            value["bot"]["api_key"],
+            "00000000-0000-0000-0000-000000000000"
+        );
+        assert_eq!(
+            value["bot"]["api_secret"],
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        );
+        assert_eq!(value["bot"]["api_passphrase"], "fixture-passphrase");
+    }
+
+    #[test]
+    fn refuses_to_create_a_missing_credentials_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.yaml");
+        let result = persist_api_credentials(
+            &path,
+            ApiCredentialUpdate {
+                api_key: "key",
+                api_secret: "secret",
+                api_passphrase: "passphrase",
+            },
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("must already exist"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn rejects_empty_api_fields_without_changing_original_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        let before = b"bot:\n  private_key: key\n  funder_address: addr\n  signature_type: 0\n";
+        std::fs::write(&path, before).unwrap();
+        let result = persist_api_credentials(
+            &path,
+            ApiCredentialUpdate {
+                api_key: "",
+                api_secret: "secret",
+                api_passphrase: "passphrase",
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn simulated_persist_failure_keeps_original_and_cleans_tempfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        let before = b"bot:\n  private_key: key\n  funder_address: addr\n  signature_type: 0\n";
+        std::fs::write(&path, before).unwrap();
+        let result = persist_api_credentials_with(
+            &path,
+            ApiCredentialUpdate {
+                api_key: "key",
+                api_secret: "secret",
+                api_passphrase: "passphrase",
+            },
+            |_temp, _target| Err(anyhow!("simulated persist failure")),
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("simulated persist failure"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }
