@@ -518,7 +518,7 @@ git commit -m "feat: atomically persist CLOB API credentials"
 - Consumes: `AppConfig`, `OFFICIAL_CLOB_V2_HOST`, official SDK `LocalSigner`, `Client`, and `Credentials`.
 - Produces: `ApiKeyAction`, `AuthRequest`, `ensure_official_v2_host`, and `obtain_api_credentials`.
 
-- [ ] **Step 1: Write a failing exact-host validation test**
+- [x] **Step 1: Write a failing exact-host validation test**
 
 Create `src/service/clob_auth.rs` with tests that describe the public API before implementation:
 
@@ -545,7 +545,7 @@ mod tests {
 
 Use the same public test-only private keys already present in `src/service/clob.rs`; never copy a user key into tests.
 
-- [ ] **Step 2: Register the module and verify RED**
+- [x] **Step 2: Register the module and verify RED**
 
 Add to `src/service/mod.rs`:
 
@@ -561,7 +561,7 @@ cargo test --offline service::clob_auth::tests::production_auth_accepts_only_exa
 
 Expected: compile failure because the wished-for API is not implemented.
 
-- [ ] **Step 3: Implement only the public types and exact host validation**
+- [x] **Step 3: Implement only the public types and exact host validation**
 
 Use only official SDK types inside this module:
 
@@ -591,7 +591,7 @@ pub fn ensure_official_v2_host(host: &str) -> Result<()> {
 }
 ```
 
-- [ ] **Step 4: Run the exact-host test and verify GREEN**
+- [x] **Step 4: Run the exact-host test and verify GREEN**
 
 ```powershell
 cargo test --offline service::clob_auth::tests::production_auth_accepts_only_exact_official_v2_host
@@ -599,7 +599,7 @@ cargo test --offline service::clob_auth::tests::production_auth_accepts_only_exa
 
 Expected: PASS without opening a socket.
 
-- [ ] **Step 5: Write failing loopback endpoint/header tests**
+- [x] **Step 5: Write failing loopback endpoint/header tests**
 
 First add this validation test, then add the loopback fixture and endpoint tests below. They intentionally refer to functions that do not exist yet:
 
@@ -829,7 +829,7 @@ fn empty_sdk_credential_fields_are_rejected() {
 
 Before writing production changes for these tests, state which dispatch arm or missing helper will make each test fail.
 
-- [ ] **Step 6: Run each endpoint test and verify RED**
+- [x] **Step 6: Run each endpoint test and verify RED**
 
 ```powershell
 cargo test --offline service::clob_auth::tests::create_uses_only_post_api_key_with_l1_headers_and_nonce
@@ -842,7 +842,7 @@ cargo test --offline service::clob_auth::tests::empty_sdk_credential_fields_are_
 
 Expected: each test fails for the missing loopback client injection or incorrect dispatch behavior, not for external DNS/network access.
 
-- [ ] **Step 7: Implement signer validation, explicit SDK dispatch, sanitized errors, and returned-credential validation**
+- [x] **Step 7: Implement signer validation, explicit SDK dispatch, sanitized errors, and returned-credential validation**
 
 Add these imports:
 
@@ -934,7 +934,7 @@ fn validate_credentials(credentials: &Credentials) -> Result<()> {
 
 Call `validate_credentials(&credentials)?` after either explicit SDK method. Do not format `credentials` with `Debug` in any error.
 
-- [ ] **Step 8: Run the complete adapter test module and verify GREEN**
+- [x] **Step 8: Run the complete adapter test module and verify GREEN**
 
 ```powershell
 cargo test --offline service::clob_auth::tests
@@ -942,7 +942,7 @@ cargo test --offline service::clob_auth::tests
 
 Expected: all adapter tests PASS using loopback only.
 
-- [ ] **Step 9: Commit Task 3**
+- [x] **Step 9: Commit Task 3**
 
 ```powershell
 git add -- src/service/clob_auth.rs src/service/mod.rs

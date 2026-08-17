@@ -13,6 +13,7 @@
 //! - [`position_monitor`] — TP/SL polling loop, posts exit FAKs through the CLOB
 
 pub mod clob;
+pub mod clob_auth;
 pub mod eligibility;
 pub mod market_cache;
 pub mod midprice;
