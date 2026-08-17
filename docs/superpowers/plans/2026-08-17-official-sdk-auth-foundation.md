@@ -960,7 +960,7 @@ git commit -m "feat: add official SDK L1 auth adapter"
 - Consumes: `obtain_api_credentials`, `persist_api_credentials`, global `--config`, and global `--credentials`.
 - Produces: `auth create-api-key [--nonce N]` and `auth derive-api-key [--nonce N]`.
 
-- [ ] **Step 1: Write failing Clap parser tests**
+- [x] **Step 1: Write failing Clap parser tests**
 
 Derive `PartialEq, Eq` for auth command types and add tests in `src/main.rs`:
 
@@ -1005,7 +1005,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run parser tests and verify RED**
+- [x] **Step 2: Run parser tests and verify RED**
 
 ```powershell
 cargo test --offline --bin polymarket-toolkits parses_create_api_key_with_nonce
@@ -1014,7 +1014,7 @@ cargo test --offline --bin polymarket-toolkits parses_derive_api_key_with_defaul
 
 Expected: compile failure because `Command::Auth` and `AuthCommand` do not exist.
 
-- [ ] **Step 3: Implement nested auth command types**
+- [x] **Step 3: Implement nested auth command types**
 
 Add:
 
@@ -1044,11 +1044,11 @@ Auth {
 },
 ```
 
-- [ ] **Step 4: Run parser tests and verify GREEN**
+- [x] **Step 4: Run parser tests and verify GREEN**
 
 Run both focused commands from Step 2. Expected: PASS.
 
-- [ ] **Step 5: Write a failing redaction test**
+- [x] **Step 5: Write a failing redaction test**
 
 ```rust
 #[test]
@@ -1069,7 +1069,7 @@ cargo test --offline --bin polymarket-toolkits api_key_summary_never_contains_th
 
 Expected: compile failure because `redact_api_key` does not exist.
 
-- [ ] **Step 6: Implement only API-key redaction and verify GREEN**
+- [x] **Step 6: Implement only API-key redaction and verify GREEN**
 
 ```rust
 fn redact_api_key(key: &str) -> String {
@@ -1082,7 +1082,7 @@ fn redact_api_key(key: &str) -> String {
 
 Run the focused redaction test again. Expected: PASS.
 
-- [ ] **Step 7: Write a failing pre-network credentials-file test**
+- [x] **Step 7: Write a failing pre-network credentials-file test**
 
 Add this test using a committed-config fixture but a nonexistent credentials path:
 
@@ -1112,7 +1112,7 @@ cargo test --offline --bin polymarket-toolkits auth_refuses_missing_credentials_
 
 Expected: compile failure because `run_auth` does not exist. The test must never open a socket.
 
-- [ ] **Step 8: Implement auth command orchestration**
+- [x] **Step 8: Implement auth command orchestration**
 
 Import only the needed secret accessor in `main.rs`:
 
@@ -1184,7 +1184,7 @@ Some(Command::Auth { command }) => run_auth(&cfg, &credentials_path, command).aw
 
 Do not invoke auth from TUI startup, bot startup, or config loading.
 
-- [ ] **Step 9: Run CLI tests and inspect help without executing auth**
+- [x] **Step 9: Run CLI tests and inspect help without executing auth**
 
 ```powershell
 cargo test --offline --bin polymarket-toolkits
@@ -1196,7 +1196,7 @@ cargo run --offline -- auth derive-api-key --help
 
 Expected: tests PASS; help text states that auth contacts the official V2 host and never places an order. Do not run either command without `--help`.
 
-- [ ] **Step 10: Commit Task 4**
+- [x] **Step 10: Commit Task 4**
 
 ```powershell
 git add -- src/main.rs
