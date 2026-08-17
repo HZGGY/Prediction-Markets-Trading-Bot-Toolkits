@@ -59,7 +59,25 @@ cargo run --release -- run copy-trading
 
 Every bot ships with `enable_trading: false` by default — the full execution path runs in dry-run until *you* flip it. Per-venue configs and walkthroughs live in each [venue repo](#venue-coverage).
 
-> **Local Polymarket CLOB V2 status (2026-08-17):** raw V2 EIP-712 order signing, API-key `owner`, and official-compatible L2 HMAC request serialization are implemented for EOA accounts only (`signature_type: 0`), including standard/neg-risk exchange selection from Gamma market metadata. Proxy, Safe, and POLY_1271 accounts are rejected. pUSD funding/approval, API credential creation, and live order round-trips remain separate prerequisites; the default configuration stays in dry-run and must not be treated as live-trading approval.
+> **Local Polymarket CLOB V2 status (2026-08-17):** official Rust SDK L1 API-key creation/derivation and the existing raw V2 order path are available for EOA accounts only (`signature_type: 0`). Proxy, Safe, and POLY_1271 accounts are rejected. pUSD funding/approval and live order round-trips remain separate prerequisites; the default configuration stays in dry-run and must not be treated as live-trading approval.
+
+#### Explicit CLOB API credential commands
+
+After copying `config.yaml.example` to an existing `config.yaml` and filling the EOA private key, matching funder address, and `signature_type: 0`, choose exactly one operation:
+
+```powershell
+.\target\release\polymarket-toolkits.exe `
+  --config .\config.json `
+  --credentials .\config.yaml `
+  auth create-api-key
+
+.\target\release\polymarket-toolkits.exe `
+  --config .\config.json `
+  --credentials .\config.yaml `
+  auth derive-api-key
+```
+
+These commands contact only `https://clob-v2.polymarket.com`. Create and derive are explicit and never silently fall back to each other. On success, only the three API credential fields in the existing YAML are atomically updated; terminal/log output shows only a redacted API-key summary. Obtaining credentials does not enable trading or disable mock mode. This development phase validated the flow with local loopback tests and did not execute either command against the real CLOB.
 
 </td>
 <td width="50%" valign="top">

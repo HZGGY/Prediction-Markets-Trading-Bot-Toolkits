@@ -1217,7 +1217,7 @@ git commit -m "feat: add explicit CLOB API credential commands"
 - Consumes: the final CLI syntax and persistence behavior from Tasks 1–4.
 - Produces: user-facing instructions that do not encourage real execution during this phase.
 
-- [ ] **Step 1: Add English and Chinese phase-1 usage notes**
+- [x] **Step 1: Add English and Chinese phase-1 usage notes**
 
 Document exactly these commands as future manual operations, without running them:
 
@@ -1242,7 +1242,7 @@ State that:
 - credentials do not enable trading;
 - this development phase did not execute either command.
 
-- [ ] **Step 2: Update `config.yaml.example` comments**
+- [x] **Step 2: Update `config.yaml.example` comments**
 
 Replace the statement that automatic L1 credential creation is not implemented with:
 
@@ -1255,7 +1255,7 @@ Replace the statement that automatic L1 credential creation is not implemented w
   # api_passphrase: ""
 ```
 
-- [ ] **Step 3: Run documentation and safety scans**
+- [x] **Step 3: Run documentation and safety scans**
 
 ```powershell
 rg -n "clob\.polymarket\.com|create-or-derive|create_or_derive" README.md README.zh-CN.md config.json config.dryrun-public.json config.yaml.example src/main.rs src/service/clob_auth.rs
@@ -1264,7 +1264,7 @@ rg -n '"enable_trading"\s*:\s*true|"mock_trading"\s*:\s*false|api_key:\s*"[^\"]+
 
 Expected: old HTTP host and silent fallback references are absent from the intended V2 HTTP/auth documentation; safety scan has no matches. The existing WebSocket hostname containing `clob.polymarket.com` is allowed and must not be changed in this phase.
 
-- [ ] **Step 4: Commit Task 5**
+- [x] **Step 4: Commit Task 5**
 
 ```powershell
 git add -- README.md README.zh-CN.md config.yaml.example docs/superpowers/plans/2026-08-17-official-sdk-auth-foundation.md

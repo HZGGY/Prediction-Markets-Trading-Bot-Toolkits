@@ -13,8 +13,9 @@ bot:
   # Explicit Polymarket signature type. Only EOA (0) is supported in phase 1.
   signature_type: 0
 
-  # Pre-issued CLOB API credentials (L2 auth), required for live POSTs.
-  # Automatic L1 credential creation is not implemented in this phase.
+  # Copy this example to config.yaml and fill the EOA fields before running
+  # `auth create-api-key` or `auth derive-api-key`. The auth command updates
+  # only these three API fields and never enables trading.
   # api_key: ""
   # api_secret: ""      # URL-safe Base64 value returned by the CLOB API.
   # api_passphrase: ""

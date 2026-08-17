@@ -59,7 +59,25 @@ cargo run --release -- run copy-trading
 
 每款机器人默认 `enable_trading: false`——完整执行链路会一直空跑，直到**你**亲手打开实盘。各平台配置与图文讲解见对应的[平台仓库](#平台覆盖)。
 
-> **本地 Polymarket CLOB V2 状态（2026-08-17）：** 已实现 EOA 账户（仅 `signature_type: 0`）的 V2 EIP-712 原始订单签名、以 API Key 作为 `owner` 的请求体，以及兼容官方客户端的 L2 HMAC 序列化，并根据 Gamma 市场元数据选择 standard/neg-risk exchange；代理钱包、Safe 和 POLY_1271 会被拒绝。pUSD 资金/授权、API 凭据创建和真实订单往返测试仍是独立前置条件；默认配置继续保持 dry-run，不代表已经获准开启实盘。
+> **本地 Polymarket CLOB V2 状态（2026-08-17）：** 已提供官方 Rust SDK L1 API 凭据创建/派生能力，并保留现有 V2 原始订单路径；当前仅支持 EOA 账户（`signature_type: 0`）。代理钱包、Safe 和 POLY_1271 会被拒绝。pUSD 资金/授权和真实订单往返测试仍是独立前置条件；默认配置继续保持 dry-run，不代表已经获准开启实盘。
+
+#### 显式 CLOB API 凭据命令
+
+先将 `config.yaml.example` 复制为已存在的 `config.yaml`，填入 EOA 私钥、与私钥匹配的 funder 地址和 `signature_type: 0`，然后明确选择其中一个操作：
+
+```powershell
+.\target\release\polymarket-toolkits.exe `
+  --config .\config.json `
+  --credentials .\config.yaml `
+  auth create-api-key
+
+.\target\release\polymarket-toolkits.exe `
+  --config .\config.json `
+  --credentials .\config.yaml `
+  auth derive-api-key
+```
+
+这两个命令只允许连接 `https://clob-v2.polymarket.com`。Create 和 Derive 严格分离，不会静默 fallback。成功后只会原子更新既有 YAML 中的三个 API 凭据字段；终端和日志只显示脱敏后的 API Key 摘要。获取凭据不会自动开启交易，也不会关闭 mock 模式。本开发阶段只通过本地回环测试验证，未对真实 CLOB 执行任何一个命令。
 
 </td>
 <td width="50%" valign="top">
