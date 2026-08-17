@@ -25,6 +25,7 @@ url = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+base64 = "0.22"
 
 # Errors / logging
 anyhow = "1"

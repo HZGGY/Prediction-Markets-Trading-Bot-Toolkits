@@ -69,9 +69,7 @@ pub fn check(filters: &FiltersConfig, market: &MarketInfo) -> Eligibility {
 }
 
 fn ci_eq(a: &str, b: &str) -> bool {
-    a.len() == b.len() && a.chars().zip(b.chars()).all(|(x, y)| {
-        x.to_ascii_lowercase() == y.to_ascii_lowercase()
-    })
+    a.len() == b.len() && a.chars().zip(b.chars()).all(|(x, y)| x.eq_ignore_ascii_case(&y))
 }
 
 #[cfg(test)]
@@ -87,6 +85,7 @@ mod tests {
             category: category.map(String::from),
             tags: tags.iter().map(|s| s.to_string()).collect(),
             closed: false,
+            neg_risk: false,
         }
     }
 

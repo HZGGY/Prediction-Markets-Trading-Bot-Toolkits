@@ -59,6 +59,8 @@ cargo run --release -- run copy-trading
 
 每款机器人默认 `enable_trading: false`——完整执行链路会一直空跑，直到**你**亲手打开实盘。各平台配置与图文讲解见对应的[平台仓库](#平台覆盖)。
 
+> **本地 Polymarket CLOB V2 状态（2026-08-17）：** 已实现 EOA 账户（仅 `signature_type: 0`）的 V2 EIP-712 原始订单签名、以 API Key 作为 `owner` 的请求体，以及兼容官方客户端的 L2 HMAC 序列化，并根据 Gamma 市场元数据选择 standard/neg-risk exchange；代理钱包、Safe 和 POLY_1271 会被拒绝。pUSD 资金/授权、API 凭据创建和真实订单往返测试仍是独立前置条件；默认配置继续保持 dry-run，不代表已经获准开启实盘。
+
 </td>
 <td width="50%" valign="top">
 
@@ -185,7 +187,7 @@ cargo run --release -- run copy-trading
 
 | 平台 | 类型 | 运行中的策略 |
 |---|---|---|
-| **Polymarket** | 去中心化（Polygon / USDC） | 全部 10 款 — 完整覆盖 |
+| **Polymarket** | 去中心化（Polygon / pUSD） | 全部 10 款 — 完整覆盖 |
 | **Kalshi** | CFTC 监管（美国） | 跨平台套利 · 结算狙击 · OBI · 做市 · 方向性套利 · 价差耕作 · 体育 |
 | **Limitless** | 链上订单簿 | 结算狙击 · OBI · 价差耕作 |
 | **Drift BET** | Solana | BTC 套利 · OBI · 做市 · 鲸鱼信号 |

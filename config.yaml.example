@@ -6,12 +6,15 @@ bot:
   # Your trading wallet private key — 64 hex chars, no 0x prefix.
   private_key: "0000000000000000000000000000000000000000000000000000000000000000"
 
-  # Your Polymarket proxy/funder address. Find it on polymarket.com
-  # under your profile → "Deposit" — the address USDC was sent to.
+  # Phase 1 supports EOA accounts only. This must equal the address derived
+  # from private_key. Proxy, Safe, and POLY_1271 accounts are rejected.
   funder_address: "0x0000000000000000000000000000000000000000"
 
-  # Optional: pre-issued CLOB API credentials (L2 auth).
-  # If unset, the bot will create them on startup via the L1 EIP-712 flow.
+  # Explicit Polymarket signature type. Only EOA (0) is supported in phase 1.
+  signature_type: 0
+
+  # Pre-issued CLOB API credentials (L2 auth), required for live POSTs.
+  # Automatic L1 credential creation is not implemented in this phase.
   # api_key: ""
-  # api_secret: ""
+  # api_secret: ""      # URL-safe Base64 value returned by the CLOB API.
   # api_passphrase: ""

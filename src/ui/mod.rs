@@ -145,8 +145,7 @@ fn draw(f: &mut Frame, cfg: &AppConfig, state: &mut ListState) {
 
     let items: Vec<ListItem> = BOTS
         .iter()
-        .enumerate()
-        .map(|(_, k)| {
+        .map(|k| {
             let status = if k.is_production() { "✅" } else { "🚧" };
             let line = Line::from(vec![
                 Span::raw(format!("{status}  ")),

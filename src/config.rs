@@ -193,6 +193,7 @@ fn default_monitor_secs() -> u64 { 15 }
 pub struct Credentials {
     pub private_key: String,
     pub funder_address: String,
+    pub signature_type: Option<u8>,
     pub api_key: Option<String>,
     pub api_secret: Option<String>,
     pub api_passphrase: Option<String>,
@@ -207,6 +208,7 @@ struct CredentialsFile {
 struct CredentialsBot {
     private_key: String,
     funder_address: String,
+    signature_type: Option<u8>,
     api_key: Option<String>,
     api_secret: Option<String>,
     api_passphrase: Option<String>,
@@ -231,6 +233,7 @@ impl AppConfig {
             cfg.credentials = Credentials {
                 private_key: parsed.bot.private_key,
                 funder_address: parsed.bot.funder_address,
+                signature_type: parsed.bot.signature_type,
                 api_key: parsed.bot.api_key,
                 api_secret: parsed.bot.api_secret,
                 api_passphrase: parsed.bot.api_passphrase,

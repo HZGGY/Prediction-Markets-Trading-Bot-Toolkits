@@ -120,6 +120,7 @@ async fn monitor_once(
     let planned = PlannedOrder {
         venue: VenueId::Polymarket,
         token_id: pos.token_id.clone(),
+        neg_risk: pos.neg_risk,
         side: exit_side,
         shares: pos.shares,
         limit_price,
@@ -169,6 +170,7 @@ mod tests {
             slug: "s".into(),
             category: None,
             tags: vec![],
+            neg_risk: false,
             side,
             entry_price: entry,
             shares: 100.0,

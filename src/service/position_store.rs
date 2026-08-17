@@ -17,6 +17,7 @@ pub struct OpenPosition {
     pub slug: String,
     pub category: Option<String>,
     pub tags: Vec<String>,
+    pub neg_risk: bool,
     pub side: Side,
     pub entry_price: f64,
     pub shares: f64,
@@ -103,9 +104,7 @@ impl PositionStore {
 }
 
 fn ci_eq(a: &str, b: &str) -> bool {
-    a.len() == b.len() && a.chars().zip(b.chars()).all(|(x, y)| {
-        x.to_ascii_lowercase() == y.to_ascii_lowercase()
-    })
+    a.len() == b.len() && a.chars().zip(b.chars()).all(|(x, y)| x.eq_ignore_ascii_case(&y))
 }
 
 #[cfg(test)]
@@ -118,6 +117,7 @@ mod tests {
             slug: slug.into(),
             category: Some(cat.into()),
             tags: tags.iter().map(|s| s.to_string()).collect(),
+            neg_risk: false,
             side: Side::Buy,
             entry_price: 0.50,
             shares: usd * 2.0,

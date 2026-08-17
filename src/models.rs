@@ -57,6 +57,7 @@ impl WhaleTrade {
 pub struct PlannedOrder {
     pub venue: VenueId,
     pub token_id: String,
+    pub neg_risk: bool,
     pub side: Side,
     pub shares: f64,
     pub limit_price: f64,

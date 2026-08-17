@@ -27,7 +27,6 @@
 
 use crate::config::AppConfig;
 use crate::service::{
-    clob::ClobClient,
     market_cache::MarketCache,
     midprice::{ClobMidpriceSource, MidpriceSource},
     onchain::{spawn_subscription, LogFilter, RawLog},
@@ -145,6 +144,13 @@ async fn handle_log(executor: &OrderExecutor, whale: &str, log: &RawLog) -> Resu
     );
     match executor.execute(&trade).await? {
         ExecutionOutcome::Skipped(r) => info!(?r, "execution skipped"),
+        ExecutionOutcome::DryRunPlanned(planned) => info!(
+            token = %planned.token_id,
+            shares = planned.shares,
+            usd = planned.usd_notional,
+            price = planned.limit_price,
+            "dry-run order planned (not signed or submitted)"
+        ),
         ExecutionOutcome::DryRun(signed) => info!(
             token = %signed.token_id,
             shares = %signed.taker_amount,

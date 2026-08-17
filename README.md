@@ -59,6 +59,8 @@ cargo run --release -- run copy-trading
 
 Every bot ships with `enable_trading: false` by default — the full execution path runs in dry-run until *you* flip it. Per-venue configs and walkthroughs live in each [venue repo](#venue-coverage).
 
+> **Local Polymarket CLOB V2 status (2026-08-17):** raw V2 EIP-712 order signing, API-key `owner`, and official-compatible L2 HMAC request serialization are implemented for EOA accounts only (`signature_type: 0`), including standard/neg-risk exchange selection from Gamma market metadata. Proxy, Safe, and POLY_1271 accounts are rejected. pUSD funding/approval, API credential creation, and live order round-trips remain separate prerequisites; the default configuration stays in dry-run and must not be treated as live-trading approval.
+
 </td>
 <td width="50%" valign="top">
 
@@ -187,7 +189,7 @@ the rest of the prediction-market landscape is on the adapter-driven roadmap.
 
 | Venue | Type | Strategies running |
 |---|---|---|
-| [**Polymarket**](https://github.com/HarrierOnChain/Polymarket) | Decentralized (Polygon / USDC) | All 10 — full coverage |
+| [**Polymarket**](https://github.com/HarrierOnChain/Polymarket) | Decentralized (Polygon / pUSD) | All 10 — full coverage |
 | [**Kalshi**](https://github.com/HarrierOnChain/Kalshi) | CFTC-regulated (US) | Cross-arb · Resolution Sniper · OBI · Market Making · Directional Arb · Spread · Sports |
 | [**Limitless**](https://github.com/HarrierOnChain/Limitless-Exchange) | On-chain order book | Resolution Sniper · OBI · Spread Farming |
 | [**Drift BET**](https://github.com/HarrierOnChain/Drift-BET) | Solana | BTC Arb · OBI · Market Making · Whale Signal |

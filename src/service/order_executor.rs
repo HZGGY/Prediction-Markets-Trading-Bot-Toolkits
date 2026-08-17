@@ -31,6 +31,8 @@ pub struct OrderExecutor {
 #[derive(Debug, Clone)]
 pub enum ExecutionOutcome {
     Skipped(SkipReason),
+    /// Paper-only plan produced without credentials; no signature or POST.
+    DryRunPlanned(PlannedOrder),
     DryRun(SignedOrder),
     Submitted {
         order_id: Option<String>,
@@ -157,6 +159,7 @@ impl OrderExecutor {
         let planned = PlannedOrder {
             venue: trade.venue,
             token_id: trade.token_id.clone(),
+            neg_risk: market.neg_risk,
             side: trade.side,
             shares,
             limit_price,
@@ -166,6 +169,17 @@ impl OrderExecutor {
         };
 
         let Some(clob) = self.clob.as_ref() else {
+            if !self.cfg.live_trading_allowed() {
+                info!(
+                    token = %planned.token_id,
+                    side = ?planned.side,
+                    shares = planned.shares,
+                    price = planned.limit_price,
+                    "dry-run: order planned but not signed or submitted"
+                );
+                self.record_open(&market, &planned);
+                return Ok(ExecutionOutcome::DryRunPlanned(planned));
+            }
             return Ok(ExecutionOutcome::Skipped(SkipReason::TradingDisabled));
         };
 
@@ -249,6 +263,7 @@ impl OrderExecutor {
             slug: market.slug.clone(),
             category: market.category.clone(),
             tags: market.tags.clone(),
+            neg_risk: market.neg_risk,
             side: planned.side,
             entry_price: planned.limit_price,
             shares: planned.shares,
@@ -304,7 +319,115 @@ fn order_type_for(side: Side) -> OrderType {
 }
 
 fn ci_eq(a: &str, b: &str) -> bool {
-    a.len() == b.len() && a.chars().zip(b.chars()).all(|(x, y)| {
-        x.to_ascii_lowercase() == y.to_ascii_lowercase()
-    })
+    a.len() == b.len() && a.chars().zip(b.chars()).all(|(x, y)| x.eq_ignore_ascii_case(&y))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{Side, VenueId};
+    use crate::service::onchain::RawLog;
+    use crate::service::parse::{decode_whale_trade, order_filled_topic};
+    use crate::service::position_store::PositionStore;
+    use crate::service::risk_guard::RiskGuard;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    const MAKER: &str = "0x1111111111111111111111111111111111111111";
+
+    fn u256_word(value: u128) -> String {
+        format!("{value:064x}")
+    }
+
+    fn address_topic(address: &str) -> String {
+        format!("0x{}{}", "0".repeat(24), address.trim_start_matches("0x"))
+    }
+
+    fn order_filled_fixture() -> RawLog {
+        RawLog {
+            address: "0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e".into(),
+            topics: vec![
+                format!("0x{}", hex::encode(order_filled_topic().as_slice())),
+                format!("0x{}", "11".repeat(32)),
+                address_topic(MAKER),
+                address_topic("0x2222222222222222222222222222222222222222"),
+            ],
+            // makerAssetId=0 (USDC), takerAssetId=12345 (outcome token),
+            // makerAmountFilled=$100, takerAmountFilled=200 shares, fee=0.
+            data: format!(
+                "0x{}{}{}{}{}",
+                u256_word(0),
+                u256_word(12_345),
+                u256_word(100_000_000),
+                u256_word(200_000_000),
+                u256_word(0),
+            ),
+            tx_hash: "0xreplay-fixture".into(),
+            block_number: 123,
+        }
+    }
+
+    async fn serve_fixture_market(listener: TcpListener) {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 1024];
+        let _ = socket.read(&mut request).await.unwrap();
+        let body = r#"[{"slug":"fixture-market","question":"Fixture market","closed":false,"clobTokenIds":"[\"12345\",\"67890\"]","category":"Politics","tags":["election"]}]"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn order_filled_replay_without_credentials_records_paper_position() {
+        let trade = decode_whale_trade(&order_filled_fixture(), MAKER)
+            .unwrap()
+            .expect("fixture must decode for the tracked maker");
+        assert_eq!(trade.venue, VenueId::Polymarket);
+        assert_eq!(trade.side, Side::Buy);
+        assert_eq!(trade.token_id, "12345");
+        assert!((trade.shares - 200.0).abs() < 1e-9);
+        assert!((trade.usd_notional - 100.0).abs() < 1e-9);
+        assert!((trade.price - 0.5).abs() < 1e-9);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(serve_fixture_market(listener));
+
+        let mut cfg: AppConfig = serde_json::from_str(include_str!("../../config.json")).unwrap();
+        cfg.site.gamma_api_base = base;
+        cfg.tp_sl.enabled = false;
+
+        let risk = RiskGuard::new(cfg.risk.clone());
+        let markets = MarketCache::new(reqwest::Client::new(), cfg.site.gamma_api_base.clone());
+        let positions = PositionStore::new();
+        let executor = OrderExecutor::new(
+            cfg,
+            risk,
+            markets,
+            Arc::clone(&positions),
+        )
+        .unwrap();
+
+        let outcome = executor.execute(&trade).await.unwrap();
+        server.await.unwrap();
+
+        match outcome {
+            ExecutionOutcome::DryRunPlanned(planned) => {
+                assert_eq!(planned.token_id, "12345");
+                assert_eq!(planned.side, Side::Buy);
+                assert_eq!(planned.usd_notional, 20.0);
+                assert_eq!(planned.limit_price, 0.505);
+            }
+            other => panic!("paper dry-run must produce a plan: {other:?}"),
+        }
+        let position = positions
+            .get("12345")
+            .expect("paper dry-run should record the planned entry");
+        assert!((position.usd_notional - 20.0).abs() < 1e-9);
+        assert!((position.entry_price - 0.505).abs() < 1e-9);
+        assert_eq!(position.shares, 39.0);
+    }
 }

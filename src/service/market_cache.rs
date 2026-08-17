@@ -22,6 +22,7 @@ pub struct MarketInfo {
     pub category: Option<String>,
     pub tags: Vec<String>,
     pub closed: bool,
+    pub neg_risk: bool,
 }
 
 impl MarketInfo {
@@ -151,6 +152,10 @@ fn parse_market(m: &serde_json::Value) -> Result<MarketInfo> {
         .unwrap_or("")
         .to_string();
     let closed = m.get("closed").and_then(|v| v.as_bool()).unwrap_or(false);
+    let neg_risk = m
+        .get("negRisk")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     // Gamma stores the two CLOB token IDs as a JSON-encoded string array.
     // Decode defensively — older endpoints return them as a real array.
@@ -198,5 +203,25 @@ fn parse_market(m: &serde_json::Value) -> Result<MarketInfo> {
         category,
         tags,
         closed,
+        neg_risk,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_neg_risk_flag_from_gamma_market() {
+        let market = serde_json::json!({
+            "slug": "neg-risk-market",
+            "question": "Which outcome?",
+            "clobTokenIds": ["101", "102"],
+            "closed": false,
+            "negRisk": true
+        });
+
+        let parsed = parse_market(&market).unwrap();
+        assert!(parsed.neg_risk);
+    }
 }
