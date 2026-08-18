@@ -420,6 +420,35 @@ pub(crate) fn open_existing_restrictive(path: &Path, append: bool) -> Result<Fil
     Ok(file)
 }
 
+pub(crate) fn open_snapshot_guard_restrictive(path: &Path) -> Result<File, LedgerError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(unix_no_follow_flag()?);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    #[cfg(not(any(unix, windows)))]
+    return Err(LedgerError::new(LedgerErrorCode::UnsafePath));
+
+    let file = options
+        .open(path)
+        .map_err(|error| classify_open_error(path, error))?;
+    validate_opened_target(&file, path)?;
+    Ok(file)
+}
+
 fn acquire_lifetime_lock(file: &File) -> Result<(), LedgerError> {
     match file.try_lock() {
         Ok(()) => Ok(()),

@@ -11,7 +11,8 @@ use super::{
     model::{EventHash, LedgerError, LedgerErrorCode},
     projection::{ActiveIntent, LedgerProjection},
     storage::{
-        open_existing_restrictive, reject_existing_target, validate_opened_target, LedgerPaths,
+        open_snapshot_guard_restrictive, reject_existing_target, validate_opened_target,
+        LedgerPaths,
     },
 };
 
@@ -136,7 +137,7 @@ pub(crate) fn persist_snapshot<D: SnapshotDurability + ?Sized>(
     durability
         .persist_snapshot(temp, &paths.snapshot)
         .map_err(|_| LedgerError::new(LedgerErrorCode::SnapshotPersistFailed))?;
-    let file = open_existing_restrictive(&paths.snapshot, false)?;
+    let file = open_snapshot_guard_restrictive(&paths.snapshot)?;
     let mut persisted = PersistedSnapshot {
         file,
         path: paths.snapshot.clone(),
@@ -152,12 +153,14 @@ pub(crate) fn persist_snapshot<D: SnapshotDurability + ?Sized>(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use std::sync::{atomic::AtomicBool, Mutex};
     use std::{
         fs::{self, File},
         io::{self, Write},
         path::{Path, PathBuf},
         sync::{
-            atomic::{AtomicBool, AtomicUsize, Ordering},
+            atomic::{AtomicUsize, Ordering},
             Arc,
         },
     };
@@ -460,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn replacement_between_persist_and_publication_is_detected_and_poisons() {
+    fn publication_guard_denies_windows_mutation_and_detects_unix_replacement() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("execution-ledger.jsonl");
         let ops = Arc::new(FailingSnapshotOps::new(
@@ -470,25 +473,89 @@ mod tests {
 
         let result = ledger.append(intent_id(13), prepared_payload());
         #[cfg(windows)]
-        assert!(ops.replacement_denied.load(Ordering::SeqCst));
+        {
+            assert!(ops.write_denied.load(Ordering::SeqCst));
+            assert!(ops.delete_denied.load(Ordering::SeqCst));
+            assert!(ops.rename_denied.load(Ordering::SeqCst));
+            assert!(matches!(result.unwrap(), AppendOutcome::Appended(_)));
+            assert_eq!(ledger.projection().sequence, 1);
+            assert!(ledger.projection().active.is_some());
+            drop(ledger);
+            ExecutionLedger::open_live(path).unwrap();
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                result.unwrap_err().code(),
+                LedgerErrorCode::SnapshotMismatch
+            );
+            assert_eq!(ledger.projection().sequence, 0);
+            assert!(ledger.projection().active.is_none());
+            assert_eq!(
+                ledger
+                    .append(intent_id(13), prepared_payload())
+                    .unwrap_err()
+                    .code(),
+                LedgerErrorCode::Fatal
+            );
+            drop(ledger);
+            assert_eq!(
+                ExecutionLedger::open_live(path).unwrap_err().code(),
+                LedgerErrorCode::SnapshotMismatch
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn existing_snapshot_writer_conflict_poisons_before_projection_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("execution-ledger.jsonl");
+        let ops = Arc::new(FailingSnapshotOps::new(
+            SnapshotFailure::HoldWriterBeforeGuard,
+        ));
+        let ledger = ExecutionLedger::open_live_with_ops(&path, ops).unwrap();
+
         assert_eq!(
-            result.unwrap_err().code(),
+            ledger
+                .append(intent_id(14), prepared_payload())
+                .unwrap_err()
+                .code(),
+            LedgerErrorCode::Unavailable
+        );
+        assert_eq!(ledger.projection().sequence, 0);
+        assert!(ledger.projection().active.is_none());
+        assert_eq!(
+            ledger
+                .append(intent_id(14), prepared_payload())
+                .unwrap_err()
+                .code(),
+            LedgerErrorCode::Fatal
+        );
+    }
+
+    #[test]
+    fn corruption_before_guard_reopen_is_detected_and_poisons() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("execution-ledger.jsonl");
+        let ops = Arc::new(FailingSnapshotOps::new(SnapshotFailure::CorruptBeforeGuard));
+        let ledger = ExecutionLedger::open_live_with_ops(&path, ops).unwrap();
+
+        assert_eq!(
+            ledger
+                .append(intent_id(15), prepared_payload())
+                .unwrap_err()
+                .code(),
             LedgerErrorCode::SnapshotMismatch
         );
         assert_eq!(ledger.projection().sequence, 0);
         assert!(ledger.projection().active.is_none());
         assert_eq!(
             ledger
-                .append(intent_id(13), prepared_payload())
+                .append(intent_id(15), prepared_payload())
                 .unwrap_err()
                 .code(),
             LedgerErrorCode::Fatal
-        );
-        drop(ledger);
-
-        assert_eq!(
-            ExecutionLedger::open_live(path).unwrap_err().code(),
-            LedgerErrorCode::SnapshotMismatch
         );
     }
 
@@ -638,6 +705,9 @@ mod tests {
         Flush,
         Sync,
         PersistOn(usize),
+        CorruptBeforeGuard,
+        #[cfg(windows)]
+        HoldWriterBeforeGuard,
         ReplaceDuringDirectorySync,
         DirectorySync,
     }
@@ -645,7 +715,14 @@ mod tests {
     struct FailingSnapshotOps {
         failure: SnapshotFailure,
         persist_calls: AtomicUsize,
-        replacement_denied: AtomicBool,
+        #[cfg(windows)]
+        write_denied: AtomicBool,
+        #[cfg(windows)]
+        delete_denied: AtomicBool,
+        #[cfg(windows)]
+        rename_denied: AtomicBool,
+        #[cfg(windows)]
+        held_writer: Mutex<Option<File>>,
     }
 
     impl FailingSnapshotOps {
@@ -653,7 +730,14 @@ mod tests {
             Self {
                 failure,
                 persist_calls: AtomicUsize::new(0),
-                replacement_denied: AtomicBool::new(false),
+                #[cfg(windows)]
+                write_denied: AtomicBool::new(false),
+                #[cfg(windows)]
+                delete_denied: AtomicBool::new(false),
+                #[cfg(windows)]
+                rename_denied: AtomicBool::new(false),
+                #[cfg(windows)]
+                held_writer: Mutex::new(None),
             }
         }
     }
@@ -720,7 +804,23 @@ mod tests {
             }
             temp.persist(target)
                 .map(|_| ())
-                .map_err(|error| error.error)
+                .map_err(|error| error.error)?;
+            if matches!(self.failure, SnapshotFailure::CorruptBeforeGuard) {
+                fs::write(target, stale_snapshot_bytes()?)?;
+            }
+            #[cfg(windows)]
+            if matches!(self.failure, SnapshotFailure::HoldWriterBeforeGuard) {
+                use std::os::windows::fs::OpenOptionsExt;
+
+                const FILE_SHARE_READ: u32 = 0x1;
+                const FILE_SHARE_WRITE: u32 = 0x2;
+                let writer = fs::OpenOptions::new()
+                    .write(true)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                    .open(target)?;
+                *self.held_writer.lock().unwrap() = Some(writer);
+            }
+            Ok(())
         }
 
         fn sync_snapshot_directory(&self, path: &Path) -> io::Result<()> {
@@ -729,27 +829,55 @@ mod tests {
             }
             if matches!(self.failure, SnapshotFailure::ReplaceDuringDirectorySync) {
                 let target = path.join("execution-ledger.jsonl.active.json");
-                let stale = serde_json::to_vec(&ActiveSnapshot {
-                    schema_version: ACTIVE_SNAPSHOT_SCHEMA_VERSION,
-                    sequence: 0,
-                    head_hash: EventHash::default(),
-                    active_intent: None,
-                })
-                .map_err(io::Error::other)?;
-                if let Err(error) = fs::remove_file(&target) {
-                    #[cfg(windows)]
-                    if error.kind() == io::ErrorKind::PermissionDenied
-                        || matches!(error.raw_os_error(), Some(5 | 32 | 33))
-                    {
-                        self.replacement_denied.store(true, Ordering::SeqCst);
-                        fs::write(target, stale)?;
-                        return Ok(());
+                let stale = stale_snapshot_bytes()?;
+                #[cfg(windows)]
+                {
+                    match fs::write(&target, &stale) {
+                        Err(error) if windows_sharing_denied(&error) => {
+                            self.write_denied.store(true, Ordering::SeqCst);
+                        }
+                        Err(error) => return Err(error),
+                        Ok(()) => {}
                     }
-                    return Err(error);
+                    let renamed = path.join("execution-ledger.jsonl.active.attack.json");
+                    match fs::rename(&target, &renamed) {
+                        Err(error) if windows_sharing_denied(&error) => {
+                            self.rename_denied.store(true, Ordering::SeqCst);
+                        }
+                        Err(error) => return Err(error),
+                        Ok(()) => fs::rename(&renamed, &target)?,
+                    }
+                    match fs::remove_file(&target) {
+                        Err(error) if windows_sharing_denied(&error) => {
+                            self.delete_denied.store(true, Ordering::SeqCst);
+                        }
+                        Err(error) => return Err(error),
+                        Ok(()) => fs::write(&target, &stale)?,
+                    }
                 }
-                fs::write(target, stale)?;
+                #[cfg(not(windows))]
+                {
+                    fs::remove_file(&target)?;
+                    fs::write(&target, stale)?;
+                }
             }
             Ok(())
         }
+    }
+
+    fn stale_snapshot_bytes() -> io::Result<Vec<u8>> {
+        serde_json::to_vec(&ActiveSnapshot {
+            schema_version: ACTIVE_SNAPSHOT_SCHEMA_VERSION,
+            sequence: 0,
+            head_hash: EventHash::default(),
+            active_intent: None,
+        })
+        .map_err(io::Error::other)
+    }
+
+    #[cfg(windows)]
+    fn windows_sharing_denied(error: &io::Error) -> bool {
+        error.kind() == io::ErrorKind::PermissionDenied
+            || matches!(error.raw_os_error(), Some(5 | 32 | 33))
     }
 }
