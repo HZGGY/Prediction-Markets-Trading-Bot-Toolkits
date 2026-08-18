@@ -160,12 +160,18 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Utc;
     use parking_lot::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     use super::*;
+    use crate::config::AppConfig;
     use crate::service::execution_circuit_breaker::ExecutionCircuitBreaker;
+    use crate::service::market_cache::MarketCache;
+    use crate::service::order_executor::test_support;
     use crate::service::order_gateway::{
         OrderErrorCode, OrderGateway, OrderReceipt, OrderSubmitError,
     };
+    use crate::service::risk_guard::RiskGuard;
 
     fn pos(entry: f64, tp: f64, sl: f64, side: Side) -> OpenPosition {
         OpenPosition {
@@ -277,11 +283,12 @@ mod tests {
         let position = pos(0.50, 30.0, 20.0, Side::Buy);
         positions.open(position.clone());
         let dir = tempfile::tempdir().unwrap();
-        let breaker =
-            ExecutionCircuitBreaker::new_live(dir.path().join("execution-halt.json")).unwrap();
-        let gateway = Arc::new(FakeGateway::returning(Err(OrderSubmitError::Uncertain {
+        let marker = dir.path().join("execution-halt.json");
+        let breaker = ExecutionCircuitBreaker::new_live(marker.clone()).unwrap();
+        let gateway_fake = Arc::new(FakeGateway::returning(Err(OrderSubmitError::Uncertain {
             code: OrderErrorCode::PostTransport,
         })));
+        let gateway: Arc<dyn OrderGateway> = gateway_fake.clone();
 
         let result = monitor_once(
             &position,
@@ -296,11 +303,63 @@ mod tests {
         assert!(result.is_err());
         assert!(positions.get("t").is_some());
         assert!(breaker.is_halted());
-        assert!(breaker
-            .submit_fok(gateway.as_ref(), &exit_plan(&position, 0.70, 0.005))
-            .await
-            .is_err());
-        assert_eq!(gateway.calls(), 1);
+        assert!(marker.is_file());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut cfg: AppConfig = serde_json::from_str(include_str!("../../config.json")).unwrap();
+        cfg.site.gamma_api_base = format!("http://{}", listener.local_addr().unwrap());
+        cfg.site.clob_api_base = "http://127.0.0.1:9".into();
+        cfg.bot.enable_trading = true;
+        cfg.bot.mock_trading = false;
+        cfg.trading.execution_halt_path = marker;
+        let markets = MarketCache::new(reqwest::Client::new(), cfg.site.gamma_api_base.clone());
+        let server = tokio::spawn(serve_fixture_market(listener));
+        let executor = test_support::new_with_live_components(
+            cfg.clone(),
+            RiskGuard::new(cfg.risk.clone()),
+            markets,
+            Arc::clone(&positions),
+            Some(gateway.clone()),
+            Some(breaker.clone()),
+        );
+
+        let error = executor.execute(&entry_trade()).await.unwrap_err();
+        server.await.unwrap();
+        assert!(matches!(
+            error.downcast_ref::<OrderSubmitError>(),
+            Some(OrderSubmitError::Halted { .. })
+        ));
+        assert!(positions.get("12345").is_none());
+        assert_eq!(positions.len(), 1);
+        assert_eq!(gateway_fake.calls(), 1);
+    }
+
+    fn entry_trade() -> crate::models::WhaleTrade {
+        crate::models::WhaleTrade {
+            venue: VenueId::Polymarket,
+            maker: "fixture-maker".into(),
+            side: Side::Buy,
+            token_id: "12345".into(),
+            shares: 200.0,
+            price: 0.5,
+            usd_notional: 100.0,
+            tx_hash: Some("fixture-entry".into()),
+            block_number: Some(1),
+            observed_at: Utc::now(),
+        }
+    }
+
+    async fn serve_fixture_market(listener: TcpListener) {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 1024];
+        let _ = socket.read(&mut request).await.unwrap();
+        let body = r#"[{"slug":"fixture-market","question":"Fixture market","closed":false,"clobTokenIds":"[\"12345\",\"67890\"]","category":"Politics","tags":["election"]}]"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
     }
 
     struct FixedMidprice(f64);

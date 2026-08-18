@@ -89,7 +89,7 @@ impl OrderExecutor {
         ))
     }
 
-    pub fn new_with_live_components(
+    fn new_with_live_components(
         cfg: AppConfig,
         risk: Arc<RiskGuard>,
         markets: Arc<MarketCache>,
@@ -355,6 +355,31 @@ impl OrderExecutor {
         } else {
             (tp_default, sl_default)
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::Arc;
+
+    use crate::config::AppConfig;
+    use crate::service::execution_circuit_breaker::ExecutionCircuitBreaker;
+    use crate::service::market_cache::MarketCache;
+    use crate::service::order_gateway::OrderGateway;
+    use crate::service::position_store::PositionStore;
+    use crate::service::risk_guard::RiskGuard;
+
+    use super::OrderExecutor;
+
+    pub(crate) fn new_with_live_components(
+        cfg: AppConfig,
+        risk: Arc<RiskGuard>,
+        markets: Arc<MarketCache>,
+        positions: Arc<PositionStore>,
+        gateway: Option<Arc<dyn OrderGateway>>,
+        breaker: Option<Arc<ExecutionCircuitBreaker>>,
+    ) -> OrderExecutor {
+        OrderExecutor::new_with_live_components(cfg, risk, markets, positions, gateway, breaker)
     }
 }
 

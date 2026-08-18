@@ -215,13 +215,16 @@ fn log_filled(receipt: &OrderReceipt) {
 
 fn redact_order_id(order_id: &str) -> String {
     const VISIBLE: usize = 4;
-    if order_id.len() <= VISIBLE * 2 {
+    let characters = order_id.chars().collect::<Vec<_>>();
+    if characters.len() <= VISIBLE * 2 {
         return "[redacted]".into();
     }
     format!(
         "{}…{}",
-        &order_id[..VISIBLE],
-        &order_id[order_id.len() - VISIBLE..]
+        characters[..VISIBLE].iter().collect::<String>(),
+        characters[characters.len() - VISIBLE..]
+            .iter()
+            .collect::<String>()
     )
 }
 
@@ -243,5 +246,23 @@ mod tests {
             .unwrap();
 
         assert!(live_tp_sl_components(&cfg, &executor).is_none());
+    }
+
+    #[test]
+    fn redacts_short_order_ids_without_disclosing_them() {
+        assert_eq!(redact_order_id("short"), "[redacted]");
+    }
+
+    #[test]
+    fn redacts_normal_ascii_order_ids_with_prefix_and_suffix() {
+        assert_eq!(redact_order_id("order-public-fixture"), "orde…ture");
+    }
+
+    #[test]
+    fn redacts_multibyte_order_ids_on_character_boundaries() {
+        assert_eq!(
+            redact_order_id("订单编号交易确认成功回执"),
+            "订单编号…成功回执"
+        );
     }
 }
