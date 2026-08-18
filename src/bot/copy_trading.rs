@@ -1,4 +1,4 @@
-//! Copy-trading bot — production-ready.
+//! Copy-trading bot — phase-2 offline/non-live implementation.
 //!
 //! Architecture (matches §2 of the technical brief):
 //!
@@ -33,7 +33,7 @@ use crate::service::{
     midprice::{ClobMidpriceSource, MidpriceSource},
     onchain::{spawn_subscription, LogFilter, RawLog},
     order_executor::{ExecutionOutcome, OrderExecutor},
-    order_gateway::{OrderGateway, OrderReceipt, OrderSubmitError},
+    order_gateway::{order_id_hint, OrderGateway, OrderReceipt, OrderSubmitError},
     parse::{decode_whale_trade, order_filled_topic},
     position_monitor,
     position_store::PositionStore,
@@ -79,19 +79,20 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
     )
     .await?;
 
+    let mut tp_sl_monitor = None;
     if let Some((gateway, breaker)) = live_tp_sl_components(&cfg, &executor) {
         let midprice: Arc<dyn MidpriceSource> = Arc::new(ClobMidpriceSource::new(
             http.clone(),
             cfg.site.clob_api_base.clone(),
         ));
-        position_monitor::spawn(
+        tp_sl_monitor = Some(position_monitor::spawn(
             cfg.tp_sl.clone(),
             Arc::clone(&positions),
             gateway,
             breaker,
             midprice,
             cfg.trading.price_buffer,
-        );
+        ));
         info!(
             poll_interval_secs = cfg.tp_sl.poll_interval_secs,
             "TP/SL monitor spawned"
@@ -109,6 +110,10 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
     loop {
         tokio::select! {
             biased;
+            monitor_result = supervise_tp_sl_monitor(&mut tp_sl_monitor) => {
+                error!("TP/SL monitor terminated; copy bot stopping");
+                return monitor_result;
+            }
             _ = &mut shutdown => {
                 info!(open_positions = positions.len(), "shutdown signal received");
                 return Ok(());
@@ -133,6 +138,19 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
                 }
             }
         }
+    }
+}
+
+async fn supervise_tp_sl_monitor(
+    monitor: &mut Option<tokio::task::JoinHandle<Result<()>>>,
+) -> Result<()> {
+    let Some(handle) = monitor.as_mut() else {
+        return std::future::pending().await;
+    };
+    match handle.await {
+        Ok(Ok(())) => Err(anyhow!("TP/SL monitor stopped unexpectedly")),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(anyhow!("TP/SL monitor task terminated unexpectedly")),
     }
 }
 
@@ -208,35 +226,34 @@ fn log_not_submitted(error: &OrderSubmitError) {
 
 fn log_filled(receipt: &OrderReceipt) {
     info!(
-        order_id_hint = %redact_order_id(&receipt.order_id),
+        order_id_hint = %order_id_hint(&receipt.order_id),
         shares = receipt.filled_shares(),
         usd = receipt.filled_usd(),
         "order fully matched"
     );
 }
 
-fn redact_order_id(order_id: &str) -> String {
-    const VISIBLE: usize = 4;
-    let characters = order_id.chars().collect::<Vec<_>>();
-    if characters.len() <= VISIBLE * 2 {
-        return "[redacted]".into();
-    }
-    format!(
-        "{}…{}",
-        characters[..VISIBLE].iter().collect::<String>(),
-        characters[characters.len() - VISIBLE..]
-            .iter()
-            .collect::<String>()
-    )
-}
-
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use chrono::Utc;
+
     use super::*;
+    use crate::models::{OrderType, PlannedOrder, Side, VenueId};
+    use crate::service::order_gateway::OrderErrorCode;
+    use crate::service::position_store::OpenPosition;
 
     #[tokio::test]
     async fn strict_dry_run_never_exposes_tp_sl_live_components() {
         let mut cfg: AppConfig = serde_json::from_str(include_str!("../../config.json")).unwrap();
+        cfg.credentials.private_key.clear();
+        cfg.credentials.funder_address.clear();
+        cfg.credentials.signature_type = None;
+        cfg.credentials.api_key = None;
+        cfg.credentials.api_secret = None;
+        cfg.credentials.api_passphrase = None;
         cfg.tp_sl.enabled = true;
         cfg.bot.enable_trading = false;
         cfg.bot.mock_trading = true;
@@ -250,21 +267,124 @@ mod tests {
         assert!(live_tp_sl_components(&cfg, &executor).is_none());
     }
 
+    #[tokio::test]
+    async fn marker_persist_failure_is_fatal_to_copy_supervisor_without_retry() {
+        let mut cfg: AppConfig = serde_json::from_str(include_str!("../../config.json")).unwrap();
+        cfg.tp_sl.enabled = true;
+        cfg.tp_sl.poll_interval_secs = 1;
+        let positions = PositionStore::new();
+        positions.open(OpenPosition {
+            token_id: "fatal-exit-token".to_owned(),
+            slug: "fatal-exit-market".to_owned(),
+            category: None,
+            tags: Vec::new(),
+            neg_risk: false,
+            side: Side::Buy,
+            entry_price: 0.50,
+            shares: 100.0,
+            usd_notional: 50.0,
+            take_profit_pct: 30.0,
+            stop_loss_pct: 20.0,
+            opened_at: Utc::now(),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("DYNAMIC_FILESYSTEM_ERROR_SENTINEL");
+        let breaker = ExecutionCircuitBreaker::new_live(marker.clone()).unwrap();
+        std::fs::create_dir(&marker).unwrap();
+        let gateway = Arc::new(UncertainGateway::default());
+        let gateway_trait: Arc<dyn OrderGateway> = gateway.clone();
+
+        let mut monitor = Some(position_monitor::spawn(
+            cfg.tp_sl,
+            Arc::clone(&positions),
+            gateway_trait,
+            Arc::clone(&breaker),
+            Arc::new(FixedMidprice(0.70)),
+            0.005,
+        ));
+        let completion = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            supervise_tp_sl_monitor(&mut monitor),
+        )
+        .await
+        .expect("fatal monitor termination must reach its supervisor");
+
+        assert!(breaker.is_halted());
+        assert!(positions.get("fatal-exit-token").is_some());
+        assert_eq!(gateway.calls(), 1);
+        let retry = breaker
+            .submit_fok(
+                gateway.as_ref(),
+                &PlannedOrder {
+                    venue: VenueId::Polymarket,
+                    token_id: "fatal-exit-token".to_owned(),
+                    neg_risk: false,
+                    side: Side::Sell,
+                    shares: 100.0,
+                    limit_price: 0.695,
+                    usd_notional: 69.5,
+                    order_type: OrderType::Fok,
+                    source_trade_hash: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(retry, OrderSubmitError::Halted { .. }));
+        assert_eq!(gateway.calls(), 1);
+
+        let rendered = format!("{completion:?}").to_lowercase();
+        assert!(rendered.contains("do not restart until manual reconciliation"));
+        assert!(!rendered.contains("dynamic_filesystem_error_sentinel"));
+    }
+
     #[test]
     fn redacts_short_order_ids_without_disclosing_them() {
-        assert_eq!(redact_order_id("short"), "[redacted]");
+        assert_eq!(order_id_hint("short"), "[redacted]");
     }
 
     #[test]
     fn redacts_normal_ascii_order_ids_with_prefix_and_suffix() {
-        assert_eq!(redact_order_id("order-public-fixture"), "orde…ture");
+        assert_eq!(order_id_hint("order-public-fixture"), "orde…ture");
     }
 
     #[test]
     fn redacts_multibyte_order_ids_on_character_boundaries() {
         assert_eq!(
-            redact_order_id("订单编号交易确认成功回执"),
+            order_id_hint("订单编号交易确认成功回执"),
             "订单编号…成功回执"
         );
+    }
+
+    struct FixedMidprice(f64);
+
+    #[async_trait]
+    impl MidpriceSource for FixedMidprice {
+        async fn midprice(&self, _token_id: &str) -> Result<f64> {
+            Ok(self.0)
+        }
+    }
+
+    #[derive(Default)]
+    struct UncertainGateway {
+        calls: AtomicUsize,
+    }
+
+    impl UncertainGateway {
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl OrderGateway for UncertainGateway {
+        async fn submit_fok(
+            &self,
+            _planned: &PlannedOrder,
+        ) -> std::result::Result<OrderReceipt, OrderSubmitError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(OrderSubmitError::Uncertain {
+                code: OrderErrorCode::PostTransport,
+            })
+        }
     }
 }

@@ -49,11 +49,11 @@ pub fn spawn(
     breaker: Arc<ExecutionCircuitBreaker>,
     midprice: Arc<dyn MidpriceSource>,
     price_buffer: f64,
-) -> tokio::task::JoinHandle<()> {
+) -> tokio::task::JoinHandle<Result<()>> {
     tokio::spawn(async move {
         if !cfg.enabled {
             info!("TP/SL monitor disabled in config — exiting task");
-            return;
+            return Ok(());
         }
         let mut ticker = interval(Duration::from_secs(cfg.poll_interval_secs.max(1)));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -70,19 +70,26 @@ pub fn spawn(
                 )
                 .await
                 {
-                    let fatal =
-                        error
-                            .downcast_ref::<OrderSubmitError>()
-                            .is_some_and(|order_error| {
-                                matches!(
-                                    order_error,
-                                    OrderSubmitError::Uncertain { .. }
-                                        | OrderSubmitError::Halted { .. }
-                                )
-                            });
+                    let order_error = error.downcast_ref::<OrderSubmitError>();
+                    let fatal = order_error.is_some_and(|order_error| {
+                        matches!(
+                            order_error,
+                            OrderSubmitError::Uncertain { .. } | OrderSubmitError::Halted { .. }
+                        )
+                    });
                     if fatal {
-                        error!(token = %pos.token_id, "TP/SL execution halted; monitor stopping");
-                        return;
+                        if let Some(instruction) =
+                            order_error.and_then(OrderSubmitError::operator_instruction)
+                        {
+                            error!(
+                                token = %pos.token_id,
+                                instruction,
+                                "TP/SL halt marker persistence failed; monitor stopping"
+                            );
+                        } else {
+                            error!(token = %pos.token_id, "TP/SL execution halted; monitor stopping");
+                        }
+                        return Err(error);
                     }
                     warn!(token = %pos.token_id, "TP/SL tick failed before order submission");
                 }
@@ -213,6 +220,18 @@ mod tests {
         let p = pos(0.50, 30.0, 20.0, Side::Sell);
         assert_eq!(check_exit(&p, 0.30), Some(ExitReason::TakeProfit));
         assert_eq!(check_exit(&p, 0.65), Some(ExitReason::StopLoss));
+    }
+
+    #[test]
+    fn exit_outcome_debug_never_contains_the_complete_order_id() {
+        let order_id = "EXIT_OUTCOME_ORDER_ID_SENTINEL_1234567890";
+        let outcome = ExitOutcome::Filled(OrderReceipt {
+            order_id: order_id.to_owned(),
+            filled_shares_micros: 100_000_000,
+            filled_usd_micros: 70_000_000,
+        });
+
+        assert!(!format!("{outcome:?}").contains(order_id));
     }
 
     #[tokio::test]

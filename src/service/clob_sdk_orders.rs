@@ -367,14 +367,14 @@ fn classify_post_error(error: &SdkError) -> OrderSubmitError {
         };
     }
     if let Some(status) = error.downcast_ref::<SdkStatus>() {
-        if status.status_code.is_redirection() {
-            return OrderSubmitError::Uncertain {
-                code: OrderErrorCode::PostTransport,
+        if status.status_code.is_client_error() || status.status_code.is_server_error() {
+            return OrderSubmitError::Rejected {
+                http_status: Some(status.status_code.as_u16()),
+                code: OrderErrorCode::HttpRejected,
             };
         }
-        return OrderSubmitError::Rejected {
-            http_status: Some(status.status_code.as_u16()),
-            code: OrderErrorCode::HttpRejected,
+        return OrderSubmitError::Uncertain {
+            code: OrderErrorCode::PostTransport,
         };
     }
     let malformed = error
@@ -963,6 +963,46 @@ mod tests {
             ));
             assert!(!rendered.contains(SERVER_BODY_SECRET_SENTINEL));
             assert_order_request_contract(&requests);
+        }
+    }
+
+    #[test]
+    fn only_client_and_server_status_classes_are_definitive_rejections() {
+        use polymarket_client_sdk_v2::error::{Method, StatusCode};
+
+        for status in [100_u16, 199, 300, 399, 600, 799] {
+            let sdk_error = SdkError::status(
+                StatusCode::from_u16(status).unwrap(),
+                Method::POST,
+                "/order".to_owned(),
+                "STATUS_BODY_SECRET_SENTINEL",
+            );
+
+            assert_eq!(
+                classify_post_error(&sdk_error),
+                OrderSubmitError::Uncertain {
+                    code: OrderErrorCode::PostTransport,
+                },
+                "status {status} does not prove rejection"
+            );
+        }
+
+        for status in [400_u16, 499, 500, 599] {
+            let sdk_error = SdkError::status(
+                StatusCode::from_u16(status).unwrap(),
+                Method::POST,
+                "/order".to_owned(),
+                "STATUS_BODY_SECRET_SENTINEL",
+            );
+
+            assert_eq!(
+                classify_post_error(&sdk_error),
+                OrderSubmitError::Rejected {
+                    http_status: Some(status),
+                    code: OrderErrorCode::HttpRejected,
+                },
+                "status {status} is a definitive rejection"
+            );
         }
     }
 

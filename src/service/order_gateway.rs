@@ -1,13 +1,43 @@
+use std::{error::Error, fmt};
+
 use async_trait::async_trait;
-use thiserror::Error;
 
 use crate::models::PlannedOrder;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+pub const HALT_MARKER_IO_INSTRUCTION: &str =
+    "do not restart until manual reconciliation is complete";
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct OrderReceipt {
     pub order_id: String,
     pub filled_shares_micros: u128,
     pub filled_usd_micros: u128,
+}
+
+pub(crate) fn order_id_hint(order_id: &str) -> String {
+    const VISIBLE: usize = 4;
+    let characters = order_id.chars().collect::<Vec<_>>();
+    if characters.len() <= VISIBLE * 2 {
+        return "[redacted]".to_owned();
+    }
+    format!(
+        "{}…{}",
+        characters[..VISIBLE].iter().collect::<String>(),
+        characters[characters.len() - VISIBLE..]
+            .iter()
+            .collect::<String>()
+    )
+}
+
+impl fmt::Debug for OrderReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OrderReceipt")
+            .field("order_id_hint", &order_id_hint(&self.order_id))
+            .field("filled_shares_micros", &self.filled_shares_micros)
+            .field("filled_usd_micros", &self.filled_usd_micros)
+            .finish()
+    }
 }
 
 impl OrderReceipt {
@@ -61,22 +91,22 @@ pub enum OrderErrorCode {
     ExecutionHalted,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrderSubmitError {
-    #[error("order preflight failed at {stage:?} ({code:?})")]
     Preflight {
         stage: OrderStage,
         code: OrderErrorCode,
     },
-    #[error("order rejected with status {http_status:?} ({code:?})")]
     Rejected {
         http_status: Option<u16>,
         code: OrderErrorCode,
     },
-    #[error("order result uncertain ({code:?})")]
-    Uncertain { code: OrderErrorCode },
-    #[error("order execution halted ({code:?})")]
-    Halted { code: OrderErrorCode },
+    Uncertain {
+        code: OrderErrorCode,
+    },
+    Halted {
+        code: OrderErrorCode,
+    },
 }
 
 impl OrderSubmitError {
@@ -92,7 +122,43 @@ impl OrderSubmitError {
     pub fn is_uncertain(&self) -> bool {
         matches!(self, Self::Uncertain { .. })
     }
+
+    pub fn operator_instruction(&self) -> Option<&'static str> {
+        matches!(
+            self,
+            Self::Halted {
+                code: OrderErrorCode::HaltMarkerIo
+            }
+        )
+        .then_some(HALT_MARKER_IO_INSTRUCTION)
+    }
 }
+
+impl fmt::Display for OrderSubmitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Preflight { stage, code } => {
+                write!(formatter, "order preflight failed at {stage:?} ({code:?})")
+            }
+            Self::Rejected { http_status, code } => write!(
+                formatter,
+                "order rejected with status {http_status:?} ({code:?})"
+            ),
+            Self::Uncertain { code } => {
+                write!(formatter, "order result uncertain ({code:?})")
+            }
+            Self::Halted {
+                code: OrderErrorCode::HaltMarkerIo,
+            } => write!(
+                formatter,
+                "order execution halted (HaltMarkerIo); {HALT_MARKER_IO_INSTRUCTION}"
+            ),
+            Self::Halted { code } => write!(formatter, "order execution halted ({code:?})"),
+        }
+    }
+}
+
+impl Error for OrderSubmitError {}
 
 #[async_trait]
 pub trait OrderGateway: Send + Sync {
@@ -124,5 +190,21 @@ mod tests {
         let rendered = format!("{error:?} {error}");
         assert!(rendered.contains("HttpRejected"));
         assert!(!rendered.contains(sentinel));
+    }
+
+    #[test]
+    fn receipt_debug_never_contains_the_complete_order_id() {
+        let order_id = "ORDER_ID_DEBUG_SENTINEL_1234567890";
+        let receipt = OrderReceipt {
+            order_id: order_id.to_owned(),
+            filled_shares_micros: 12_000_000,
+            filled_usd_micros: 6_000_000,
+        };
+
+        let rendered = format!("{receipt:?}");
+
+        assert!(!rendered.contains(order_id));
+        assert!(rendered.contains("ORDE"));
+        assert!(rendered.contains("7890"));
     }
 }

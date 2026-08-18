@@ -146,6 +146,16 @@ async fn run_auth(
     Ok(())
 }
 
+fn load_config_for_command(cli: &Cli) -> Result<AppConfig> {
+    let mut cfg = AppConfig::load_public(&cli.config)?;
+    let credentials_required =
+        matches!(&cli.command, Some(Command::Auth { .. })) || cfg.live_trading_allowed();
+    if credentials_required {
+        cfg.load_credentials(&cli.credentials)?;
+    }
+    Ok(cfg)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -157,7 +167,7 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let cfg = AppConfig::load(&cli.config, &cli.credentials).context("loading configuration")?;
+    let cfg = load_config_for_command(&cli).context("loading configuration")?;
     let credentials_path = cli.credentials.clone();
 
     info!(
@@ -177,6 +187,36 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{ffi::OsString, sync::Mutex};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        name: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(self.name, previous);
+            } else {
+                std::env::remove_var(self.name);
+            }
+        }
+    }
+
+    fn load_config_at_main_seam(cli: &Cli) -> Result<AppConfig> {
+        load_config_for_command(cli)
+    }
 
     #[test]
     fn parses_create_api_key_with_nonce() {
@@ -214,6 +254,65 @@ mod tests {
         assert!(!summary.contains(key));
         assert!(summary.starts_with("1234"));
         assert!(summary.ends_with("9abc"));
+    }
+
+    #[test]
+    fn strict_run_ignores_malformed_credentials_and_secret_environment_overrides() {
+        let _env_lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let private_key_sentinel = "STRICT_RUN_PRIVATE_KEY_SENTINEL";
+        let funder_sentinel = "0x9999999999999999999999999999999999999999";
+        let _private_key = EnvVarGuard::set("PM_PRIVATE_KEY", private_key_sentinel);
+        let _funder = EnvVarGuard::set("PM_FUNDER_ADDRESS", funder_sentinel);
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("strict-paper.json");
+        let credentials_path = dir.path().join("malformed-credentials.yaml");
+        std::fs::write(&config_path, include_str!("../config.json")).unwrap();
+        std::fs::write(&credentials_path, "bot: [malformed").unwrap();
+        let cli = Cli::try_parse_from(vec![
+            "polymarket-toolkits".to_owned(),
+            "--config".to_owned(),
+            config_path.to_string_lossy().into_owned(),
+            "--credentials".to_owned(),
+            credentials_path.to_string_lossy().into_owned(),
+            "run".to_owned(),
+            "copy-trading".to_owned(),
+        ])
+        .unwrap();
+
+        let cfg = load_config_at_main_seam(&cli)
+            .unwrap_or_else(|_| panic!("strict Run must not read or parse the credential source"));
+
+        assert!(!cfg.live_trading_allowed());
+        assert!(cfg.credentials.private_key.is_empty());
+        assert!(cfg.credentials.funder_address.is_empty());
+        assert_eq!(cfg.credentials.signature_type, None);
+        assert_eq!(cfg.credentials.api_key, None);
+        assert_eq!(cfg.credentials.api_secret, None);
+        assert_eq!(cfg.credentials.api_passphrase, None);
+        assert_ne!(cfg.credentials.private_key, private_key_sentinel);
+        assert_ne!(cfg.credentials.funder_address, funder_sentinel);
+    }
+
+    #[test]
+    fn auth_command_still_requires_parsing_the_credential_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("public.json");
+        let credentials_path = dir.path().join("malformed-credentials.yaml");
+        std::fs::write(&config_path, include_str!("../config.json")).unwrap();
+        std::fs::write(&credentials_path, "bot: [malformed").unwrap();
+        let cli = Cli::try_parse_from(vec![
+            "polymarket-toolkits".to_owned(),
+            "--config".to_owned(),
+            config_path.to_string_lossy().into_owned(),
+            "--credentials".to_owned(),
+            credentials_path.to_string_lossy().into_owned(),
+            "auth".to_owned(),
+            "derive-api-key".to_owned(),
+        ])
+        .unwrap();
+
+        assert!(load_config_at_main_seam(&cli).is_err());
     }
 
     #[tokio::test]

@@ -7,12 +7,13 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
+use std::fmt;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 pub const OFFICIAL_CLOB_V2_HOST: &str = "https://clob-v2.polymarket.com";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub bot: BotConfig,
     pub site: SiteConfig,
@@ -201,7 +202,7 @@ fn default_monitor_secs() -> u64 {
     15
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct Credentials {
     pub private_key: String,
     pub funder_address: String,
@@ -228,12 +229,12 @@ fn required_mapping<'a>(mapping: &'a mut Mapping, key: &str) -> Result<&'a mut M
         .ok_or_else(|| anyhow!("credentials YAML must contain a '{key}' mapping"))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct CredentialsFile {
     bot: CredentialsBot,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct CredentialsBot {
     private_key: String,
     funder_address: String,
@@ -244,41 +245,74 @@ struct CredentialsBot {
 }
 
 impl AppConfig {
-    pub fn load(config_path: &Path, credentials_path: &Path) -> Result<Self> {
+    pub fn load_public(config_path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(config_path)
             .with_context(|| format!("reading public config from {}", config_path.display()))?;
-        let mut cfg: AppConfig = serde_json::from_str(&raw).context("parsing config.json")?;
+        serde_json::from_str(&raw).context("parsing config.json")
+    }
 
-        // Credentials file is optional — without it we can still run in mock mode.
-        if credentials_path.exists() {
-            let raw = std::fs::read_to_string(credentials_path).with_context(|| {
-                format!("reading credentials from {}", credentials_path.display())
-            })?;
-            let parsed: CredentialsFile =
-                serde_yaml::from_str(&raw).context("parsing config.yaml")?;
-            cfg.credentials = Credentials {
-                private_key: parsed.bot.private_key,
-                funder_address: parsed.bot.funder_address,
-                signature_type: parsed.bot.signature_type,
-                api_key: parsed.bot.api_key,
-                api_secret: parsed.bot.api_secret,
-                api_passphrase: parsed.bot.api_passphrase,
-            };
-        }
+    pub fn load_credentials(&mut self, credentials_path: &Path) -> Result<()> {
+        let raw = std::fs::read_to_string(credentials_path)
+            .context("reading required credentials file")?;
+        let parsed: CredentialsFile = serde_yaml::from_str(&raw).context("parsing config.yaml")?;
+        self.credentials = Credentials {
+            private_key: parsed.bot.private_key,
+            funder_address: parsed.bot.funder_address,
+            signature_type: parsed.bot.signature_type,
+            api_key: parsed.bot.api_key,
+            api_secret: parsed.bot.api_secret,
+            api_passphrase: parsed.bot.api_passphrase,
+        };
 
         // Environment-variable overrides (handy for CI / Docker).
         if let Ok(key) = std::env::var("PM_PRIVATE_KEY") {
-            cfg.credentials.private_key = key;
+            self.credentials.private_key = key;
         }
         if let Ok(addr) = std::env::var("PM_FUNDER_ADDRESS") {
-            cfg.credentials.funder_address = addr;
+            self.credentials.funder_address = addr;
         }
 
-        Ok(cfg)
+        Ok(())
     }
 
     pub fn live_trading_allowed(&self) -> bool {
         self.bot.enable_trading && !self.bot.mock_trading
+    }
+}
+
+impl fmt::Debug for AppConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AppConfig")
+            .field("wallet_count", &self.bot.wallets_to_track.len())
+            .field("enable_trading", &self.bot.enable_trading)
+            .field("mock_trading", &self.bot.mock_trading)
+            .field("site", &"<redacted>")
+            .field("strategy", &"<configured>")
+            .field("trading", &"<configured>")
+            .field("risk", &"<configured>")
+            .field("exchange", &"<configured>")
+            .field("filters", &"<configured>")
+            .field("tp_sl", &"<configured>")
+            .field("credentials", &self.credentials)
+            .finish()
+    }
+}
+
+impl fmt::Debug for Credentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Credentials")
+            .field("private_key_present", &!self.private_key.trim().is_empty())
+            .field(
+                "funder_address_present",
+                &!self.funder_address.trim().is_empty(),
+            )
+            .field("signature_type", &self.signature_type)
+            .field("api_key_present", &self.api_key.is_some())
+            .field("api_secret_present", &self.api_secret.is_some())
+            .field("api_passphrase_present", &self.api_passphrase.is_some())
+            .finish()
     }
 }
 
@@ -442,6 +476,32 @@ mod tests {
             );
             assert!(!cfg.bot.enable_trading);
             assert!(cfg.bot.mock_trading);
+        }
+    }
+
+    #[test]
+    fn credentials_and_app_config_debug_redact_every_secret_field() {
+        let credentials = Credentials {
+            private_key: "PRIVATE_KEY_DEBUG_SENTINEL".to_owned(),
+            funder_address: "0x1111111111111111111111111111111111111111".to_owned(),
+            signature_type: Some(0),
+            api_key: Some("API_KEY_DEBUG_SENTINEL".to_owned()),
+            api_secret: Some("API_SECRET_DEBUG_SENTINEL".to_owned()),
+            api_passphrase: Some("API_PASSPHRASE_DEBUG_SENTINEL".to_owned()),
+        };
+        let credentials_debug = format!("{credentials:?}");
+        let mut cfg: AppConfig = serde_json::from_str(include_str!("../config.json")).unwrap();
+        cfg.credentials = credentials;
+        let config_debug = format!("{cfg:?}");
+
+        for sentinel in [
+            "PRIVATE_KEY_DEBUG_SENTINEL",
+            "API_KEY_DEBUG_SENTINEL",
+            "API_SECRET_DEBUG_SENTINEL",
+            "API_PASSPHRASE_DEBUG_SENTINEL",
+        ] {
+            assert!(!credentials_debug.contains(sentinel));
+            assert!(!config_debug.contains(sentinel));
         }
     }
 

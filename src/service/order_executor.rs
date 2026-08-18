@@ -482,6 +482,7 @@ mod tests {
         let server = tokio::spawn(serve_fixture_market(listener));
 
         let mut cfg: AppConfig = serde_json::from_str(include_str!("../../config.json")).unwrap();
+        blank_signing_and_api_credentials(&mut cfg);
         cfg.site.gamma_api_base = base;
         cfg.tp_sl.enabled = false;
 
@@ -514,7 +515,8 @@ mod tests {
 
     #[tokio::test]
     async fn strict_dry_run_skips_live_components_and_records_planned_position() {
-        let (cfg, markets, server) = fixture_runtime(false).await;
+        let (mut cfg, markets, server) = fixture_runtime(false).await;
+        blank_signing_and_api_credentials(&mut cfg);
         let positions = PositionStore::new();
         let executor = OrderExecutor::new(
             cfg,
@@ -532,6 +534,18 @@ mod tests {
         ));
         server.await.unwrap();
         assert!(positions.get("12345").is_some());
+    }
+
+    #[test]
+    fn execution_outcome_debug_never_contains_the_complete_order_id() {
+        let order_id = "EXECUTION_OUTCOME_ORDER_ID_SENTINEL_1234567890";
+        let outcome = ExecutionOutcome::Filled(OrderReceipt {
+            order_id: order_id.to_owned(),
+            filled_shares_micros: 12_000_000,
+            filled_usd_micros: 6_000_000,
+        });
+
+        assert!(!format!("{outcome:?}").contains(order_id));
     }
 
     #[tokio::test]
@@ -666,6 +680,15 @@ mod tests {
         cfg.bot.mock_trading = !live;
         let markets = MarketCache::new(reqwest::Client::new(), cfg.site.gamma_api_base.clone());
         (cfg, markets, tokio::spawn(serve_fixture_market(listener)))
+    }
+
+    fn blank_signing_and_api_credentials(cfg: &mut AppConfig) {
+        cfg.credentials.private_key.clear();
+        cfg.credentials.funder_address.clear();
+        cfg.credentials.signature_type = None;
+        cfg.credentials.api_key = None;
+        cfg.credentials.api_secret = None;
+        cfg.credentials.api_passphrase = None;
     }
 
     struct FakeGateway {
