@@ -12,6 +12,7 @@ use crate::models::{OrderType, PlannedOrder, Side, WhaleTrade};
 use crate::service::clob_sdk_orders::SdkOrderGateway;
 use crate::service::eligibility::{self, Eligibility};
 use crate::service::execution_circuit_breaker::ExecutionCircuitBreaker;
+use crate::service::execution_ledger::ExecutionLedger;
 use crate::service::market_cache::{MarketCache, MarketInfo};
 use crate::service::order_gateway::{OrderGateway, OrderReceipt, OrderSubmitError};
 use crate::service::position_store::{OpenPosition, PositionStore};
@@ -77,7 +78,11 @@ impl OrderExecutor {
                 cfg, risk, markets, positions, None, None,
             ));
         }
-        let breaker = ExecutionCircuitBreaker::new_live(cfg.trading.execution_halt_path.clone())?;
+        let ledger = Arc::new(ExecutionLedger::open_live(
+            &cfg.trading.execution_ledger_path,
+        )?);
+        let breaker =
+            ExecutionCircuitBreaker::new_live(ledger, cfg.trading.execution_halt_path.clone())?;
         let gateway: Arc<dyn OrderGateway> = Arc::new(SdkOrderGateway::new(&cfg).await?);
         Ok(Self::new_with_live_components(
             cfg,
@@ -559,8 +564,7 @@ mod tests {
             filled_shares_micros: 39_000_000,
             filled_usd_micros: 19_500_000,
         })));
-        let breaker =
-            ExecutionCircuitBreaker::new_live(cfg.trading.execution_halt_path.clone()).unwrap();
+        let breaker = test_breaker(cfg.trading.execution_halt_path.clone());
         let executor = OrderExecutor::new_with_live_components(
             cfg,
             RiskGuard::new(test_cfg()),
@@ -599,8 +603,7 @@ mod tests {
             cfg.trading.execution_halt_path = halt_dir.path().join("execution-halt.json");
             let positions = PositionStore::new();
             let gateway = Arc::new(FakeGateway::returning(result));
-            let breaker =
-                ExecutionCircuitBreaker::new_live(cfg.trading.execution_halt_path.clone()).unwrap();
+            let breaker = test_breaker(cfg.trading.execution_halt_path.clone());
             let executor = OrderExecutor::new_with_live_components(
                 cfg,
                 RiskGuard::new(test_cfg()),
@@ -629,7 +632,7 @@ mod tests {
         let gateway = Arc::new(FakeGateway::returning(Err(OrderSubmitError::Uncertain {
             code: OrderErrorCode::PostTimeout,
         })));
-        let breaker = ExecutionCircuitBreaker::new_live(marker.clone()).unwrap();
+        let breaker = test_breaker(marker.clone());
         let executor = OrderExecutor::new_with_live_components(
             cfg,
             RiskGuard::new(test_cfg()),
@@ -689,6 +692,14 @@ mod tests {
         cfg.credentials.api_key = None;
         cfg.credentials.api_secret = None;
         cfg.credentials.api_passphrase = None;
+    }
+
+    fn test_breaker(path: std::path::PathBuf) -> Arc<ExecutionCircuitBreaker> {
+        let ledger = Arc::new(
+            ExecutionLedger::open_live(path.parent().unwrap().join("execution-ledger.jsonl"))
+                .unwrap(),
+        );
+        ExecutionCircuitBreaker::new_live(ledger, path).unwrap()
     }
 
     struct FakeGateway {

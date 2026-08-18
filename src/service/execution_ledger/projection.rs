@@ -64,6 +64,7 @@ pub enum DurableRemoteOutcome {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActiveIntent {
     pub intent_id: IntentId,
     pub prepared: PreparedIntent,
@@ -114,6 +115,20 @@ pub struct LedgerProjectionSnapshot {
 pub(crate) struct StagedProjection {
     outcome: ApplyOutcome,
     changes: ProjectionChanges,
+}
+
+impl StagedProjection {
+    pub(crate) fn active_changed(&self) -> bool {
+        !matches!(self.changes.active, ActiveChange::Unchanged)
+    }
+
+    pub(crate) fn active_after(&self, current: &Option<ActiveIntent>) -> Option<ActiveIntent> {
+        match &self.changes.active {
+            ActiveChange::Unchanged => current.clone(),
+            ActiveChange::Set(active) => Some((**active).clone()),
+            ActiveChange::Clear => None,
+        }
+    }
 }
 
 #[derive(Default)]

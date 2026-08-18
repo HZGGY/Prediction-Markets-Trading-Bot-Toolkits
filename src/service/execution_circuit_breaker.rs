@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     models::PlannedOrder,
+    service::execution_ledger::ExecutionLedger,
     service::order_gateway::{
         OrderErrorCode, OrderGateway, OrderReceipt, OrderStage, OrderSubmitError,
     },
@@ -30,12 +31,21 @@ pub struct ExecutionHaltMarker {
 
 pub struct ExecutionCircuitBreaker {
     halted: AtomicBool,
+    _ledger: Arc<ExecutionLedger>,
     path: PathBuf,
     submit_lock: tokio::sync::Mutex<()>,
 }
 
 impl ExecutionCircuitBreaker {
-    pub fn new_live(path: PathBuf) -> Result<Arc<Self>, OrderSubmitError> {
+    pub fn new_live(
+        ledger: Arc<ExecutionLedger>,
+        path: PathBuf,
+    ) -> Result<Arc<Self>, OrderSubmitError> {
+        if ledger.projection().active.is_some() {
+            return Err(OrderSubmitError::Halted {
+                code: OrderErrorCode::ExecutionHalted,
+            });
+        }
         if path.exists() {
             return Err(OrderSubmitError::Halted {
                 code: OrderErrorCode::HaltMarkerPresent,
@@ -58,6 +68,7 @@ impl ExecutionCircuitBreaker {
         }
         Ok(Arc::new(Self {
             halted: AtomicBool::new(false),
+            _ledger: ledger,
             path,
             submit_lock: tokio::sync::Mutex::new(()),
         }))
@@ -159,7 +170,11 @@ impl ExecutionCircuitBreaker {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::atomic::{AtomicUsize, Ordering},
+        path::PathBuf,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
         time::Duration,
     };
 
@@ -168,14 +183,72 @@ mod tests {
     use super::{ExecutionCircuitBreaker, ExecutionHaltMarker};
     use crate::{
         models::{OrderType, PlannedOrder, Side, VenueId},
+        service::execution_ledger::{AcknowledgeReason, ExecutionLedger, IntentId, LedgerPayload},
         service::order_gateway::{OrderErrorCode, OrderGateway, OrderReceipt, OrderSubmitError},
     };
+
+    #[test]
+    fn manual_marker_deletion_cannot_bypass_an_active_ledger_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Arc::new(
+            ExecutionLedger::open_live(dir.path().join("execution-ledger.jsonl")).unwrap(),
+        );
+        ledger
+            .append(IntentId(uuid::Uuid::from_u128(1)), prepared_payload())
+            .unwrap();
+        let marker = dir.path().join("execution-halt.json");
+        std::fs::write(&marker, b"{}").unwrap();
+        assert!(matches!(
+            ExecutionCircuitBreaker::new_live(Arc::clone(&ledger), marker.clone()),
+            Err(OrderSubmitError::Halted {
+                code: OrderErrorCode::ExecutionHalted
+            })
+        ));
+        std::fs::remove_file(&marker).unwrap();
+        assert!(!marker.exists());
+
+        assert!(matches!(
+            ExecutionCircuitBreaker::new_live(ledger, marker),
+            Err(OrderSubmitError::Halted {
+                code: OrderErrorCode::ExecutionHalted
+            })
+        ));
+    }
+
+    #[test]
+    fn leftover_marker_with_no_active_ledger_remains_a_compatibility_halt() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Arc::new(
+            ExecutionLedger::open_live(dir.path().join("execution-ledger.jsonl")).unwrap(),
+        );
+        let intent = IntentId(uuid::Uuid::from_u128(2));
+        ledger.append(intent, prepared_payload()).unwrap();
+        ledger
+            .append(
+                intent,
+                LedgerPayload::Acknowledged {
+                    reason: AcknowledgeReason::NotSent,
+                },
+            )
+            .unwrap();
+        assert!(ledger.projection().active.is_none());
+        let marker = dir.path().join("execution-halt.json");
+        std::fs::write(&marker, b"{}").unwrap();
+
+        assert!(matches!(
+            ExecutionCircuitBreaker::new_live(ledger, marker.clone()),
+            Err(OrderSubmitError::Halted {
+                code: OrderErrorCode::HaltMarkerPresent
+            })
+        ));
+        assert!(marker.is_file());
+    }
 
     #[tokio::test]
     async fn uncertainty_persists_marker_and_blocks_every_later_submission() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("execution-halt.json");
-        let breaker = ExecutionCircuitBreaker::new_live(path.clone()).unwrap();
+        let breaker = test_breaker(path.clone()).unwrap();
         let gateway = FakeGateway::returning(Err(OrderSubmitError::Uncertain {
             code: OrderErrorCode::PostTimeout,
         }));
@@ -203,7 +276,7 @@ mod tests {
         let path = dir.path().join("execution-halt.json");
         std::fs::write(&path, b"{}").unwrap();
         assert!(matches!(
-            ExecutionCircuitBreaker::new_live(path),
+            test_breaker(path),
             Err(OrderSubmitError::Halted {
                 code: OrderErrorCode::HaltMarkerPresent
             })
@@ -214,7 +287,7 @@ mod tests {
     fn persist_failure_leaves_memory_halted() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("execution-halt.json");
-        let breaker = ExecutionCircuitBreaker::new_live(target).unwrap();
+        let breaker = test_breaker(target).unwrap();
         let result = breaker.halt_uncertain_with(
             &fixture_planned_order(),
             OrderErrorCode::PostTransport,
@@ -227,8 +300,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_submission_waits_and_never_posts_after_first_uncertainty() {
         let dir = tempfile::tempdir().unwrap();
-        let breaker =
-            ExecutionCircuitBreaker::new_live(dir.path().join("execution-halt.json")).unwrap();
+        let breaker = test_breaker(dir.path().join("execution-halt.json")).unwrap();
         let gateway = FakeGateway::returning_after(
             Err(OrderSubmitError::Uncertain {
                 code: OrderErrorCode::PostTransport,
@@ -300,5 +372,40 @@ mod tests {
             order_type: OrderType::Fok,
             source_trade_hash: None,
         }
+    }
+
+    fn prepared_payload() -> LedgerPayload {
+        use crate::service::execution_ledger::{
+            IntentPurpose, OrderId, OrderSide, OrderType as LedgerOrderType, PositionSeed,
+            PreparedIntent, TokenId, Venue,
+        };
+
+        LedgerPayload::IntentPrepared(PreparedIntent {
+            order_id: OrderId::from_hex(format!("0x{}", "11".repeat(32))).unwrap(),
+            protocol_version: 2,
+            venue: Venue::PolymarketClob,
+            token_id: TokenId::from_decimal("12345").unwrap(),
+            neg_risk: false,
+            side: OrderSide::Buy,
+            order_type: LedgerOrderType::Fok,
+            expected_maker_micros: 5_000_000,
+            expected_taker_micros: 10_000_000,
+            source_hash: None,
+            purpose: IntentPurpose::Entry(PositionSeed {
+                slug: "breaker-fixture".to_owned(),
+                category: "testing".to_owned(),
+                tags: vec!["offline".to_owned()],
+                take_profit_bps: 1_000,
+                stop_loss_bps: 500,
+            }),
+        })
+    }
+
+    fn test_breaker(path: PathBuf) -> Result<Arc<ExecutionCircuitBreaker>, OrderSubmitError> {
+        let ledger = Arc::new(
+            ExecutionLedger::open_live(path.parent().unwrap().join("execution-ledger.jsonl"))
+                .unwrap(),
+        );
+        ExecutionCircuitBreaker::new_live(ledger, path)
     }
 }

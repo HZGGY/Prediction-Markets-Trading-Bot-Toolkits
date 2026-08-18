@@ -16,6 +16,7 @@ use uuid::Uuid;
 use super::{
     model::*,
     projection::{LedgerProjection, LedgerProjectionSnapshot},
+    snapshot::{persist_snapshot, verify_snapshot, ActiveSnapshot, SnapshotDurability},
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -58,6 +59,7 @@ fn calculate_event_hash(material: &HashMaterial<'_>) -> Result<EventHash, Ledger
 pub(crate) struct LedgerPaths {
     pub(crate) parent: PathBuf,
     pub(crate) ledger: PathBuf,
+    pub(crate) snapshot: PathBuf,
     pub(crate) lock: PathBuf,
 }
 
@@ -89,6 +91,7 @@ impl LedgerPaths {
         Ok(Self {
             parent,
             ledger,
+            snapshot,
             lock,
         })
     }
@@ -100,6 +103,7 @@ pub struct ExecutionLedger {
     #[cfg(unix)]
     parent_lock_file: File,
     durability: Arc<dyn DurabilityOps>,
+    paths: LedgerPaths,
 }
 
 impl fmt::Debug for ExecutionLedger {
@@ -123,7 +127,7 @@ impl ExecutionLedger {
     }
 
     #[cfg(test)]
-    fn open_live_with_ops(
+    pub(crate) fn open_live_with_ops(
         path: impl AsRef<Path>,
         durability: Arc<dyn DurabilityOps>,
     ) -> Result<Self, LedgerError> {
@@ -151,6 +155,8 @@ impl ExecutionLedger {
                 .map_err(|_| LedgerError::new(LedgerErrorCode::DirectorySyncFailed))?;
         }
         let projection = replay(&mut file)?;
+        let snapshot_bytes = read_snapshot(&paths)?;
+        verify_snapshot(snapshot_bytes.as_deref(), &projection)?;
         file.seek(SeekFrom::End(0))
             .map_err(|_| LedgerError::new(LedgerErrorCode::Unavailable))?;
 
@@ -164,6 +170,7 @@ impl ExecutionLedger {
             #[cfg(unix)]
             parent_lock_file,
             durability,
+            paths,
         })
     }
 
@@ -197,6 +204,13 @@ impl ExecutionLedger {
             .map_err(|_| LedgerError::new(LedgerErrorCode::SerializationFailed))?;
         bytes.push(b'\n');
         let staged = state.projection.stage_next(&event)?;
+        let pending_snapshot = staged.active_changed().then(|| {
+            ActiveSnapshot::new(
+                event.sequence,
+                event.event_hash.clone(),
+                staged.active_after(&state.projection.active),
+            )
+        });
 
         if self.durability.append(&mut state.file, &bytes).is_err() {
             state.fatal = true;
@@ -209,6 +223,12 @@ impl ExecutionLedger {
         if self.durability.sync_file(&state.file).is_err() {
             state.fatal = true;
             return Err(LedgerError::new(LedgerErrorCode::SyncFailed));
+        }
+        if let Some(snapshot) = pending_snapshot {
+            if let Err(error) = persist_snapshot(&self.paths, &snapshot, self.durability.as_ref()) {
+                state.fatal = true;
+                return Err(error);
+            }
         }
 
         state.projection.publish_staged(&event, staged);
@@ -266,6 +286,22 @@ fn replay(file: &mut File) -> Result<LedgerProjection, LedgerError> {
     Ok(projection)
 }
 
+fn read_snapshot(paths: &LedgerPaths) -> Result<Option<Vec<u8>>, LedgerError> {
+    match fs::symlink_metadata(&paths.snapshot) {
+        Ok(metadata) => reject_metadata(&metadata)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(LedgerError::new(LedgerErrorCode::Unavailable)),
+    }
+    let mut file = restrictive_open_options(false)?
+        .open(&paths.snapshot)
+        .map_err(|error| classify_open_error(&paths.snapshot, error))?;
+    validate_opened_target(&file, &paths.snapshot)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|_| LedgerError::new(LedgerErrorCode::Unavailable))?;
+    Ok(Some(bytes))
+}
+
 fn classify_json_error(error: serde_json::Error) -> LedgerError {
     let code = if error.to_string().contains("unknown ledger event kind") {
         LedgerErrorCode::UnsupportedEventKind
@@ -304,7 +340,7 @@ fn reject_unsafe_path_chain(path: &Path) -> Result<(), LedgerError> {
     Ok(())
 }
 
-fn reject_existing_target(path: &Path) -> Result<(), LedgerError> {
+pub(crate) fn reject_existing_target(path: &Path) -> Result<(), LedgerError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => reject_metadata(&metadata),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -551,7 +587,7 @@ fn run_durability_probe(
     remove_result.map_err(|_| LedgerError::new(LedgerErrorCode::Unavailable))
 }
 
-trait DurabilityOps: Send + Sync {
+pub(crate) trait DurabilityOps: SnapshotDurability + Send + Sync {
     fn append(&self, file: &mut File, bytes: &[u8]) -> io::Result<()>;
     fn flush(&self, file: &mut File) -> io::Result<()>;
     fn sync_file(&self, file: &File) -> io::Result<()>;
@@ -560,6 +596,36 @@ trait DurabilityOps: Send + Sync {
 }
 
 struct SystemDurabilityOps;
+
+impl SnapshotDurability for SystemDurabilityOps {
+    fn create_snapshot_temp(&self, parent: &Path) -> io::Result<NamedTempFile> {
+        tempfile::Builder::new()
+            .prefix(".execution-active-")
+            .tempfile_in(parent)
+    }
+
+    fn write_snapshot(&self, file: &mut File, bytes: &[u8]) -> io::Result<()> {
+        file.write_all(bytes)
+    }
+
+    fn flush_snapshot(&self, file: &mut File) -> io::Result<()> {
+        file.flush()
+    }
+
+    fn sync_snapshot(&self, file: &File) -> io::Result<()> {
+        file.sync_all()
+    }
+
+    fn persist_snapshot(&self, temp: NamedTempFile, target: &Path) -> io::Result<()> {
+        temp.persist(target)
+            .map(|_| ())
+            .map_err(|error| error.error)
+    }
+
+    fn sync_snapshot_directory(&self, path: &Path) -> io::Result<()> {
+        sync_directory_supported(path)
+    }
+}
 
 impl DurabilityOps for SystemDurabilityOps {
     fn append(&self, file: &mut File, bytes: &[u8]) -> io::Result<()> {
@@ -1205,12 +1271,12 @@ mod tests {
     }
 
     #[test]
-    fn flush_failure_poisons_instance_and_complete_line_replays_safely() {
+    fn flush_failure_poisons_instance_and_complete_line_without_snapshot_fails_closed() {
         assert_complete_line_failure_is_poisoned(FailurePoint::Flush, LedgerErrorCode::FlushFailed);
     }
 
     #[test]
-    fn sync_failure_poisons_instance_and_complete_line_replays_safely() {
+    fn sync_failure_poisons_instance_and_complete_line_without_snapshot_fails_closed() {
         assert_complete_line_failure_is_poisoned(FailurePoint::Sync, LedgerErrorCode::SyncFailed);
     }
 
@@ -1373,11 +1439,8 @@ mod tests {
         drop(ledger);
 
         assert_eq!(
-            ExecutionLedger::open_live(&path)
-                .unwrap()
-                .projection()
-                .sequence,
-            1
+            ExecutionLedger::open_live(&path).unwrap_err().code(),
+            LedgerErrorCode::SnapshotMissing
         );
     }
 
@@ -1489,6 +1552,32 @@ mod tests {
                 return Err(io::Error::other("injected directory sync"));
             }
             sync_directory_supported(path)
+        }
+    }
+
+    impl SnapshotDurability for FailingDurabilityOps {
+        fn create_snapshot_temp(&self, parent: &Path) -> io::Result<NamedTempFile> {
+            SystemDurabilityOps.create_snapshot_temp(parent)
+        }
+
+        fn write_snapshot(&self, file: &mut File, bytes: &[u8]) -> io::Result<()> {
+            SystemDurabilityOps.write_snapshot(file, bytes)
+        }
+
+        fn flush_snapshot(&self, file: &mut File) -> io::Result<()> {
+            SystemDurabilityOps.flush_snapshot(file)
+        }
+
+        fn sync_snapshot(&self, file: &File) -> io::Result<()> {
+            SystemDurabilityOps.sync_snapshot(file)
+        }
+
+        fn persist_snapshot(&self, temp: NamedTempFile, target: &Path) -> io::Result<()> {
+            SystemDurabilityOps.persist_snapshot(temp, target)
+        }
+
+        fn sync_snapshot_directory(&self, path: &Path) -> io::Result<()> {
+            SystemDurabilityOps.sync_snapshot_directory(path)
         }
     }
 }

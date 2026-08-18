@@ -173,6 +173,7 @@ mod tests {
     use super::*;
     use crate::config::AppConfig;
     use crate::service::execution_circuit_breaker::ExecutionCircuitBreaker;
+    use crate::service::execution_ledger::ExecutionLedger;
     use crate::service::market_cache::MarketCache;
     use crate::service::order_executor::test_support;
     use crate::service::order_gateway::{
@@ -240,8 +241,7 @@ mod tests {
         let position = pos(0.50, 30.0, 20.0, Side::Buy);
         positions.open(position.clone());
         let dir = tempfile::tempdir().unwrap();
-        let breaker =
-            ExecutionCircuitBreaker::new_live(dir.path().join("execution-halt.json")).unwrap();
+        let breaker = test_breaker(dir.path().join("execution-halt.json"));
         let gateway = Arc::new(FakeGateway::returning(Ok(OrderReceipt {
             order_id: "order-public-fixture".into(),
             filled_shares_micros: 100_000_000,
@@ -273,8 +273,7 @@ mod tests {
         let position = pos(0.50, 30.0, 20.0, Side::Buy);
         positions.open(position.clone());
         let dir = tempfile::tempdir().unwrap();
-        let breaker =
-            ExecutionCircuitBreaker::new_live(dir.path().join("execution-halt.json")).unwrap();
+        let breaker = test_breaker(dir.path().join("execution-halt.json"));
         let gateway = Arc::new(FakeGateway::returning(Err(OrderSubmitError::Rejected {
             http_status: Some(409),
             code: OrderErrorCode::HttpRejected,
@@ -303,7 +302,7 @@ mod tests {
         positions.open(position.clone());
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("execution-halt.json");
-        let breaker = ExecutionCircuitBreaker::new_live(marker.clone()).unwrap();
+        let breaker = test_breaker(marker.clone());
         let gateway_fake = Arc::new(FakeGateway::returning(Err(OrderSubmitError::Uncertain {
             code: OrderErrorCode::PostTransport,
         })));
@@ -388,6 +387,14 @@ mod tests {
         async fn midprice(&self, _token_id: &str) -> Result<f64> {
             Ok(self.0)
         }
+    }
+
+    fn test_breaker(path: std::path::PathBuf) -> Arc<ExecutionCircuitBreaker> {
+        let ledger = Arc::new(
+            ExecutionLedger::open_live(path.parent().unwrap().join("execution-ledger.jsonl"))
+                .unwrap(),
+        );
+        ExecutionCircuitBreaker::new_live(ledger, path).unwrap()
     }
 
     struct FakeGateway {

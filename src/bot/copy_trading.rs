@@ -242,6 +242,7 @@ mod tests {
 
     use super::*;
     use crate::models::{OrderType, PlannedOrder, Side, VenueId};
+    use crate::service::execution_ledger::ExecutionLedger;
     use crate::service::order_gateway::OrderErrorCode;
     use crate::service::position_store::OpenPosition;
 
@@ -289,7 +290,10 @@ mod tests {
         });
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("DYNAMIC_FILESYSTEM_ERROR_SENTINEL");
-        let breaker = ExecutionCircuitBreaker::new_live(marker.clone()).unwrap();
+        let ledger = Arc::new(
+            ExecutionLedger::open_live(dir.path().join("execution-ledger.jsonl")).unwrap(),
+        );
+        let breaker = ExecutionCircuitBreaker::new_live(ledger, marker.clone()).unwrap();
         std::fs::create_dir(&marker).unwrap();
         let gateway = Arc::new(UncertainGateway::default());
         let gateway_trait: Arc<dyn OrderGateway> = gateway.clone();
