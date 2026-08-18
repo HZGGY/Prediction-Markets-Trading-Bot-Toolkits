@@ -345,7 +345,7 @@ fn side_str(side: Side) -> &'static str {
 
 fn order_type_str(t: OrderType) -> &'static str {
     match t {
-        OrderType::Fak => "FOK",
+        OrderType::Fok => "FOK",
         OrderType::Gtd => "GTD",
         OrderType::Gtc => "GTC",
     }

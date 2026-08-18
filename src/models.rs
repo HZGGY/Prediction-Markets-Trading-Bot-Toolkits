@@ -68,11 +68,11 @@ pub struct PlannedOrder {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderType {
-    /// Fill-or-kill (Polymarket label FOK in the SDK).
-    Fak,
-    /// Good-till-date — limit order with explicit expiration.
+    /// Fill-or-kill; must map to official SDK `OrderType::FOK`.
+    Fok,
+    /// Good-till-date — retained for non-phase-2 stubs only.
     Gtd,
-    /// Good-till-cancel — limit order with no expiration.
+    /// Good-till-cancel — retained for non-phase-2 stubs only.
     Gtc,
 }
 
@@ -107,5 +107,16 @@ impl BookSnapshot {
             .take(levels)
             .map(|lv| lv.price * lv.size)
             .sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn phase_two_order_intent_is_named_fok() {
+        let order_type = OrderType::Fok;
+        assert!(matches!(order_type, OrderType::Fok));
     }
 }

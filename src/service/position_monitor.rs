@@ -125,16 +125,16 @@ async fn monitor_once(
         shares: pos.shares,
         limit_price,
         usd_notional: pos.shares * limit_price,
-        order_type: OrderType::Fak,
+        order_type: OrderType::Fok,
         source_trade_hash: None,
     };
 
     let signed = clob
-        .build_signed_order(&planned, OrderType::Fak, order_expiration_secs)
+        .build_signed_order(&planned, OrderType::Fok, order_expiration_secs)
         .await?;
 
     if live_trading {
-        match clob.post_order(signed.clone(), OrderType::Fak).await {
+        match clob.post_order(signed.clone(), OrderType::Fok).await {
             Ok(resp) => {
                 info!(
                     order_id = ?resp.order_id,

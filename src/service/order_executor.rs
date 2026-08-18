@@ -313,7 +313,7 @@ fn limit_price_for(trade: &WhaleTrade, cfg: &AppConfig) -> f64 {
 
 fn order_type_for(side: Side) -> OrderType {
     match side {
-        Side::Buy => OrderType::Fak,
+        Side::Buy => OrderType::Fok,
         Side::Sell => OrderType::Gtd,
     }
 }
