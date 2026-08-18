@@ -41,7 +41,7 @@
 - Consumes: existing `OrderType::Fak`, whose serializer currently emits wire value `FOK`.
 - Produces: `OrderType::Fok`, preserving the current wire behavior before the old backend is removed.
 
-- [ ] **Step 1: Write the failing FOK naming test**
+- [x] **Step 1: Write the failing FOK naming test**
 
 Add to `src/models.rs`:
 
@@ -58,7 +58,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [x] **Step 2: Run the focused test and verify RED**
 
 ```powershell
 cargo test --offline --locked models::tests::phase_two_order_intent_is_named_fok
@@ -66,7 +66,7 @@ cargo test --offline --locked models::tests::phase_two_order_intent_is_named_fok
 
 Expected: compile failure because `OrderType::Fok` does not exist.
 
-- [ ] **Step 3: Rename only the internal variant and references**
+- [x] **Step 3: Rename only the internal variant and references**
 
 Change the enum declaration to:
 
@@ -90,7 +90,7 @@ OrderType::Fok => "FOK",
 
 Do not change it to `FAK`.
 
-- [ ] **Step 4: Run naming and existing protocol regressions and verify GREEN**
+- [x] **Step 4: Run naming and existing protocol regressions and verify GREEN**
 
 ```powershell
 cargo test --offline --locked models::tests::phase_two_order_intent_is_named_fok
@@ -99,7 +99,7 @@ cargo test --offline --locked service::clob::tests
 
 Expected: both commands PASS and the legacy fixed order still serializes `FOK`.
 
-- [ ] **Step 5: Commit Task 1**
+- [x] **Step 5: Commit Task 1**
 
 ```powershell
 git add -- src/models.rs src/service/clob.rs src/service/order_executor.rs src/service/position_monitor.rs
@@ -119,7 +119,7 @@ git commit -m "refactor: name fill-or-kill orders explicitly"
 - Consumes: existing `TradingConfig`.
 - Produces: `TradingConfig::execution_halt_path: PathBuf`, defaulting to `execution-halt.json`.
 
-- [ ] **Step 1: Write failing default and committed-config tests**
+- [x] **Step 1: Write failing default and committed-config tests**
 
 Add to the existing config tests:
 
@@ -147,7 +147,7 @@ fn committed_configs_pin_safe_halt_path_and_trading_flags() {
 }
 ```
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [x] **Step 2: Run the focused tests and verify RED**
 
 ```powershell
 cargo test --offline --locked config::tests::execution_halt_path_defaults_when_omitted
@@ -156,7 +156,7 @@ cargo test --offline --locked config::tests::committed_configs_pin_safe_halt_pat
 
 Expected: compile failure because `execution_halt_path` is absent.
 
-- [ ] **Step 3: Add the field, default, and explicit committed values**
+- [x] **Step 3: Add the field, default, and explicit committed values**
 
 Import `PathBuf` and extend `TradingConfig`:
 
@@ -186,7 +186,7 @@ Add this property to each JSON `trading` object without changing any other value
 "execution_halt_path": "execution-halt.json"
 ```
 
-- [ ] **Step 4: Run all config tests and verify GREEN**
+- [x] **Step 4: Run all config tests and verify GREEN**
 
 ```powershell
 cargo test --offline --locked config::tests
@@ -194,7 +194,7 @@ cargo test --offline --locked config::tests
 
 Expected: all config tests PASS.
 
-- [ ] **Step 5: Commit Task 2**
+- [x] **Step 5: Commit Task 2**
 
 ```powershell
 git add -- src/config.rs config.json config.dryrun-public.json
@@ -213,7 +213,7 @@ git commit -m "feat: configure persistent execution halt marker"
 - Consumes: `PlannedOrder` and internal `Side`.
 - Produces: `OrderGateway::submit_fok`, `OrderReceipt`, `OrderStage`, `OrderErrorCode`, and `OrderSubmitError`.
 
-- [ ] **Step 1: Create failing tests for exact units and sanitized errors**
+- [x] **Step 1: Create failing tests for exact units and sanitized errors**
 
 Create `src/service/order_gateway.rs` with only this test module first:
 
@@ -247,7 +247,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the module and verify RED**
+- [x] **Step 2: Run the module and verify RED**
 
 ```powershell
 cargo test --offline --locked service::order_gateway::tests
@@ -255,7 +255,7 @@ cargo test --offline --locked service::order_gateway::tests
 
 Expected: compile failure because the module and contract types do not exist.
 
-- [ ] **Step 3: Implement the complete neutral contract**
+- [x] **Step 3: Implement the complete neutral contract**
 
 Add `pub mod order_gateway;` to `src/service/mod.rs`, then implement:
 
@@ -361,7 +361,7 @@ pub trait OrderGateway: Send + Sync {
 
 Do not import an SDK type into this file.
 
-- [ ] **Step 4: Run the module and verify GREEN**
+- [x] **Step 4: Run the module and verify GREEN**
 
 ```powershell
 cargo test --offline --locked service::order_gateway::tests
@@ -369,7 +369,7 @@ cargo test --offline --locked service::order_gateway::tests
 
 Expected: both tests PASS.
 
-- [ ] **Step 5: Commit Task 3**
+- [x] **Step 5: Commit Task 3**
 
 ```powershell
 git add -- src/service/order_gateway.rs src/service/mod.rs
@@ -388,7 +388,7 @@ git commit -m "feat: define neutral order gateway contracts"
 - Consumes: `OrderGateway`, `OrderSubmitError`, `PlannedOrder`, and configured marker path.
 - Produces: `ExecutionCircuitBreaker::new_live`, `check`, `halt_uncertain`, and guarded `submit_fok`.
 
-- [ ] **Step 1: Write failing marker and guarded-submission tests**
+- [x] **Step 1: Write failing marker and guarded-submission tests**
 
 Add tests using a `FakeGateway` with an `AtomicUsize` call counter. The wished-for API is:
 
@@ -526,7 +526,7 @@ async fn concurrent_submission_waits_and_never_posts_after_first_uncertainty() {
 }
 ```
 
-- [ ] **Step 2: Run the breaker tests and verify RED**
+- [x] **Step 2: Run the breaker tests and verify RED**
 
 ```powershell
 cargo test --offline --locked service::execution_circuit_breaker::tests
@@ -534,7 +534,7 @@ cargo test --offline --locked service::execution_circuit_breaker::tests
 
 Expected: compile failure because the breaker module does not exist.
 
-- [ ] **Step 3: Implement the marker schema and startup checks**
+- [x] **Step 3: Implement the marker schema and startup checks**
 
 Add `pub mod execution_circuit_breaker;` and create:
 
@@ -599,7 +599,7 @@ impl ExecutionCircuitBreaker {
 }
 ```
 
-- [ ] **Step 4: Implement atomic halt persistence and guarded submission**
+- [x] **Step 4: Implement atomic halt persistence and guarded submission**
 
 `halt_uncertain` must set memory first, then atomically persist without including any payload or credential:
 
@@ -670,7 +670,7 @@ pub async fn submit_fok(
 
 Do not add a marker-clearing function.
 
-- [ ] **Step 5: Run breaker and gateway tests and verify GREEN**
+- [x] **Step 5: Run breaker and gateway tests and verify GREEN**
 
 ```powershell
 cargo test --offline --locked service::execution_circuit_breaker::tests
@@ -679,7 +679,7 @@ cargo test --offline --locked service::order_gateway::tests
 
 Expected: all tests PASS; uncertainty calls the fake once, writes one marker, and blocks the second call.
 
-- [ ] **Step 6: Commit Task 4**
+- [x] **Step 6: Commit Task 4**
 
 ```powershell
 git add -- src/service/execution_circuit_breaker.rs src/service/mod.rs
@@ -700,7 +700,7 @@ git commit -m "feat: persist uncertain order execution halts"
 - Consumes: `AppConfig`, official SDK credentials already present in config, and neutral `PlannedOrder`.
 - Produces: `SdkOrderGateway::new`, private `prepare_fok`, tick alignment, V2 amount extraction, and signed SDK orders; no POST implementation yet.
 
-- [ ] **Step 1: Add failing pure mapping tests**
+- [x] **Step 1: Add failing pure mapping tests**
 
 Create `clob_sdk_orders.rs` with tests for:
 
@@ -733,7 +733,7 @@ fn side_aware_amount_mapping_is_exact() {
 
 Here `map_amounts(side, making_micros, taking_micros)` returns `(shares_micros, usd_micros)`.
 
-- [ ] **Step 2: Run mapping tests and verify RED**
+- [x] **Step 2: Run mapping tests and verify RED**
 
 ```powershell
 cargo test --offline --locked service::clob_sdk_orders::tests::buy_rounds_down_and_sell_rounds_up_without_worsening_limit
@@ -741,7 +741,7 @@ cargo test --offline --locked service::clob_sdk_orders::tests::buy_rounds_down_a
 
 Expected: compile failure because the adapter helpers do not exist.
 
-- [ ] **Step 3: Implement pure conversion and alignment helpers**
+- [x] **Step 3: Implement pure conversion and alignment helpers**
 
 Use SDK-reexported `Decimal` and `U256`; do not use `f64` for tick arithmetic:
 
@@ -808,7 +808,7 @@ fn map_amounts(side: Side, making: u128, taking: u128) -> (u128, u128) {
 
 The helpers must not log their input on error.
 
-- [ ] **Step 4: Add failing loopback build/sign test**
+- [x] **Step 4: Add failing loopback build/sign test**
 
 Use the public Hardhat fixture key already used in `clob_auth.rs`, UUID nil credentials, and a local TCP server that returns, in order:
 
@@ -835,7 +835,7 @@ Use a plan with `shares = 39.0`, `limit_price = 0.505`; BUY alignment makes the 
 
 Add a second test where loopback returns `{"neg_risk":true}` for a `planned.neg_risk = false` order. Assert `NegRiskMismatch` and that `/version` is never requested.
 
-- [ ] **Step 5: Implement authenticated client construction with supplied credentials only**
+- [x] **Step 5: Implement authenticated client construction with supplied credentials only**
 
 Define the adapter and private test seam:
 
@@ -907,7 +907,7 @@ impl SdkOrderGateway {
 
 Only tests may call `new_with_host`; production calls `new` and therefore enforces the exact official host. Authentication with supplied `Credentials` must not call Create, Derive, or Create-or-Derive.
 
-- [ ] **Step 6: Implement explicit metadata, build, and sign stages**
+- [x] **Step 6: Implement explicit metadata, build, and sign stages**
 
 `prepare_fok` must:
 
@@ -958,7 +958,7 @@ async fn prepare_fok(&self, planned: &PlannedOrder) -> Result<PreparedOrder, Ord
 
 Do not call `build_sign_and_post`.
 
-- [ ] **Step 7: Add SDK signature recovery to the loopback test**
+- [x] **Step 7: Add SDK signature recovery to the loopback test**
 
 Add a dev-only alias compatible with the SDK's Alloy generation:
 
@@ -996,7 +996,7 @@ assert_eq!(
 );
 ```
 
-- [ ] **Step 8: Run adapter preparation tests and verify GREEN**
+- [x] **Step 8: Run adapter preparation tests and verify GREEN**
 
 ```powershell
 cargo test --offline --locked service::clob_sdk_orders::tests::buy_rounds_down_and_sell_rounds_up_without_worsening_limit
@@ -1006,7 +1006,7 @@ cargo test --offline --locked service::clob_sdk_orders::tests::neg_risk_mismatch
 
 Expected: all tests PASS, no L1 request occurs, and the captured hosts are loopback only.
 
-- [ ] **Step 9: Commit Task 5**
+- [x] **Step 9: Commit Task 5**
 
 ```powershell
 git add -- Cargo.toml Cargo.lock src/service/clob_sdk_orders.rs src/service/mod.rs
@@ -1024,7 +1024,7 @@ git commit -m "feat: prepare FOK orders with official SDK"
 - Consumes: `PreparedOrder` from Task 5 and official SDK `PostOrderResponse`/`Error`.
 - Produces: the only production `OrderGateway` implementation, with one explicit post attempt and sanitized classification.
 
-- [ ] **Step 1: Write failing response-classification unit tests**
+- [x] **Step 1: Write failing response-classification unit tests**
 
 Create a pure `classify_response` seam and tests covering this exact matrix:
 
@@ -1081,7 +1081,7 @@ fn success_false_is_rejected_but_successful_non_final_or_mismatch_is_uncertain()
 
 Also cover `Delayed`, `Unmatched`, `Unknown`, zero amounts, SELL mapping, excess decimal precision, and micro-unit overflow.
 
-- [ ] **Step 2: Run classification tests and verify RED**
+- [x] **Step 2: Run classification tests and verify RED**
 
 ```powershell
 cargo test --offline --locked service::clob_sdk_orders::tests::exact_matched_buy_returns_actual_side_aware_receipt
@@ -1089,7 +1089,7 @@ cargo test --offline --locked service::clob_sdk_orders::tests::exact_matched_buy
 
 Expected: compile failure because `classify_response` does not exist.
 
-- [ ] **Step 3: Implement fail-closed response classification**
+- [x] **Step 3: Implement fail-closed response classification**
 
 Implement in this order so `success = false` never becomes an uncertainty merely because its amounts are empty:
 
@@ -1134,7 +1134,7 @@ fn classify_response(
 
 Because `OrderStatusType` is non-exhaustive, any future successful non-`Matched` value follows the uncertainty branch.
 
-- [ ] **Step 4: Write failing loopback post/error/redaction tests**
+- [x] **Step 4: Write failing loopback post/error/redaction tests**
 
 Use a scripted loopback server that serves Task 5's three metadata/version responses and then one `/order` response. Add tests for:
 
@@ -1150,7 +1150,7 @@ server accepts request but withholds response beyond injected 25ms -> Uncertain(
 
 For every test, capture requests and assert there is exactly one `POST /order`, `orderType` is `FOK`, `owner` is UUID nil, `POLY_ADDRESS` is the fixture signer, and L1 `/auth/api-key` and `/auth/derive-api-key` counts are zero. Sentinel assertions must use only rendered local errors; never print the raw body.
 
-- [ ] **Step 5: Implement one-shot post classification and the trait**
+- [x] **Step 5: Implement one-shot post classification and the trait**
 
 Inspect status without formatting or attaching the SDK error:
 
@@ -1195,7 +1195,7 @@ impl OrderGateway for SdkOrderGateway {
 
 Do not retry after version invalidation or any other error. Never call `build_sign_and_post`.
 
-- [ ] **Step 6: Run the full SDK adapter module and verify GREEN**
+- [x] **Step 6: Run the full SDK adapter module and verify GREEN**
 
 ```powershell
 cargo test --offline --locked service::clob_sdk_orders::tests
@@ -1203,7 +1203,7 @@ cargo test --offline --locked service::clob_sdk_orders::tests
 
 Expected: all pure and loopback tests PASS; each uncertain case has exactly one POST and no response-body sentinel appears in output.
 
-- [ ] **Step 7: Commit Task 6**
+- [x] **Step 7: Commit Task 6**
 
 ```powershell
 git add -- src/service/clob_sdk_orders.rs
@@ -1221,7 +1221,7 @@ git commit -m "feat: submit and classify official SDK FOK orders"
 - Consumes: `SdkOrderGateway`, `ExecutionCircuitBreaker`, `OrderGateway`, and `OrderReceipt`.
 - Produces: async `OrderExecutor::new`, `live_order_components`, `ExecutionOutcome::NotSubmitted`, and `ExecutionOutcome::Filled`.
 
-- [ ] **Step 1: Write failing fake-gateway execution tests**
+- [x] **Step 1: Write failing fake-gateway execution tests**
 
 Add a test-only constructor:
 
@@ -1258,7 +1258,7 @@ assert!(matches!(outcome, ExecutionOutcome::NotSubmitted(_)));
 
 The fake receipt for the actual-accounting test is `39_000_000` shares and `19_500_000` USD. The share count remains a complete FOK fill, while the actual USD differs from the strategy's original `20.0` estimate because the SDK-aligned BUY price is `0.50` rather than the planned `0.505` limit.
 
-- [ ] **Step 2: Run executor tests and verify RED**
+- [x] **Step 2: Run executor tests and verify RED**
 
 ```powershell
 cargo test --offline --locked service::order_executor::tests
@@ -1266,7 +1266,7 @@ cargo test --offline --locked service::order_executor::tests
 
 Expected: compile failures for the new constructor/outcome API and at least one behavioral failure because live positions still use planned amounts.
 
-- [ ] **Step 3: Replace `ClobClient` fields and outcomes**
+- [x] **Step 3: Replace `ClobClient` fields and outcomes**
 
 Use these fields and outcome variants:
 
@@ -1291,7 +1291,7 @@ pub enum ExecutionOutcome {
 
 Delete `DryRun(SignedOrder)` and `Submitted { signed, ... }`.
 
-- [ ] **Step 4: Make construction strict and asynchronous**
+- [x] **Step 4: Make construction strict and asynchronous**
 
 ```rust
 pub async fn new(
@@ -1323,7 +1323,7 @@ pub fn live_order_components(
 
 Live initialization errors must propagate; never fall back to dry-run.
 
-- [ ] **Step 5: Route execution and accounting through the guarded gateway**
+- [x] **Step 5: Route execution and accounting through the guarded gateway**
 
 Every phase-2 plan uses `OrderType::Fok`. After planning:
 
@@ -1356,7 +1356,7 @@ let entry_price = usd_notional / shares;
 
 Reject zero values before creating an `OpenPosition`; a zero receipt should already be impossible after Task 6.
 
-- [ ] **Step 6: Run executor tests and verify GREEN**
+- [x] **Step 6: Run executor tests and verify GREEN**
 
 ```powershell
 cargo test --offline --locked service::order_executor::tests
@@ -1364,7 +1364,7 @@ cargo test --offline --locked service::order_executor::tests
 
 Expected: dry-run replay still passes without credentials/signing; live fake receipts use actual amounts; reject/preflight/uncertain cases never open a position.
 
-- [ ] **Step 7: Commit Task 7**
+- [x] **Step 7: Commit Task 7**
 
 ```powershell
 git add -- src/service/order_executor.rs
@@ -1383,7 +1383,7 @@ git commit -m "feat: route entries through guarded SDK gateway"
 - Consumes: `OrderExecutor::live_order_components`, shared `OrderGateway`, shared breaker, and live-only midpoint source.
 - Produces: live-only TP/SL spawn and exact FOK exit outcomes with no local close on rejected/uncertain orders.
 
-- [ ] **Step 1: Write failing TP/SL fake-gateway tests**
+- [x] **Step 1: Write failing TP/SL fake-gateway tests**
 
 Expose a testable single-tick result:
 
@@ -1416,7 +1416,7 @@ assert!(breaker.is_halted());
 
 Assert the submitted exit plan is `Side::Sell`, `OrderType::Fok`, and exactly the open position's shares.
 
-- [ ] **Step 2: Run TP/SL tests and verify RED**
+- [x] **Step 2: Run TP/SL tests and verify RED**
 
 ```powershell
 cargo test --offline --locked service::position_monitor::tests
@@ -1424,7 +1424,7 @@ cargo test --offline --locked service::position_monitor::tests
 
 Expected: compile failures because the monitor still requires `ClobClient` and closes on any successful POST wrapper result.
 
-- [ ] **Step 3: Replace the monitor's live dependencies and submission logic**
+- [x] **Step 3: Replace the monitor's live dependencies and submission logic**
 
 Change `spawn` and `monitor_once` to consume:
 
@@ -1479,7 +1479,7 @@ if let Err(error) = monitor_once(
 
 Do not format the full error in either log branch.
 
-- [ ] **Step 4: Write failing bot wiring test/helper**
+- [x] **Step 4: Write failing bot wiring test/helper**
 
 Extract this pure decision and test it:
 
@@ -1497,7 +1497,7 @@ fn live_tp_sl_components(
 
 The test must assert strict dry-run returns `None` even when TP/SL is enabled. This proves copy startup will not construct `ClobMidpriceSource` in dry-run.
 
-- [ ] **Step 5: Update bot construction, spawning, and outcome logs**
+- [x] **Step 5: Update bot construction, spawning, and outcome logs**
 
 Await constructor:
 
@@ -1543,7 +1543,7 @@ if let Err(error) = handle_log(&executor, &whale, &log).await {
 
 Do not log the full `anyhow::Error`, because it may originate in an unrelated HTTP source.
 
-- [ ] **Step 6: Run monitor, bot, and replay tests and verify GREEN**
+- [x] **Step 6: Run monitor, bot, and replay tests and verify GREEN**
 
 ```powershell
 cargo test --offline --locked service::position_monitor::tests
@@ -1553,7 +1553,7 @@ cargo test --offline --locked bot::copy_trading
 
 Expected: all tests PASS; dry-run has no CLOB midpoint/SDK path and entries/exits share the same breaker in live fixtures.
 
-- [ ] **Step 7: Commit Task 8**
+- [x] **Step 7: Commit Task 8**
 
 ```powershell
 git add -- src/service/position_monitor.rs src/bot/copy_trading.rs
@@ -1577,7 +1577,7 @@ git commit -m "feat: share guarded SDK execution with TP SL"
 - Consumes: all migrated callers and official SDK loopback coverage from Tasks 5–8.
 - Produces: one production order backend, corrected user documentation, and no runtime manual signing/HMAC/POST entry point.
 
-- [ ] **Step 1: Prove all production callers have left the old backend**
+- [x] **Step 1: Prove all production callers have left the old backend**
 
 ```powershell
 rg -n "ClobClient|SignedOrder|OrderPostBody|build_signed_order|l2_headers|hmac_sha256|serialize_order_request|service::clob" src --glob '!src/service/clob.rs'
@@ -1585,7 +1585,7 @@ rg -n "ClobClient|SignedOrder|OrderPostBody|build_signed_order|l2_headers|hmac_s
 
 Expected: no matches. If a match remains, migrate that exact caller to `OrderGateway` before deleting anything.
 
-- [ ] **Step 2: Delete the backend and remove its module export**
+- [x] **Step 2: Delete the backend and remove its module export**
 
 Delete `src/service/clob.rs` and remove `pub mod clob;`. Update service/bot module comments to describe official SDK FOK execution and strict paper mode.
 
@@ -1597,7 +1597,7 @@ rg -n "base64::|alloy_primitives_v1|alloy_dyn_abi" src
 
 If the command has no matches, remove direct `base64`, `alloy-primitives-v1`, and `alloy-dyn-abi` entries. Keep `alloy-primitives = 0.8` and `alloy-sol-types = 0.8` because `parse.rs` uses them. Keep the exact Alloy signer pins required by the already-verified SDK dependency graph.
 
-- [ ] **Step 3: Run compile and old-backend absence checks**
+- [x] **Step 3: Run compile and old-backend absence checks**
 
 ```powershell
 cargo test --offline --locked --no-run
@@ -1606,7 +1606,7 @@ rg -n "pub mod clob;|ClobClient|build_signed_order|l2_headers|hmac_sha256_base64
 
 Expected: compile succeeds and the absence scan has no matches. `clob_auth` and `clob_sdk_orders` names are allowed.
 
-- [ ] **Step 4: Update English and Chinese documentation**
+- [x] **Step 4: Update English and Chinese documentation**
 
 Document these exact facts in both README files:
 
@@ -1623,7 +1623,7 @@ Replace the local status paragraphs that still say “existing raw V2 order path
 
 Update `config.yaml.example` comments from “phase 1” to “current EOA-only SDK phases” without adding any credential value.
 
-- [ ] **Step 5: Run documentation and safety scans**
+- [x] **Step 5: Run documentation and safety scans**
 
 ```powershell
 rg -n "existing raw V2 order path|现有 V2 原始订单路径|dry-run.*signed|空跑.*签名" README.md README.zh-CN.md src
@@ -1632,7 +1632,7 @@ rg -n '"enable_trading"\s*:\s*true|"mock_trading"\s*:\s*false|api_key:\s*"[^"]+"
 
 Expected: obsolete local status claims and permissive/credential values have no matches.
 
-- [ ] **Step 6: Commit Task 9**
+- [x] **Step 6: Commit Task 9**
 
 ```powershell
 git add -- Cargo.toml Cargo.lock src/service/clob.rs src/service/mod.rs README.md README.zh-CN.md config.yaml.example
@@ -1652,7 +1652,7 @@ git commit -m "refactor: remove custom CLOB order backend"
 - Consumes: complete phase-2 branch.
 - Produces: verified branch evidence, credential-free Obsidian status, and a user choice for branch completion.
 
-- [ ] **Step 1: Format only changed Rust files**
+- [x] **Step 1: Format only changed Rust files**
 
 List changed Rust files, inspect the exact paths, then run `rustfmt --edition 2021` only on those files. The expected set is:
 
@@ -1662,7 +1662,7 @@ rustfmt --edition 2021 src/models.rs src/config.rs src/service/order_gateway.rs 
 
 Do not format untouched files.
 
-- [ ] **Step 2: Run focused safety-critical tests**
+- [x] **Step 2: Run focused safety-critical tests**
 
 ```powershell
 cargo test --offline --locked service::order_gateway::tests
@@ -1674,7 +1674,7 @@ cargo test --offline --locked service::position_monitor::tests
 
 Expected: all PASS with zero failures and no public network access.
 
-- [ ] **Step 3: Run the full locked offline suite and release gates**
+- [x] **Step 3: Run the full locked offline suite and release gates**
 
 ```powershell
 cargo test --all-targets --offline --locked
@@ -1684,7 +1684,7 @@ cargo clippy --all-targets --offline --locked -- -D warnings
 
 Expected: all commands PASS.
 
-- [ ] **Step 4: Record the repository-wide formatting baseline**
+- [x] **Step 4: Record the repository-wide formatting baseline**
 
 ```powershell
 cargo fmt --check
@@ -1692,7 +1692,7 @@ cargo fmt --check
 
 If it fails only on the known untouched files, record the exact unchanged baseline and do not run whole-repository formatting. If a changed file appears, format only that file and rerun its focused tests.
 
-- [ ] **Step 5: Run old-backend, retry, host, and secret scans**
+- [x] **Step 5: Run old-backend, retry, host, and secret scans**
 
 ```powershell
 rg -n "ClobClient|build_signed_order|build_sign_and_post|l2_headers|hmac_sha256_base64url|serialize_order_request" src
@@ -1710,7 +1710,7 @@ Interpretation:
 - config scan: no matches;
 - sentinel scan: test and implementation-plan literals only, never production output.
 
-- [ ] **Step 6: Inspect dependency and diff state**
+- [x] **Step 6: Inspect dependency and diff state**
 
 ```powershell
 cargo tree --offline --locked -i polymarket_client_sdk_v2
@@ -1721,7 +1721,7 @@ git log --oneline --decorate -12
 
 Expected: official SDK is the sole order protocol implementation, diff check is clean, and only intentional plan-result/Obsidian work remains.
 
-- [ ] **Step 7: Perform independent code review and address findings**
+- [x] **Step 7: Perform independent code review and address findings**
 
 Use `superpowers:requesting-code-review` after all tests pass. Review specifically for:
 
@@ -1738,7 +1738,7 @@ remaining runtime references to custom clob.rs
 
 For each accepted finding, add a failing regression test, implement the smallest fix, rerun focused and full gates, and commit the fix separately.
 
-- [ ] **Step 8: Update Obsidian without credentials**
+- [x] **Step 8: Update Obsidian without credentials**
 
 Record only:
 
@@ -1752,16 +1752,29 @@ Record only:
 
 Never store fixture secrets, complete API keys, private keys, signatures, signed bodies, raw response bodies, or raw terminal output.
 
-- [ ] **Step 9: Commit the completed plan record**
+- [x] **Step 9: Commit the completed plan record**
 
 ```powershell
 git add -- docs/superpowers/plans/2026-08-18-official-sdk-order-migration.md
 git commit -m "docs: close official SDK order migration plan"
 ```
 
-- [ ] **Step 10: Use the finishing-development-branch workflow**
+- [x] **Step 10: Use the finishing-development-branch workflow**
 
 Invoke `superpowers:finishing-a-development-branch` and offer only its supported local merge, PR, keep-branch, or discard choices. Do not merge, push, delete, or discard without explicit user selection.
+
+---
+
+## Actual Verification Results
+
+- Implemented Tasks 1–10 on `codex/sdk-order-migration`, based on local `main` commit `0f55b7e`.
+- Removed the custom CLOB order backend in `208830a`; official `polymarket_client_sdk_v2 = 0.6.0` with the reviewed local patch is the sole production order implementation.
+- Formatted the migrated SDK-order files in `a967afe` without changing the known repository-wide formatting baseline in untouched files.
+- Independent whole-branch review initially found zero Critical, four Important, and one must-fix Minor issue. All five were fixed in `8b64ecd`; scoped re-review found no remaining Critical, Important, or Minor issue and no out-of-scope change.
+- Final controller verification at source commit `8b64ecd`: `cargo test --all-targets --offline --locked` passed 107/107 tests; release build and Clippy with `-D warnings` passed; changed-file rustfmt, `git diff --check`, legacy-backend, retry, host, credential, and obsolete-documentation scans passed.
+- Committed configs remain strict paper mode (`enable_trading = false`, `mock_trading = true`) and contain no example credentials. No public CLOB, Gamma, Polygon, authentication, signing, broadcast, or real-order call was made during implementation or verification.
+- Accepted deferred low-severity cleanup: public `ExitOutcome`, the fail-closed diagnostic limitation across reqwest major versions, loopback harness bounds, and the large SDK adapter test module.
+- Phase 3 crash-consistency and operator-reconciliation work remains required before live-trading evaluation. This completed phase does not authorize live trading.
 
 ---
 
@@ -1775,7 +1788,7 @@ Invoke `superpowers:finishing-a-development-branch` and offer only its supported
 - [x] BUY prices round down and SELL prices round up to the SDK-reported tick.
 - [x] Planned neg-risk must match the SDK response before build/sign/post.
 - [x] Explicit build, sign, and post stages are used; `build_sign_and_post` is forbidden.
-- [x] HTTP status errors are sanitized rejection; post transport/timeout/malformed success is uncertainty.
+- [x] Explicit HTTP 4xx/5xx errors are sanitized rejection; 1xx/3xx/unexpected statuses and post transport/timeout/malformed success are uncertainty.
 - [x] Only exact positive `Matched` making/taking values produce a receipt and position mutation.
 - [x] Every uncertain post gets one attempt, no position mutation, in-memory halt first, atomic marker persistence, and global entry/exit blocking; the shared submission lock prevents an entry/exit race from posting a second order after the first uncertainty.
 - [x] Marker persistence failure remains halted in memory and returns a fatal sanitized error; marker clearing is absent.
