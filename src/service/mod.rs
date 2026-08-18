@@ -16,6 +16,7 @@ pub mod clob_auth;
 pub mod clob_sdk_orders;
 pub mod eligibility;
 pub mod execution_circuit_breaker;
+pub mod execution_ledger;
 pub mod market_cache;
 pub mod midprice;
 pub mod onchain;
