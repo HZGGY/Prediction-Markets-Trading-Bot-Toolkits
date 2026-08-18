@@ -12,6 +12,7 @@ use polymarket_client_sdk_v2::clob::types::{
     OrderStatusType, OrderType as SdkOrderType, Side as SdkSide, SignedOrder as SdkSignedOrder,
 };
 use polymarket_client_sdk_v2::clob::{Client, Config as SdkConfig};
+use polymarket_client_sdk_v2::error::EmptyResponse as SdkEmptyResponse;
 use polymarket_client_sdk_v2::error::{Error as SdkError, Status as SdkStatus};
 use polymarket_client_sdk_v2::types::{Address, Decimal, U256};
 use polymarket_client_sdk_v2::POLYGON;
@@ -360,7 +361,17 @@ fn classify_response(
 }
 
 fn classify_post_error(error: &SdkError) -> OrderSubmitError {
+    if error.downcast_ref::<SdkEmptyResponse>().is_some() {
+        return OrderSubmitError::Uncertain {
+            code: OrderErrorCode::MalformedResponse,
+        };
+    }
     if let Some(status) = error.downcast_ref::<SdkStatus>() {
+        if status.status_code.is_redirection() {
+            return OrderSubmitError::Uncertain {
+                code: OrderErrorCode::PostTransport,
+            };
+        }
         return OrderSubmitError::Rejected {
             http_status: Some(status.status_code.as_u16()),
             code: OrderErrorCode::HttpRejected,
@@ -456,6 +467,7 @@ mod tests {
             status: &'static str,
             body: &'static str,
         },
+        Redirect,
         Disconnect,
         Withhold(Duration),
     }
@@ -758,9 +770,20 @@ mod tests {
             requests.push(version_request);
             write_keep_alive_json_response(&mut stream, r#"{"version":2}"#).await;
             requests.push(read_safe_request(&mut stream).await);
+            let allow_redirect_probe = matches!(order_response, OrderServerResponse::Redirect);
             match order_response {
                 OrderServerResponse::Http { status, body } => {
                     write_json_response(&mut stream, status, body).await;
+                }
+                OrderServerResponse::Redirect => {
+                    let response = concat!(
+                        "HTTP/1.1 307 Temporary Redirect\r\n",
+                        "Location: /redirect-target\r\n",
+                        "Content-Length: 0\r\n",
+                        "Connection: close\r\n\r\n"
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.shutdown().await.unwrap();
                 }
                 OrderServerResponse::Disconnect => {
                     stream.shutdown().await.unwrap();
@@ -775,7 +798,12 @@ mod tests {
                 tokio::time::timeout(Duration::from_millis(100), listener.accept()).await
             {
                 let request = read_safe_request(&mut stream).await;
-                panic!("unexpected extra loopback request: {}", request.line);
+                if allow_redirect_probe {
+                    requests.push(request);
+                    write_json_response(&mut stream, "200 OK", MATCHED_RESPONSE).await;
+                } else {
+                    panic!("unexpected extra loopback request: {}", request.line);
+                }
             }
             requests
         });
@@ -957,6 +985,52 @@ mod tests {
             error,
             OrderSubmitError::Uncertain {
                 code: OrderErrorCode::MalformedResponse,
+            }
+        );
+        assert_order_request_contract(&requests);
+    }
+
+    #[tokio::test]
+    async fn successful_null_response_is_uncertain_without_fabricating_http_404() {
+        let (host, server) = spawn_order_server(OrderServerResponse::Http {
+            status: "200 OK",
+            body: "null",
+        })
+        .await;
+        let cfg = fixture_config();
+        let gateway = SdkOrderGateway::new_with_host(&cfg, &host, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        let result = gateway.submit_fok(&planned_order(false)).await;
+        let requests = server.await.unwrap();
+        let error = result.unwrap_err();
+
+        assert_eq!(
+            error,
+            OrderSubmitError::Uncertain {
+                code: OrderErrorCode::MalformedResponse,
+            }
+        );
+        assert_order_request_contract(&requests);
+    }
+
+    #[tokio::test]
+    async fn redirect_response_is_not_followed_or_replayed() {
+        let (host, server) = spawn_order_server(OrderServerResponse::Redirect).await;
+        let cfg = fixture_config();
+        let gateway = SdkOrderGateway::new_with_host(&cfg, &host, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        let result = gateway.submit_fok(&planned_order(false)).await;
+        let requests = server.await.unwrap();
+        let error = result.unwrap_err();
+
+        assert_eq!(
+            error,
+            OrderSubmitError::Uncertain {
+                code: OrderErrorCode::PostTransport,
             }
         );
         assert_order_request_contract(&requests);

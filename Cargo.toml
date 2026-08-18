@@ -62,6 +62,9 @@ polymarket_client_sdk_v2 = { version = "=0.6.0", default-features = false, featu
 # Same-directory atomic persistence for the gitignored credentials YAML.
 tempfile = "3"
 
+[patch.crates-io]
+polymarket_client_sdk_v2 = { path = "vendor/polymarket_client_sdk_v2" }
+
 [dev-dependencies]
 alloy-sol-types-v1 = { package = "alloy-sol-types", version = "=1.6.1" }
 
