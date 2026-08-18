@@ -224,14 +224,26 @@ impl ExecutionLedger {
             state.fatal = true;
             return Err(LedgerError::new(LedgerErrorCode::SyncFailed));
         }
-        if let Some(snapshot) = pending_snapshot {
-            if let Err(error) = persist_snapshot(&self.paths, &snapshot, self.durability.as_ref()) {
+        let mut snapshot_guard = if let Some(snapshot) = pending_snapshot {
+            match persist_snapshot(&self.paths, &snapshot, self.durability.as_ref()) {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    state.fatal = true;
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(guard) = snapshot_guard.as_mut() {
+            if let Err(error) = guard.revalidate() {
                 state.fatal = true;
                 return Err(error);
             }
         }
 
         state.projection.publish_staged(&event, staged);
+        drop(snapshot_guard);
         Ok(AppendOutcome::Appended(event))
     }
 
@@ -292,10 +304,7 @@ fn read_snapshot(paths: &LedgerPaths) -> Result<Option<Vec<u8>>, LedgerError> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(LedgerError::new(LedgerErrorCode::Unavailable)),
     }
-    let mut file = restrictive_open_options(false)?
-        .open(&paths.snapshot)
-        .map_err(|error| classify_open_error(&paths.snapshot, error))?;
-    validate_opened_target(&file, &paths.snapshot)?;
+    let mut file = open_existing_restrictive(&paths.snapshot, false)?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
         .map_err(|_| LedgerError::new(LedgerErrorCode::Unavailable))?;
@@ -396,14 +405,19 @@ fn open_restrictive(path: &Path, append: bool) -> Result<OpenedFile, LedgerError
         Err(error) => return Err(classify_open_error(path, error)),
     }
 
-    let file = restrictive_open_options(append)?
-        .open(path)
-        .map_err(|error| classify_open_error(path, error))?;
-    validate_opened_target(&file, path)?;
+    let file = open_existing_restrictive(path, append)?;
     Ok(OpenedFile {
         file,
         created: false,
     })
+}
+
+pub(crate) fn open_existing_restrictive(path: &Path, append: bool) -> Result<File, LedgerError> {
+    let file = restrictive_open_options(append)?
+        .open(path)
+        .map_err(|error| classify_open_error(path, error))?;
+    validate_opened_target(&file, path)?;
+    Ok(file)
 }
 
 fn acquire_lifetime_lock(file: &File) -> Result<(), LedgerError> {
@@ -526,7 +540,7 @@ fn classify_open_error(path: &Path, _error: io::Error) -> LedgerError {
     }
 }
 
-fn validate_opened_target(file: &File, path: &Path) -> Result<(), LedgerError> {
+pub(crate) fn validate_opened_target(file: &File, path: &Path) -> Result<(), LedgerError> {
     let opened = file
         .metadata()
         .map_err(|_| LedgerError::new(LedgerErrorCode::UnsafePath))?;

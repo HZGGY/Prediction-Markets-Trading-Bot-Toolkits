@@ -1,4 +1,8 @@
-use std::{fs::File, io, path::Path};
+use std::{
+    fs::File,
+    io::{self, Read, Seek, SeekFrom},
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
@@ -6,7 +10,9 @@ use tempfile::NamedTempFile;
 use super::{
     model::{EventHash, LedgerError, LedgerErrorCode},
     projection::{ActiveIntent, LedgerProjection},
-    storage::{reject_existing_target, LedgerPaths},
+    storage::{
+        open_existing_restrictive, reject_existing_target, validate_opened_target, LedgerPaths,
+    },
 };
 
 pub const ACTIVE_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
@@ -52,6 +58,39 @@ pub(crate) trait SnapshotDurability: Send + Sync {
     fn sync_snapshot_directory(&self, path: &Path) -> io::Result<()>;
 }
 
+pub(crate) struct PersistedSnapshot {
+    file: File,
+    path: PathBuf,
+    intended_bytes: Vec<u8>,
+    intended_snapshot: ActiveSnapshot,
+}
+
+impl PersistedSnapshot {
+    pub(crate) fn revalidate(&mut self) -> Result<(), LedgerError> {
+        validate_opened_target(&self.file, &self.path)
+            .map_err(|_| LedgerError::new(LedgerErrorCode::SnapshotMismatch))?;
+        self.file
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| LedgerError::new(LedgerErrorCode::SnapshotMismatch))?;
+        let mut actual_bytes = Vec::new();
+        self.file
+            .read_to_end(&mut actual_bytes)
+            .map_err(|_| LedgerError::new(LedgerErrorCode::SnapshotMismatch))?;
+        if actual_bytes != self.intended_bytes {
+            return Err(LedgerError::new(LedgerErrorCode::SnapshotMismatch));
+        }
+        let actual: ActiveSnapshot = serde_json::from_slice(&actual_bytes)
+            .map_err(|_| LedgerError::new(LedgerErrorCode::SnapshotMismatch))?;
+        if actual.schema_version != ACTIVE_SNAPSHOT_SCHEMA_VERSION
+            || actual != self.intended_snapshot
+        {
+            return Err(LedgerError::new(LedgerErrorCode::SnapshotMismatch));
+        }
+        validate_opened_target(&self.file, &self.path)
+            .map_err(|_| LedgerError::new(LedgerErrorCode::SnapshotMismatch))
+    }
+}
+
 pub(crate) fn verify_snapshot(
     bytes: Option<&[u8]>,
     projection: &LedgerProjection,
@@ -78,7 +117,7 @@ pub(crate) fn persist_snapshot<D: SnapshotDurability + ?Sized>(
     paths: &LedgerPaths,
     snapshot: &ActiveSnapshot,
     durability: &D,
-) -> Result<(), LedgerError> {
+) -> Result<PersistedSnapshot, LedgerError> {
     let bytes = serde_json::to_vec(snapshot)
         .map_err(|_| LedgerError::new(LedgerErrorCode::SnapshotWriteFailed))?;
     let mut temp = durability
@@ -97,11 +136,18 @@ pub(crate) fn persist_snapshot<D: SnapshotDurability + ?Sized>(
     durability
         .persist_snapshot(temp, &paths.snapshot)
         .map_err(|_| LedgerError::new(LedgerErrorCode::SnapshotPersistFailed))?;
-    reject_existing_target(&paths.snapshot)?;
+    let file = open_existing_restrictive(&paths.snapshot, false)?;
+    let mut persisted = PersistedSnapshot {
+        file,
+        path: paths.snapshot.clone(),
+        intended_bytes: bytes,
+        intended_snapshot: snapshot.clone(),
+    };
+    persisted.revalidate()?;
     durability
         .sync_snapshot_directory(&paths.parent)
         .map_err(|_| LedgerError::new(LedgerErrorCode::SnapshotDirectorySyncFailed))?;
-    Ok(())
+    Ok(persisted)
 }
 
 #[cfg(test)]
@@ -111,7 +157,7 @@ mod tests {
         io::{self, Write},
         path::{Path, PathBuf},
         sync::{
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc,
         },
     };
@@ -414,6 +460,39 @@ mod tests {
     }
 
     #[test]
+    fn replacement_between_persist_and_publication_is_detected_and_poisons() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("execution-ledger.jsonl");
+        let ops = Arc::new(FailingSnapshotOps::new(
+            SnapshotFailure::ReplaceDuringDirectorySync,
+        ));
+        let ledger = ExecutionLedger::open_live_with_ops(&path, ops.clone()).unwrap();
+
+        let result = ledger.append(intent_id(13), prepared_payload());
+        #[cfg(windows)]
+        assert!(ops.replacement_denied.load(Ordering::SeqCst));
+        assert_eq!(
+            result.unwrap_err().code(),
+            LedgerErrorCode::SnapshotMismatch
+        );
+        assert_eq!(ledger.projection().sequence, 0);
+        assert!(ledger.projection().active.is_none());
+        assert_eq!(
+            ledger
+                .append(intent_id(13), prepared_payload())
+                .unwrap_err()
+                .code(),
+            LedgerErrorCode::Fatal
+        );
+        drop(ledger);
+
+        assert_eq!(
+            ExecutionLedger::open_live(path).unwrap_err().code(),
+            LedgerErrorCode::SnapshotMismatch
+        );
+    }
+
+    #[test]
     fn directory_sync_failure_poisoning_can_reopen_only_when_mirror_matches_durable_head() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("execution-ledger.jsonl");
@@ -559,12 +638,14 @@ mod tests {
         Flush,
         Sync,
         PersistOn(usize),
+        ReplaceDuringDirectorySync,
         DirectorySync,
     }
 
     struct FailingSnapshotOps {
         failure: SnapshotFailure,
         persist_calls: AtomicUsize,
+        replacement_denied: AtomicBool,
     }
 
     impl FailingSnapshotOps {
@@ -572,6 +653,7 @@ mod tests {
             Self {
                 failure,
                 persist_calls: AtomicUsize::new(0),
+                replacement_denied: AtomicBool::new(false),
             }
         }
     }
@@ -641,9 +723,31 @@ mod tests {
                 .map_err(|error| error.error)
         }
 
-        fn sync_snapshot_directory(&self, _path: &Path) -> io::Result<()> {
+        fn sync_snapshot_directory(&self, path: &Path) -> io::Result<()> {
             if matches!(self.failure, SnapshotFailure::DirectorySync) {
                 return Err(io::Error::other("injected snapshot directory sync"));
+            }
+            if matches!(self.failure, SnapshotFailure::ReplaceDuringDirectorySync) {
+                let target = path.join("execution-ledger.jsonl.active.json");
+                let stale = serde_json::to_vec(&ActiveSnapshot {
+                    schema_version: ACTIVE_SNAPSHOT_SCHEMA_VERSION,
+                    sequence: 0,
+                    head_hash: EventHash::default(),
+                    active_intent: None,
+                })
+                .map_err(io::Error::other)?;
+                if let Err(error) = fs::remove_file(&target) {
+                    #[cfg(windows)]
+                    if error.kind() == io::ErrorKind::PermissionDenied
+                        || matches!(error.raw_os_error(), Some(5 | 32 | 33))
+                    {
+                        self.replacement_denied.store(true, Ordering::SeqCst);
+                        fs::write(target, stale)?;
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
+                fs::write(target, stale)?;
             }
             Ok(())
         }
