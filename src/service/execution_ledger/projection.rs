@@ -25,12 +25,53 @@ pub enum ActiveIntentState {
     RecoveryApplied,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActiveEvidence {
+    None,
+    RemoteMatched(MatchedAmounts),
+    RemoteRejected(RemoteRejectCode),
+    RemoteUncertain(UncertainCode),
+    ReconciledMatched(MatchedAmounts),
+    ReconciledNoFill(TerminalNoFillStatus),
+    ReconciledLive,
+    ReconciledPending,
+    ReconciledUncertain(ReconcileUncertainCode),
+    CancelResponseObserved(CancelResponseClass),
+    RecoveryApplied(EventId),
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconciliationOrigin {
+    SubmitStarted,
+    RemoteMatched,
+    RemoteRejected,
+    RemoteUncertain,
+    PositionRecorded,
+    ReconciledLive,
+    ReconciledPending,
+    ReconciledUncertain,
+    CancelStarted,
+    CancelResponseObserved,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DurableRemoteOutcome {
+    Matched(MatchedAmounts),
+    Rejected(RemoteRejectCode),
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ActiveIntent {
     pub intent_id: IntentId,
     pub prepared: PreparedIntent,
     pub state: ActiveIntentState,
     pub position_event_id: Option<EventId>,
+    pub evidence: ActiveEvidence,
+    pub reconciliation_origin: Option<ReconciliationOrigin>,
+    pub durable_remote_outcome: Option<DurableRemoteOutcome>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,13 +80,22 @@ pub enum ApplyOutcome {
     AlreadyApplied,
 }
 
-#[derive(Clone, Debug, Default)]
+/// The projection deliberately is not cloneable: replay mutates only touched state.
+///
+/// ```compile_fail
+/// use polymarket_toolkits::service::execution_ledger::LedgerProjection;
+/// let projection = LedgerProjection::default();
+/// let _copy = projection.clone();
+/// ```
+#[derive(Debug, Default)]
 pub struct LedgerProjection {
     pub sequence: u64,
     pub head_hash: EventHash,
     pub active: Option<ActiveIntent>,
     pub positions: HashMap<PositionId, DurablePosition>,
-    pub event_ids: HashMap<EventId, EventHash>,
+    pub event_ids: HashMap<EventId, LedgerEvent>,
+    pub intent_orders: HashMap<IntentId, OrderId>,
+    pub order_intents: HashMap<OrderId, IntentId>,
 }
 
 impl LedgerProjection {
@@ -54,8 +104,11 @@ impl LedgerProjection {
     }
 
     pub fn validate_and_apply(&mut self, event: &LedgerEvent) -> Result<ApplyOutcome, LedgerError> {
-        if let Some(existing_hash) = self.event_ids.get(&event.event_id) {
-            return if existing_hash == &event.event_hash {
+        if event.schema_version != LEDGER_SCHEMA_VERSION {
+            return Err(LedgerError::new(LedgerErrorCode::UnsupportedSchema));
+        }
+        if let Some(existing_event) = self.event_ids.get(&event.event_id) {
+            return if existing_event == event {
                 Ok(ApplyOutcome::AlreadyApplied)
             } else {
                 Err(LedgerError::new(LedgerErrorCode::IdempotencyConflict))
@@ -63,14 +116,10 @@ impl LedgerProjection {
         }
 
         self.validate_envelope(event)?;
-        let mut candidate = self.clone();
-        candidate.apply_payload(event)?;
-        candidate.sequence = event.sequence;
-        candidate.head_hash = event.event_hash.clone();
-        candidate
-            .event_ids
-            .insert(event.event_id, event.event_hash.clone());
-        *self = candidate;
+        self.apply_payload(event)?;
+        self.sequence = event.sequence;
+        self.head_hash = event.event_hash.clone();
+        self.event_ids.insert(event.event_id, event.clone());
         Ok(ApplyOutcome::Applied)
     }
 
@@ -78,7 +127,11 @@ impl LedgerProjection {
         if event.schema_version != LEDGER_SCHEMA_VERSION {
             return Err(LedgerError::new(LedgerErrorCode::UnsupportedSchema));
         }
-        if event.sequence != self.sequence + 1 {
+        let expected_sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| LedgerError::new(LedgerErrorCode::SequenceExhausted))?;
+        if event.sequence != expected_sequence {
             return Err(LedgerError::new(LedgerErrorCode::SequenceMismatch));
         }
         if event.previous_hash != self.head_hash {
@@ -97,22 +150,34 @@ impl LedgerProjection {
             ),
             LedgerPayload::RemoteMatched(amounts) => {
                 self.validate_match(event.intent_id, *amounts)?;
+                let active = self.active_mut(event.intent_id)?;
+                if active.state != ActiveIntentState::SubmitStarted {
+                    return Err(LedgerError::new(LedgerErrorCode::IllegalTransition));
+                }
+                active.state = ActiveIntentState::RemoteMatched;
+                active.evidence = ActiveEvidence::RemoteMatched(*amounts);
+                active.durable_remote_outcome = Some(DurableRemoteOutcome::Matched(*amounts));
+                Ok(())
+            }
+            LedgerPayload::RemoteRejected { code } => {
+                let active = self.active_mut(event.intent_id)?;
+                if active.state != ActiveIntentState::SubmitStarted {
+                    return Err(LedgerError::new(LedgerErrorCode::IllegalTransition));
+                }
+                active.state = ActiveIntentState::RemoteRejected;
+                active.evidence = ActiveEvidence::RemoteRejected(*code);
+                active.durable_remote_outcome = Some(DurableRemoteOutcome::Rejected(*code));
+                Ok(())
+            }
+            LedgerPayload::RemoteUncertain { code } => {
                 self.transition(
                     event.intent_id,
                     ActiveIntentState::SubmitStarted,
-                    ActiveIntentState::RemoteMatched,
-                )
+                    ActiveIntentState::RemoteUncertain,
+                )?;
+                self.active_mut(event.intent_id)?.evidence = ActiveEvidence::RemoteUncertain(*code);
+                Ok(())
             }
-            LedgerPayload::RemoteRejected { .. } => self.transition(
-                event.intent_id,
-                ActiveIntentState::SubmitStarted,
-                ActiveIntentState::RemoteRejected,
-            ),
-            LedgerPayload::RemoteUncertain { .. } => self.transition(
-                event.intent_id,
-                ActiveIntentState::SubmitStarted,
-                ActiveIntentState::RemoteUncertain,
-            ),
             LedgerPayload::SubmissionCommitted => {
                 self.clear_normal(event.intent_id, ActiveIntentState::PositionRecorded)
             }
@@ -125,26 +190,41 @@ impl LedgerProjection {
             LedgerPayload::ReconciledMatched(amounts) => {
                 self.classify_matched(event.intent_id, *amounts)
             }
-            LedgerPayload::ReconciledNoFill { .. } => {
-                self.classify_without_position(event.intent_id, ActiveIntentState::ReconciledNoFill)
-            }
-            LedgerPayload::ReconciledLive => {
-                self.classify_without_position(event.intent_id, ActiveIntentState::ReconciledLive)
-            }
-            LedgerPayload::ReconciledPending => self
-                .classify_without_position(event.intent_id, ActiveIntentState::ReconciledPending),
-            LedgerPayload::ReconciledUncertain { .. } => self
-                .classify_without_position(event.intent_id, ActiveIntentState::ReconciledUncertain),
+            LedgerPayload::ReconciledNoFill { status } => self.classify_without_position(
+                event.intent_id,
+                ActiveIntentState::ReconciledNoFill,
+                ActiveEvidence::ReconciledNoFill(*status),
+            ),
+            LedgerPayload::ReconciledLive => self.classify_without_position(
+                event.intent_id,
+                ActiveIntentState::ReconciledLive,
+                ActiveEvidence::ReconciledLive,
+            ),
+            LedgerPayload::ReconciledPending => self.classify_without_position(
+                event.intent_id,
+                ActiveIntentState::ReconciledPending,
+                ActiveEvidence::ReconciledPending,
+            ),
+            LedgerPayload::ReconciledUncertain { code } => self.classify_without_position(
+                event.intent_id,
+                ActiveIntentState::ReconciledUncertain,
+                ActiveEvidence::ReconciledUncertain(*code),
+            ),
             LedgerPayload::CancelStarted => self.transition(
                 event.intent_id,
                 ActiveIntentState::ReconciledLive,
                 ActiveIntentState::CancelStarted,
             ),
-            LedgerPayload::CancelResponseObserved { .. } => self.transition(
-                event.intent_id,
-                ActiveIntentState::CancelStarted,
-                ActiveIntentState::CancelResponseObserved,
-            ),
+            LedgerPayload::CancelResponseObserved { result } => {
+                self.transition(
+                    event.intent_id,
+                    ActiveIntentState::CancelStarted,
+                    ActiveIntentState::CancelResponseObserved,
+                )?;
+                self.active_mut(event.intent_id)?.evidence =
+                    ActiveEvidence::CancelResponseObserved(*result);
+                Ok(())
+            }
             LedgerPayload::RecoveryApplied { position_event_id } => {
                 self.apply_recovery(event.intent_id, *position_event_id)
             }
@@ -157,31 +237,63 @@ impl LedgerProjection {
         intent_id: IntentId,
         prepared: &PreparedIntent,
     ) -> Result<(), LedgerError> {
+        if self.intent_orders.contains_key(&intent_id)
+            || self.order_intents.contains_key(&prepared.order_id)
+        {
+            return Err(LedgerError::new(LedgerErrorCode::IdentityConflict));
+        }
         if self.active.is_some()
             || prepared.protocol_version != ORDER_PROTOCOL_VERSION
             || prepared.order_type != OrderType::Fok
-            || prepared.token_id.is_empty()
             || prepared.expected_maker_micros == 0
             || prepared.expected_taker_micros == 0
         {
             return Err(LedgerError::new(LedgerErrorCode::IllegalTransition));
         }
 
-        if let IntentPurpose::Exit { position_id } = prepared.purpose {
-            let position = self
-                .positions
-                .get(&position_id)
-                .ok_or_else(|| LedgerError::new(LedgerErrorCode::IllegalTransition))?;
-            if !position.is_open() || position.token_id != prepared.token_id {
-                return Err(LedgerError::new(LedgerErrorCode::IllegalTransition));
+        match prepared.purpose {
+            IntentPurpose::Entry(_) => {
+                if self
+                    .positions
+                    .values()
+                    .any(|position| position.is_open() && position.token_id == prepared.token_id)
+                {
+                    return Err(LedgerError::new(LedgerErrorCode::PositionConflict));
+                }
+            }
+            IntentPurpose::Exit { position_id } => {
+                let position = self
+                    .positions
+                    .get(&position_id)
+                    .ok_or_else(|| LedgerError::new(LedgerErrorCode::IllegalTransition))?;
+                let expected_shares = match prepared.side {
+                    OrderSide::Buy => prepared.expected_taker_micros,
+                    OrderSide::Sell => prepared.expected_maker_micros,
+                };
+                if !position.is_open()
+                    || position.token_id != prepared.token_id
+                    || position.venue != prepared.venue
+                    || position.neg_risk != prepared.neg_risk
+                    || position.side == prepared.side
+                    || position.entry_shares_micros != expected_shares
+                {
+                    return Err(LedgerError::new(LedgerErrorCode::IllegalTransition));
+                }
             }
         }
 
+        self.intent_orders
+            .insert(intent_id, prepared.order_id.clone());
+        self.order_intents
+            .insert(prepared.order_id.clone(), intent_id);
         self.active = Some(ActiveIntent {
             intent_id,
             prepared: prepared.clone(),
             state: ActiveIntentState::NotSent,
             position_event_id: None,
+            evidence: ActiveEvidence::None,
+            reconciliation_origin: None,
+            durable_remote_outcome: None,
         });
         Ok(())
     }
@@ -275,6 +387,7 @@ impl LedgerProjection {
         let exact = position.position_id == PositionId(event.intent_id.0)
             && position.opening_intent_id == event.intent_id
             && position.opening_order_id == active.prepared.order_id
+            && position.venue == active.prepared.venue
             && position.token_id == active.prepared.token_id
             && position.slug == seed.slug
             && position.category == seed.category
@@ -360,22 +473,23 @@ impl LedgerProjection {
 
     fn start_reconciliation(&mut self, intent_id: IntentId) -> Result<(), LedgerError> {
         let active = self.active_mut(intent_id)?;
-        if !matches!(
-            active.state,
-            ActiveIntentState::SubmitStarted
-                | ActiveIntentState::RemoteMatched
-                | ActiveIntentState::RemoteRejected
-                | ActiveIntentState::RemoteUncertain
-                | ActiveIntentState::PositionRecorded
-                | ActiveIntentState::ReconciledLive
-                | ActiveIntentState::ReconciledPending
-                | ActiveIntentState::ReconciledUncertain
-                | ActiveIntentState::CancelStarted
-                | ActiveIntentState::CancelResponseObserved
-        ) {
-            return Err(LedgerError::new(LedgerErrorCode::IllegalTransition));
-        }
+        let origin = match active.state {
+            ActiveIntentState::SubmitStarted => ReconciliationOrigin::SubmitStarted,
+            ActiveIntentState::RemoteMatched => ReconciliationOrigin::RemoteMatched,
+            ActiveIntentState::RemoteRejected => ReconciliationOrigin::RemoteRejected,
+            ActiveIntentState::RemoteUncertain => ReconciliationOrigin::RemoteUncertain,
+            ActiveIntentState::PositionRecorded => ReconciliationOrigin::PositionRecorded,
+            ActiveIntentState::ReconciledLive => ReconciliationOrigin::ReconciledLive,
+            ActiveIntentState::ReconciledPending => ReconciliationOrigin::ReconciledPending,
+            ActiveIntentState::ReconciledUncertain => ReconciliationOrigin::ReconciledUncertain,
+            ActiveIntentState::CancelStarted => ReconciliationOrigin::CancelStarted,
+            ActiveIntentState::CancelResponseObserved => {
+                ReconciliationOrigin::CancelResponseObserved
+            }
+            _ => return Err(LedgerError::new(LedgerErrorCode::IllegalTransition)),
+        };
         active.state = ActiveIntentState::ReconciliationStarted;
+        active.reconciliation_origin = Some(origin);
         Ok(())
     }
 
@@ -384,11 +498,20 @@ impl LedgerProjection {
         intent_id: IntentId,
         amounts: MatchedAmounts,
     ) -> Result<(), LedgerError> {
-        if self.active_mut(intent_id)?.state != ActiveIntentState::ReconciliationStarted {
+        let active = self.active_mut(intent_id)?;
+        if active.state != ActiveIntentState::ReconciliationStarted {
             return Err(LedgerError::new(LedgerErrorCode::IllegalTransition));
         }
+        if matches!(
+            active.durable_remote_outcome,
+            Some(DurableRemoteOutcome::Rejected(_))
+        ) {
+            return Err(LedgerError::new(LedgerErrorCode::EvidenceConflict));
+        }
         self.validate_match(intent_id, amounts)?;
-        self.active_mut(intent_id)?.state = ActiveIntentState::ReconciledMatched;
+        let active = self.active_mut(intent_id)?;
+        active.state = ActiveIntentState::ReconciledMatched;
+        active.evidence = ActiveEvidence::ReconciledMatched(amounts);
         Ok(())
     }
 
@@ -396,6 +519,7 @@ impl LedgerProjection {
         &mut self,
         intent_id: IntentId,
         classification: ActiveIntentState,
+        evidence: ActiveEvidence,
     ) -> Result<(), LedgerError> {
         let active = self.active_mut(intent_id)?;
         if active.state != ActiveIntentState::ReconciliationStarted
@@ -403,7 +527,21 @@ impl LedgerProjection {
         {
             return Err(LedgerError::new(LedgerErrorCode::IllegalTransition));
         }
+        let conflicts = match active.durable_remote_outcome {
+            Some(DurableRemoteOutcome::Matched(_)) => {
+                classification != ActiveIntentState::ReconciledUncertain
+            }
+            Some(DurableRemoteOutcome::Rejected(_)) => !matches!(
+                classification,
+                ActiveIntentState::ReconciledNoFill | ActiveIntentState::ReconciledUncertain
+            ),
+            None => false,
+        };
+        if conflicts {
+            return Err(LedgerError::new(LedgerErrorCode::EvidenceConflict));
+        }
         active.state = classification;
+        active.evidence = evidence;
         Ok(())
     }
 
@@ -421,6 +559,7 @@ impl LedgerProjection {
             return Err(LedgerError::new(LedgerErrorCode::IllegalTransition));
         }
         active.state = ActiveIntentState::RecoveryApplied;
+        active.evidence = ActiveEvidence::RecoveryApplied(position_event_id);
         Ok(())
     }
 
@@ -545,7 +684,7 @@ mod tests {
             order_id: order_id(order_byte),
             protocol_version: 2,
             venue: Venue::PolymarketClob,
-            token_id: "12345678901234567890".to_owned(),
+            token_id: TokenId::from_decimal("12345678901234567890").unwrap(),
             neg_risk: false,
             side: OrderSide::Buy,
             order_type: OrderType::Fok,
@@ -561,7 +700,7 @@ mod tests {
             order_id: order_id(order_byte),
             protocol_version: 2,
             venue: Venue::PolymarketClob,
-            token_id: "12345678901234567890".to_owned(),
+            token_id: TokenId::from_decimal("12345678901234567890").unwrap(),
             neg_risk: false,
             side: OrderSide::Sell,
             order_type: OrderType::Fok,
@@ -591,7 +730,8 @@ mod tests {
             position_id: PositionId(opening_intent_id.0),
             opening_intent_id,
             opening_order_id: order_id(order_byte),
-            token_id: "12345678901234567890".to_owned(),
+            venue: Venue::PolymarketClob,
+            token_id: TokenId::from_decimal("12345678901234567890").unwrap(),
             slug: "will-example-pass".to_owned(),
             category: "testing".to_owned(),
             tags: vec!["offline".to_owned()],
@@ -644,6 +784,27 @@ mod tests {
         assert_eq!(
             fixtures.projection.apply(&skipped).unwrap_err().code(),
             LedgerErrorCode::SequenceMismatch
+        );
+    }
+
+    #[test]
+    fn exhausted_sequence_fails_closed_with_a_typed_error() {
+        let mut fixtures = Fixtures::new();
+        fixtures.projection.sequence = u64::MAX;
+        let event = LedgerEvent {
+            schema_version: LEDGER_SCHEMA_VERSION,
+            sequence: 0,
+            event_id: EventId(Uuid::from_u128(999)),
+            intent_id: intent_id(1),
+            recorded_at: timestamp(0),
+            payload: LedgerPayload::IntentPrepared(entry_intent(0x11)),
+            previous_hash: fixtures.projection.head_hash.clone(),
+            event_hash: EventHash::from_bytes([0xaa; 32]),
+        };
+
+        assert_eq!(
+            fixtures.projection.apply(&event).unwrap_err().code(),
+            LedgerErrorCode::SequenceExhausted
         );
     }
 
@@ -757,6 +918,141 @@ mod tests {
             fixtures.apply(intent, classification);
             assert!(fixtures.projection.active.is_some());
         }
+    }
+
+    #[test]
+    fn active_projection_retains_typed_safety_evidence_and_reconciliation_origin() {
+        let mut fixtures = Fixtures::new();
+        let intent = intent_id(1);
+        fixtures.apply(intent, LedgerPayload::IntentPrepared(entry_intent(0x11)));
+        fixtures.apply(intent, LedgerPayload::SubmitStarted);
+        fixtures.apply(
+            intent,
+            LedgerPayload::RemoteUncertain {
+                code: UncertainCode::MalformedResponse,
+            },
+        );
+        assert_eq!(
+            fixtures.projection.active.as_ref().unwrap().evidence,
+            ActiveEvidence::RemoteUncertain(UncertainCode::MalformedResponse)
+        );
+
+        fixtures.apply(intent, LedgerPayload::ReconciliationStarted);
+        assert_eq!(
+            fixtures
+                .projection
+                .active
+                .as_ref()
+                .unwrap()
+                .reconciliation_origin,
+            Some(ReconciliationOrigin::RemoteUncertain)
+        );
+        fixtures.apply(
+            intent,
+            LedgerPayload::ReconciledUncertain {
+                code: ReconcileUncertainCode::PartialFill,
+            },
+        );
+        assert_eq!(
+            fixtures.projection.active.as_ref().unwrap().evidence,
+            ActiveEvidence::ReconciledUncertain(ReconcileUncertainCode::PartialFill)
+        );
+
+        let mut rejected = Fixtures::new();
+        rejected.apply(intent, LedgerPayload::IntentPrepared(entry_intent(0x11)));
+        rejected.apply(intent, LedgerPayload::SubmitStarted);
+        rejected.apply(
+            intent,
+            LedgerPayload::RemoteRejected {
+                code: RemoteRejectCode::HttpRejected,
+            },
+        );
+        assert_eq!(
+            rejected.projection.active.as_ref().unwrap().evidence,
+            ActiveEvidence::RemoteRejected(RemoteRejectCode::HttpRejected)
+        );
+        rejected.apply(intent, LedgerPayload::ReconciliationStarted);
+        rejected.apply(
+            intent,
+            LedgerPayload::ReconciledNoFill {
+                status: TerminalNoFillStatus::Rejected,
+            },
+        );
+        assert_eq!(
+            rejected.projection.active.as_ref().unwrap().evidence,
+            ActiveEvidence::ReconciledNoFill(TerminalNoFillStatus::Rejected)
+        );
+
+        let mut canceled = Fixtures::new();
+        canceled.apply(intent, LedgerPayload::IntentPrepared(entry_intent(0x11)));
+        canceled.apply(intent, LedgerPayload::SubmitStarted);
+        canceled.apply(intent, LedgerPayload::ReconciliationStarted);
+        canceled.apply(intent, LedgerPayload::ReconciledLive);
+        canceled.apply(intent, LedgerPayload::CancelStarted);
+        canceled.apply(
+            intent,
+            LedgerPayload::CancelResponseObserved {
+                result: CancelResponseClass::NotCanceled,
+            },
+        );
+        assert_eq!(
+            canceled.projection.active.as_ref().unwrap().evidence,
+            ActiveEvidence::CancelResponseObserved(CancelResponseClass::NotCanceled)
+        );
+    }
+
+    #[test]
+    fn durable_remote_match_cannot_reconcile_to_no_fill() {
+        let mut fixtures = Fixtures::new();
+        let intent = intent_id(1);
+        fixtures.apply(intent, LedgerPayload::IntentPrepared(entry_intent(0x11)));
+        fixtures.apply(intent, LedgerPayload::SubmitStarted);
+        fixtures.apply(intent, LedgerPayload::RemoteMatched(buy_match()));
+        fixtures.apply(intent, LedgerPayload::ReconciliationStarted);
+
+        let no_fill = fixtures.event(
+            intent,
+            LedgerPayload::ReconciledNoFill {
+                status: TerminalNoFillStatus::Canceled,
+            },
+        );
+        assert_eq!(
+            fixtures
+                .projection
+                .validate_and_apply(&no_fill)
+                .unwrap_err()
+                .code(),
+            LedgerErrorCode::EvidenceConflict
+        );
+        assert!(fixtures.projection.active.is_some());
+        assert!(fixtures.projection.positions.is_empty());
+    }
+
+    #[test]
+    fn durable_remote_rejection_cannot_reconcile_to_match() {
+        let mut fixtures = Fixtures::new();
+        let intent = intent_id(1);
+        fixtures.apply(intent, LedgerPayload::IntentPrepared(entry_intent(0x11)));
+        fixtures.apply(intent, LedgerPayload::SubmitStarted);
+        fixtures.apply(
+            intent,
+            LedgerPayload::RemoteRejected {
+                code: RemoteRejectCode::ServerRejected,
+            },
+        );
+        fixtures.apply(intent, LedgerPayload::ReconciliationStarted);
+
+        let matched = fixtures.event(intent, LedgerPayload::ReconciledMatched(buy_match()));
+        assert_eq!(
+            fixtures
+                .projection
+                .validate_and_apply(&matched)
+                .unwrap_err()
+                .code(),
+            LedgerErrorCode::EvidenceConflict
+        );
+        assert!(fixtures.projection.active.is_some());
+        assert!(fixtures.projection.positions.is_empty());
     }
 
     #[test]
@@ -966,6 +1262,28 @@ mod tests {
             fixtures.projection.apply(&conflicting).unwrap_err().code(),
             LedgerErrorCode::IdempotencyConflict
         );
+
+        let mut changed_payload_with_retained_hash = event.clone();
+        changed_payload_with_retained_hash.payload = LedgerPayload::SubmitStarted;
+        assert_eq!(
+            fixtures
+                .projection
+                .apply(&changed_payload_with_retained_hash)
+                .unwrap_err()
+                .code(),
+            LedgerErrorCode::IdempotencyConflict
+        );
+
+        let mut changed_schema_with_retained_hash = event;
+        changed_schema_with_retained_hash.schema_version += 1;
+        assert_eq!(
+            fixtures
+                .projection
+                .apply(&changed_schema_with_retained_hash)
+                .unwrap_err()
+                .code(),
+            LedgerErrorCode::UnsupportedSchema
+        );
     }
 
     #[test]
@@ -987,6 +1305,129 @@ mod tests {
         assert_eq!(
             fixtures.projection.active.as_ref().unwrap().intent_id,
             intent_id(1)
+        );
+    }
+
+    #[test]
+    fn terminal_intent_id_cannot_be_rebound_to_another_order() {
+        let mut fixtures = Fixtures::new();
+        let intent = intent_id(1);
+        fixtures.apply(intent, LedgerPayload::IntentPrepared(entry_intent(0x11)));
+        fixtures.apply(intent, LedgerPayload::SubmitStarted);
+        fixtures.apply(
+            intent,
+            LedgerPayload::RemoteRejected {
+                code: RemoteRejectCode::ServerRejected,
+            },
+        );
+        fixtures.apply(intent, LedgerPayload::SubmissionCommittedNoFill);
+
+        let rebound = fixtures.event(intent, LedgerPayload::IntentPrepared(entry_intent(0x22)));
+        assert_eq!(
+            fixtures.projection.apply(&rebound).unwrap_err().code(),
+            LedgerErrorCode::IdentityConflict
+        );
+    }
+
+    #[test]
+    fn terminal_order_id_cannot_be_rebound_to_another_intent() {
+        let mut fixtures = Fixtures::new();
+        let first = intent_id(1);
+        fixtures.apply(first, LedgerPayload::IntentPrepared(entry_intent(0x11)));
+        fixtures.apply(first, LedgerPayload::SubmitStarted);
+        fixtures.apply(
+            first,
+            LedgerPayload::RemoteRejected {
+                code: RemoteRejectCode::ServerRejected,
+            },
+        );
+        fixtures.apply(first, LedgerPayload::SubmissionCommittedNoFill);
+
+        let rebound = fixtures.event(
+            intent_id(2),
+            LedgerPayload::IntentPrepared(entry_intent(0x11)),
+        );
+        assert_eq!(
+            fixtures.projection.apply(&rebound).unwrap_err().code(),
+            LedgerErrorCode::IdentityConflict
+        );
+    }
+
+    #[test]
+    fn second_entry_for_an_open_token_is_rejected_during_preparation() {
+        let mut fixtures = Fixtures::new();
+        fixtures.apply_entry_until(intent_id(1), EntryTerminal::Committed);
+
+        let second = fixtures.event(
+            intent_id(2),
+            LedgerPayload::IntentPrepared(entry_intent(0x22)),
+        );
+        assert_eq!(
+            fixtures
+                .projection
+                .validate_and_apply(&second)
+                .unwrap_err()
+                .code(),
+            LedgerErrorCode::PositionConflict
+        );
+    }
+
+    #[test]
+    fn exit_preparation_requires_the_opposing_side() {
+        let mut fixtures = Fixtures::new();
+        let opening = intent_id(1);
+        fixtures.apply_entry_until(opening, EntryTerminal::Committed);
+        let mut exit = exit_intent(PositionId(opening.0), 0x22);
+        exit.side = OrderSide::Buy;
+        exit.expected_maker_micros = 6_000_000;
+        exit.expected_taker_micros = 10_000_000;
+
+        let event = fixtures.event(intent_id(2), LedgerPayload::IntentPrepared(exit));
+        assert_eq!(
+            fixtures
+                .projection
+                .validate_and_apply(&event)
+                .unwrap_err()
+                .code(),
+            LedgerErrorCode::IllegalTransition
+        );
+    }
+
+    #[test]
+    fn exit_preparation_requires_matching_neg_risk() {
+        let mut fixtures = Fixtures::new();
+        let opening = intent_id(1);
+        fixtures.apply_entry_until(opening, EntryTerminal::Committed);
+        let mut exit = exit_intent(PositionId(opening.0), 0x22);
+        exit.neg_risk = true;
+
+        let event = fixtures.event(intent_id(2), LedgerPayload::IntentPrepared(exit));
+        assert_eq!(
+            fixtures
+                .projection
+                .validate_and_apply(&event)
+                .unwrap_err()
+                .code(),
+            LedgerErrorCode::IllegalTransition
+        );
+    }
+
+    #[test]
+    fn exit_preparation_requires_exact_full_close_shares() {
+        let mut fixtures = Fixtures::new();
+        let opening = intent_id(1);
+        fixtures.apply_entry_until(opening, EntryTerminal::Committed);
+        let mut exit = exit_intent(PositionId(opening.0), 0x22);
+        exit.expected_maker_micros -= 1;
+
+        let event = fixtures.event(intent_id(2), LedgerPayload::IntentPrepared(exit));
+        assert_eq!(
+            fixtures
+                .projection
+                .validate_and_apply(&event)
+                .unwrap_err()
+                .code(),
+            LedgerErrorCode::IllegalTransition
         );
     }
 
