@@ -16,7 +16,7 @@ use crate::service::execution_ledger::{
     ExecutionLedger, IntentId, OrderId, OrderSide, PositionId, TokenId, Venue,
 };
 use crate::service::market_cache::{MarketCache, MarketInfo};
-use crate::service::order_gateway::{OrderErrorCode, OrderGateway, OrderReceipt, OrderSubmitError};
+use crate::service::order_gateway::{OrderGateway, OrderReceipt, OrderSubmitError};
 use crate::service::position_store::{OpenPosition, PositionStore};
 use crate::service::risk_guard::{BlockReason, RiskCheck, RiskGuard};
 use crate::service::strategy;
@@ -233,16 +233,14 @@ impl OrderExecutor {
             .breaker
             .as_ref()
             .ok_or_else(|| anyhow!("live breaker unavailable"))?;
-        match breaker.submit_fok(gateway.as_ref(), &planned).await {
-            Ok(receipt) => {
-                if self
-                    .record_open_from_receipt(&market, &planned, &receipt)
-                    .is_err()
-                {
-                    return Err(halt_after_filled_position_failure(breaker, &planned));
-                }
-                Ok(ExecutionOutcome::Filled(receipt))
-            }
+        match breaker
+            .submit_fok(gateway.as_ref(), &planned, |receipt| {
+                self.record_open_from_receipt(&market, &planned, receipt)
+                    .map_err(|_| ())
+            })
+            .await
+        {
+            Ok(receipt) => Ok(ExecutionOutcome::Filled(receipt)),
             Err(
                 error @ (OrderSubmitError::Preflight { .. } | OrderSubmitError::Rejected { .. }),
             ) => Ok(ExecutionOutcome::NotSubmitted(error)),
@@ -385,19 +383,6 @@ impl OrderExecutor {
             (tp_default, sl_default)
         }
     }
-}
-
-fn halt_after_filled_position_failure(
-    breaker: &ExecutionCircuitBreaker,
-    planned: &PlannedOrder,
-) -> anyhow::Error {
-    let error = breaker
-        .halt_uncertain(planned, OrderErrorCode::ExecutionHalted)
-        .err()
-        .unwrap_or(OrderSubmitError::Halted {
-            code: OrderErrorCode::ExecutionHalted,
-        });
-    anyhow::Error::new(error)
 }
 
 fn ledger_venue(venue: crate::models::VenueId) -> Result<Venue> {
@@ -774,7 +759,9 @@ mod tests {
 
         let planned = gateway.plans.lock()[0].clone();
         assert!(matches!(
-            breaker.submit_fok(gateway.as_ref(), &planned).await,
+            breaker
+                .submit_fok(gateway.as_ref(), &planned, |_receipt| Ok(()))
+                .await,
             Err(OrderSubmitError::Halted { .. })
         ));
         assert_eq!(gateway.calls(), 1);

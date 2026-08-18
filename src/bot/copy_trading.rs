@@ -328,6 +328,7 @@ mod tests {
                     order_type: OrderType::Fok,
                     source_trade_hash: None,
                 },
+                |_receipt| Ok(()),
             )
             .await
             .unwrap_err();

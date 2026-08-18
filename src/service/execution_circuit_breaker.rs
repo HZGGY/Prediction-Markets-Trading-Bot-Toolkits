@@ -154,15 +154,28 @@ impl ExecutionCircuitBreaker {
         &self,
         gateway: &dyn OrderGateway,
         planned: &PlannedOrder,
+        complete_post_fill: impl FnOnce(&OrderReceipt) -> Result<(), ()> + Send,
     ) -> Result<OrderReceipt, OrderSubmitError> {
         let _submission_guard = self.submit_lock.lock().await;
         self.check()?;
         match gateway.submit_fok(planned).await {
+            Ok(receipt) => {
+                if complete_post_fill(&receipt).is_err() {
+                    let error = self
+                        .halt_uncertain(planned, OrderErrorCode::ExecutionHalted)
+                        .err()
+                        .unwrap_or(OrderSubmitError::Halted {
+                            code: OrderErrorCode::ExecutionHalted,
+                        });
+                    return Err(error);
+                }
+                Ok(receipt)
+            }
             Err(error @ OrderSubmitError::Uncertain { code }) => {
                 self.halt_uncertain(planned, code)?;
                 Err(error)
             }
-            result => result,
+            Err(error) => Err(error),
         }
     }
 }
@@ -254,12 +267,18 @@ mod tests {
         }));
         let planned = fixture_planned_order();
 
-        let first = breaker.submit_fok(&gateway, &planned).await.unwrap_err();
+        let first = breaker
+            .submit_fok(&gateway, &planned, |_receipt| Ok(()))
+            .await
+            .unwrap_err();
         assert!(first.is_uncertain());
         assert!(path.is_file());
         assert_eq!(gateway.calls(), 1);
 
-        let second = breaker.submit_fok(&gateway, &planned).await.unwrap_err();
+        let second = breaker
+            .submit_fok(&gateway, &planned, |_receipt| Ok(()))
+            .await
+            .unwrap_err();
         assert!(matches!(second, OrderSubmitError::Halted { .. }));
         assert_eq!(gateway.calls(), 1);
 
@@ -309,11 +328,65 @@ mod tests {
         );
         let planned = fixture_planned_order();
         let (first, second) = tokio::join!(
-            breaker.submit_fok(&gateway, &planned),
-            breaker.submit_fok(&gateway, &planned),
+            breaker.submit_fok(&gateway, &planned, |_receipt| Ok(())),
+            breaker.submit_fok(&gateway, &planned, |_receipt| Ok(())),
         );
         assert!(first.is_err());
         assert!(second.is_err());
+        assert_eq!(gateway.calls(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failing_post_fill_blocks_concurrent_gateway_call_until_halted() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("execution-halt.json");
+        let breaker = test_breaker(marker.clone()).unwrap();
+        let gateway = Arc::new(ConcurrentAcceptedGateway::default());
+        let planned = fixture_planned_order();
+        let post_fill_entered = Arc::new(tokio::sync::Notify::new());
+        let (release_post_fill, wait_for_release) = std::sync::mpsc::sync_channel(0);
+
+        let first_breaker = Arc::clone(&breaker);
+        let first_gateway = Arc::clone(&gateway);
+        let first_planned = planned.clone();
+        let first_entered = Arc::clone(&post_fill_entered);
+        let first = tokio::spawn(async move {
+            first_breaker
+                .submit_fok(first_gateway.as_ref(), &first_planned, move |_receipt| {
+                    first_entered.notify_one();
+                    wait_for_release.recv().unwrap();
+                    Err(())
+                })
+                .await
+        });
+
+        post_fill_entered.notified().await;
+        assert_eq!(gateway.calls(), 1);
+
+        let mut second =
+            Box::pin(breaker.submit_fok(gateway.as_ref(), &planned, |_receipt| Ok(())));
+        tokio::select! {
+            biased;
+            _ = &mut second => panic!("second submission completed before post-fill release"),
+            _ = tokio::task::yield_now() => {}
+        }
+        assert_eq!(gateway.calls(), 1);
+        release_post_fill.send(()).unwrap();
+
+        let first_result = first.await.unwrap();
+        let second_result = second.await;
+        assert!(matches!(
+            first_result,
+            Err(OrderSubmitError::Halted {
+                code: OrderErrorCode::ExecutionHalted
+            })
+        ));
+        assert!(matches!(
+            second_result,
+            Err(OrderSubmitError::Halted { .. })
+        ));
+        assert!(breaker.is_halted());
+        assert!(marker.is_file());
         assert_eq!(gateway.calls(), 1);
     }
 
@@ -357,6 +430,32 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(self.delay).await;
             self.result.clone()
+        }
+    }
+
+    #[derive(Default)]
+    struct ConcurrentAcceptedGateway {
+        calls: AtomicUsize,
+    }
+
+    impl ConcurrentAcceptedGateway {
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl OrderGateway for ConcurrentAcceptedGateway {
+        async fn submit_fok(
+            &self,
+            _planned: &PlannedOrder,
+        ) -> Result<OrderReceipt, OrderSubmitError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(OrderReceipt {
+                order_id: format!("0x{}", "44".repeat(32)),
+                filled_shares_micros: 39_000_000,
+                filled_usd_micros: 19_500_000,
+            })
         }
     }
 

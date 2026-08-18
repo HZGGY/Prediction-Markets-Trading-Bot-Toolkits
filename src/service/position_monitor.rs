@@ -13,7 +13,7 @@ use crate::models::{OrderType, PlannedOrder, Side, VenueId};
 use crate::service::execution_circuit_breaker::ExecutionCircuitBreaker;
 use crate::service::execution_ledger::{IntentId, OrderId, OrderSide, PositionClose, Venue};
 use crate::service::midprice::MidpriceSource;
-use crate::service::order_gateway::{OrderErrorCode, OrderGateway, OrderReceipt, OrderSubmitError};
+use crate::service::order_gateway::{OrderGateway, OrderReceipt, OrderSubmitError};
 use crate::service::position_store::{OpenPosition, PositionStore};
 use crate::utils;
 
@@ -135,13 +135,13 @@ async fn monitor_once(
     );
 
     let planned = exit_plan(pos, mid, price_buffer);
-    match breaker.submit_fok(gateway, &planned).await {
-        Ok(receipt) => {
-            if apply_filled_close(pos, positions, &receipt).is_err() {
-                return Err(halt_after_filled_position_failure(breaker, &planned));
-            }
-            Ok(ExitOutcome::Filled(receipt))
-        }
+    match breaker
+        .submit_fok(gateway, &planned, |receipt| {
+            apply_filled_close(pos, positions, receipt).map_err(|_| ())
+        })
+        .await
+    {
+        Ok(receipt) => Ok(ExitOutcome::Filled(receipt)),
         Err(error @ (OrderSubmitError::Preflight { .. } | OrderSubmitError::Rejected { .. })) => {
             Ok(ExitOutcome::Rejected(error))
         }
@@ -177,19 +177,6 @@ fn apply_filled_close(
         closed_at: chrono::Utc::now(),
     })?;
     Ok(())
-}
-
-fn halt_after_filled_position_failure(
-    breaker: &ExecutionCircuitBreaker,
-    planned: &PlannedOrder,
-) -> anyhow::Error {
-    let error = breaker
-        .halt_uncertain(planned, OrderErrorCode::ExecutionHalted)
-        .err()
-        .unwrap_or(OrderSubmitError::Halted {
-            code: OrderErrorCode::ExecutionHalted,
-        });
-    anyhow::Error::new(error)
 }
 
 fn exit_plan(pos: &OpenPosition, midprice: f64, price_buffer: f64) -> PlannedOrder {
@@ -457,7 +444,9 @@ mod tests {
 
         let planned = gateway.plans.lock()[0].clone();
         assert!(matches!(
-            breaker.submit_fok(gateway.as_ref(), &planned).await,
+            breaker
+                .submit_fok(gateway.as_ref(), &planned, |_receipt| Ok(()))
+                .await,
             Err(OrderSubmitError::Halted { .. })
         ));
         assert_eq!(gateway.calls(), 1);
