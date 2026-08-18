@@ -23,6 +23,18 @@ The application adapter treats a redirect response and `EmptyResponse` as an
 uncertain order result. It does not retry, and the existing execution circuit
 breaker persists a halt before another live order can be submitted.
 
-When an official release fixes both behaviors, compare that release against
-these three changes, run the complete offline safety suite, and remove the
-`[patch.crates-io]` entry rather than carrying this local patch indefinitely.
+When an official release fixes both behaviors, retire this patch in the
+following order so the dependency cannot silently fall back to vulnerable
+official version `0.6.0`:
+
+1. Compare the candidate official release against these three changes and
+   confirm that it both blocks redirect replay and preserves successful-null
+   HTTP provenance.
+2. Change the root dependency's exact `=0.6.0` pin to that exact fixed
+   official version.
+3. Remove the `[patch.crates-io]` entry and this vendored directory.
+4. Regenerate `Cargo.lock`; verify that the SDK package again has the expected
+   crates.io registry source and checksum for the fixed version.
+5. Run the redirect and null regression tests, the complete offline locked
+   test suite, the release build, and strict Clippy against that final
+   dependency graph.
