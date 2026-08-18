@@ -12,7 +12,9 @@ use crate::models::{OrderType, PlannedOrder, Side, WhaleTrade};
 use crate::service::clob_sdk_orders::SdkOrderGateway;
 use crate::service::eligibility::{self, Eligibility};
 use crate::service::execution_circuit_breaker::ExecutionCircuitBreaker;
-use crate::service::execution_ledger::ExecutionLedger;
+use crate::service::execution_ledger::{
+    ExecutionLedger, IntentId, OrderId, OrderSide, PositionId, TokenId, Venue,
+};
 use crate::service::market_cache::{MarketCache, MarketInfo};
 use crate::service::order_gateway::{OrderGateway, OrderReceipt, OrderSubmitError};
 use crate::service::position_store::{OpenPosition, PositionStore};
@@ -22,6 +24,7 @@ use crate::utils;
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 pub struct OrderExecutor {
     cfg: AppConfig,
@@ -71,9 +74,9 @@ impl OrderExecutor {
         cfg: AppConfig,
         risk: Arc<RiskGuard>,
         markets: Arc<MarketCache>,
-        positions: Arc<PositionStore>,
     ) -> Result<Self> {
         if !cfg.live_trading_allowed() {
+            let positions = PositionStore::new_paper();
             return Ok(Self::new_with_live_components(
                 cfg, risk, markets, positions, None, None,
             ));
@@ -81,8 +84,11 @@ impl OrderExecutor {
         let ledger = Arc::new(ExecutionLedger::open_live(
             &cfg.trading.execution_ledger_path,
         )?);
-        let breaker =
-            ExecutionCircuitBreaker::new_live(ledger, cfg.trading.execution_halt_path.clone())?;
+        let positions = PositionStore::from_ledger(Arc::clone(&ledger))?;
+        let breaker = ExecutionCircuitBreaker::new_live(
+            Arc::clone(&ledger),
+            cfg.trading.execution_halt_path.clone(),
+        )?;
         let gateway: Arc<dyn OrderGateway> = Arc::new(SdkOrderGateway::new(&cfg).await?);
         Ok(Self::new_with_live_components(
             cfg,
@@ -131,7 +137,10 @@ impl OrderExecutor {
             return Ok(ExecutionOutcome::Skipped(SkipReason::WhaleExitIgnored));
         }
         // 0b. Don't pyramid into a market we're already long.
-        if self.positions.get(&trade.token_id).is_some() {
+        if TokenId::from_decimal(&trade.token_id)
+            .and_then(|token_id| self.positions.get_by_token(&token_id))
+            .is_some()
+        {
             return Ok(ExecutionOutcome::Skipped(SkipReason::AlreadyOpen));
         }
 
@@ -212,7 +221,7 @@ impl OrderExecutor {
                 price = planned.limit_price,
                 "dry-run: order planned without a signature or submission"
             );
-            self.record_open_from_plan(&market, &planned);
+            self.record_open_from_plan(&market, &planned)?;
             return Ok(ExecutionOutcome::DryRunPlanned(planned));
         }
 
@@ -277,27 +286,33 @@ impl OrderExecutor {
         None
     }
 
-    fn record_open_from_plan(&self, market: &MarketInfo, planned: &PlannedOrder) {
+    fn record_open_from_plan(&self, market: &MarketInfo, planned: &PlannedOrder) -> Result<()> {
         // Only entries open positions; exits remove them in the monitor.
         if planned.side != Side::Buy {
-            return;
+            return Ok(());
         }
         let (tp_pct, sl_pct) = self.tp_sl_for(market);
+        let intent_id = IntentId(Uuid::new_v4());
         let pos = OpenPosition {
-            token_id: planned.token_id.clone(),
+            position_id: PositionId(intent_id.0),
+            opening_intent_id: intent_id,
+            opening_order_id: paper_order_id(intent_id),
+            venue: ledger_venue(planned.venue)?,
+            token_id: TokenId::from_decimal(&planned.token_id)
+                .ok_or_else(|| anyhow!("planned order has invalid token id"))?,
             slug: market.slug.clone(),
-            category: market.category.clone(),
+            category: market.category.clone().unwrap_or_default(),
             tags: market.tags.clone(),
             neg_risk: market.neg_risk,
-            side: planned.side,
-            entry_price: planned.limit_price,
-            shares: planned.shares,
-            usd_notional: planned.usd_notional,
-            take_profit_pct: tp_pct,
-            stop_loss_pct: sl_pct,
+            side: ledger_side(planned.side),
+            shares_micros: micros_from_f64(planned.shares)?,
+            usd_notional_micros: micros_from_f64(planned.usd_notional)?,
+            take_profit_bps: bps_from_pct(tp_pct)?,
+            stop_loss_bps: bps_from_pct(sl_pct)?,
             opened_at: Utc::now(),
         };
-        self.positions.open(pos);
+        self.positions.apply_open(pos)?;
+        Ok(())
     }
 
     fn record_open_from_receipt(
@@ -309,30 +324,34 @@ impl OrderExecutor {
         if planned.side != Side::Buy {
             return Ok(());
         }
-        let shares = receipt.filled_shares();
-        let usd_notional = receipt.filled_usd();
-        if shares <= 0.0 || usd_notional <= 0.0 {
+        if receipt.filled_shares_micros == 0 || receipt.filled_usd_micros == 0 {
             return Err(anyhow!("confirmed receipt contains zero fill"));
         }
-        let entry_price = usd_notional / shares;
-        if !entry_price.is_finite() || entry_price <= 0.0 {
-            return Err(anyhow!("confirmed receipt cannot form an entry price"));
-        }
+        let order_id = OrderId::from_hex(receipt.order_id.clone())
+            .ok_or_else(|| anyhow!("confirmed receipt has invalid order id"))?;
+        let (opening_intent_id, position_id) = self
+            .positions
+            .pending_entry_identity(&order_id)
+            .ok_or_else(|| anyhow!("confirmed receipt has no journaled entry intent"))?;
         let (tp_pct, sl_pct) = self.tp_sl_for(market);
-        self.positions.open(OpenPosition {
-            token_id: planned.token_id.clone(),
+        self.positions.apply_open(OpenPosition {
+            position_id,
+            opening_intent_id,
+            opening_order_id: order_id,
+            venue: ledger_venue(planned.venue)?,
+            token_id: TokenId::from_decimal(&planned.token_id)
+                .ok_or_else(|| anyhow!("planned order has invalid token id"))?,
             slug: market.slug.clone(),
-            category: market.category.clone(),
+            category: market.category.clone().unwrap_or_default(),
             tags: market.tags.clone(),
             neg_risk: market.neg_risk,
-            side: planned.side,
-            entry_price,
-            shares,
-            usd_notional,
-            take_profit_pct: tp_pct,
-            stop_loss_pct: sl_pct,
+            side: ledger_side(planned.side),
+            shares_micros: receipt.filled_shares_micros,
+            usd_notional_micros: receipt.filled_usd_micros,
+            take_profit_bps: bps_from_pct(tp_pct)?,
+            stop_loss_bps: bps_from_pct(sl_pct)?,
             opened_at: Utc::now(),
-        });
+        })?;
         Ok(())
     }
 
@@ -361,6 +380,56 @@ impl OrderExecutor {
             (tp_default, sl_default)
         }
     }
+}
+
+fn ledger_venue(venue: crate::models::VenueId) -> Result<Venue> {
+    match venue {
+        crate::models::VenueId::Polymarket => Ok(Venue::PolymarketClob),
+        crate::models::VenueId::Kalshi | crate::models::VenueId::Limitless => {
+            Err(anyhow!("unsupported durable position venue"))
+        }
+    }
+}
+
+fn ledger_side(side: Side) -> OrderSide {
+    match side {
+        Side::Buy => OrderSide::Buy,
+        Side::Sell => OrderSide::Sell,
+    }
+}
+
+fn micros_from_f64(value: f64) -> Result<u128> {
+    let scaled = value * 1_000_000.0;
+    let rounded = scaled.round();
+    if !scaled.is_finite()
+        || scaled <= 0.0
+        || (scaled - rounded).abs() > 1e-6
+        || rounded > u128::MAX as f64
+    {
+        return Err(anyhow!(
+            "value cannot be represented in integer micro-units"
+        ));
+    }
+    Ok(rounded as u128)
+}
+
+fn bps_from_pct(value: f64) -> Result<u32> {
+    let scaled = value * 100.0;
+    let rounded = scaled.round();
+    if !scaled.is_finite()
+        || scaled < 0.0
+        || (scaled - rounded).abs() > 1e-9
+        || rounded > u32::MAX as f64
+    {
+        return Err(anyhow!("percentage cannot be represented in basis points"));
+    }
+    Ok(rounded as u32)
+}
+
+fn paper_order_id(intent_id: IntentId) -> OrderId {
+    let half = format!("{:032x}", intent_id.0.as_u128());
+    OrderId::from_hex(format!("0x{half}{half}"))
+        .expect("paper UUID expansion is a canonical order identifier")
 }
 
 #[cfg(test)]
@@ -409,6 +478,10 @@ mod tests {
     use super::*;
     use crate::models::{Side, VenueId};
     use crate::service::execution_circuit_breaker::ExecutionCircuitBreaker;
+    use crate::service::execution_ledger::{
+        IntentPurpose, LedgerPayload, MatchedAmounts, OrderType as LedgerOrderType, PositionSeed,
+        PreparedIntent, ORDER_PROTOCOL_VERSION,
+    };
     use crate::service::onchain::RawLog;
     use crate::service::order_gateway::{
         OrderErrorCode, OrderGateway, OrderReceipt, OrderStage, OrderSubmitError,
@@ -493,10 +566,8 @@ mod tests {
 
         let risk = RiskGuard::new(cfg.risk.clone());
         let markets = MarketCache::new(reqwest::Client::new(), cfg.site.gamma_api_base.clone());
-        let positions = PositionStore::new();
-        let executor = OrderExecutor::new(cfg, risk, markets, Arc::clone(&positions))
-            .await
-            .unwrap();
+        let executor = OrderExecutor::new(cfg, risk, markets).await.unwrap();
+        let positions = executor.positions();
 
         let outcome = executor.execute(&trade).await.unwrap();
         server.await.unwrap();
@@ -511,26 +582,21 @@ mod tests {
             other => panic!("paper dry-run must produce a plan: {other:?}"),
         }
         let position = positions
-            .get("12345")
+            .get_by_token(&TokenId::from_decimal("12345").unwrap())
             .expect("paper dry-run should record the planned entry");
-        assert!((position.usd_notional - 20.0).abs() < 1e-9);
-        assert!((position.entry_price - 0.505).abs() < 1e-9);
-        assert_eq!(position.shares, 39.0);
+        assert_eq!(position.usd_notional_micros, 20_000_000);
+        assert!((position.entry_price() - (20.0 / 39.0)).abs() < 1e-12);
+        assert_eq!(position.shares_micros, 39_000_000);
     }
 
     #[tokio::test]
     async fn strict_dry_run_skips_live_components_and_records_planned_position() {
         let (mut cfg, markets, server) = fixture_runtime(false).await;
         blank_signing_and_api_credentials(&mut cfg);
-        let positions = PositionStore::new();
-        let executor = OrderExecutor::new(
-            cfg,
-            RiskGuard::new(test_cfg()),
-            markets,
-            Arc::clone(&positions),
-        )
-        .await
-        .unwrap();
+        let executor = OrderExecutor::new(cfg, RiskGuard::new(test_cfg()), markets)
+            .await
+            .unwrap();
+        let positions = executor.positions();
 
         assert!(executor.live_order_components().is_none());
         assert!(matches!(
@@ -538,7 +604,29 @@ mod tests {
             ExecutionOutcome::DryRunPlanned(_)
         ));
         server.await.unwrap();
-        assert!(positions.get("12345").is_some());
+        assert!(positions
+            .get_by_token(&TokenId::from_decimal("12345").unwrap())
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn strict_dry_run_does_not_validate_or_open_the_live_ledger_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_parent = dir.path().join("paper-must-not-create-live-state");
+        let mut cfg: AppConfig = serde_json::from_str(include_str!("../../config.json")).unwrap();
+        blank_signing_and_api_credentials(&mut cfg);
+        cfg.bot.enable_trading = false;
+        cfg.bot.mock_trading = true;
+        cfg.trading.execution_ledger_path = missing_parent.join("execution-ledger.jsonl");
+        let markets = MarketCache::new(reqwest::Client::new(), cfg.site.gamma_api_base.clone());
+
+        let executor = OrderExecutor::new(cfg, RiskGuard::new(test_cfg()), markets)
+            .await
+            .unwrap();
+
+        assert!(executor.live_order_components().is_none());
+        assert!(executor.positions().is_empty());
+        assert!(!missing_parent.exists());
     }
 
     #[test]
@@ -558,13 +646,15 @@ mod tests {
         let (mut cfg, markets, server) = fixture_runtime(true).await;
         let halt_dir = tempfile::tempdir().unwrap();
         cfg.trading.execution_halt_path = halt_dir.path().join("execution-halt.json");
-        let positions = PositionStore::new();
+        let (ledger, positions, breaker) =
+            test_live_components(cfg.trading.execution_halt_path.clone());
+        let order_id = OrderId::from_hex(format!("0x{}", "ab".repeat(32))).unwrap();
+        prepare_matched_entry(&ledger, order_id.clone());
         let gateway = Arc::new(FakeGateway::returning(Ok(OrderReceipt {
-            order_id: "order-public-fixture".into(),
+            order_id: order_id.as_str().to_owned(),
             filled_shares_micros: 39_000_000,
             filled_usd_micros: 19_500_000,
         })));
-        let breaker = test_breaker(cfg.trading.execution_halt_path.clone());
         let executor = OrderExecutor::new_with_live_components(
             cfg,
             RiskGuard::new(test_cfg()),
@@ -579,10 +669,12 @@ mod tests {
             ExecutionOutcome::Filled(_)
         ));
         server.await.unwrap();
-        let position = positions.get("12345").unwrap();
-        assert_eq!(position.shares, 39.0);
-        assert_eq!(position.usd_notional, 19.5);
-        assert_eq!(position.entry_price, 0.5);
+        let position = positions
+            .get_by_token(&TokenId::from_decimal("12345").unwrap())
+            .unwrap();
+        assert_eq!(position.shares_micros, 39_000_000);
+        assert_eq!(position.usd_notional_micros, 19_500_000);
+        assert_eq!(position.entry_price(), 0.5);
         assert_eq!(gateway.calls(), 1);
     }
 
@@ -601,9 +693,9 @@ mod tests {
             let (mut cfg, markets, server) = fixture_runtime(true).await;
             let halt_dir = tempfile::tempdir().unwrap();
             cfg.trading.execution_halt_path = halt_dir.path().join("execution-halt.json");
-            let positions = PositionStore::new();
+            let (_ledger, positions, breaker) =
+                test_live_components(cfg.trading.execution_halt_path.clone());
             let gateway = Arc::new(FakeGateway::returning(result));
-            let breaker = test_breaker(cfg.trading.execution_halt_path.clone());
             let executor = OrderExecutor::new_with_live_components(
                 cfg,
                 RiskGuard::new(test_cfg()),
@@ -628,11 +720,10 @@ mod tests {
         let halt_dir = tempfile::tempdir().unwrap();
         cfg.trading.execution_halt_path = halt_dir.path().join("execution-halt.json");
         let marker = cfg.trading.execution_halt_path.clone();
-        let positions = PositionStore::new();
+        let (_ledger, positions, breaker) = test_live_components(marker.clone());
         let gateway = Arc::new(FakeGateway::returning(Err(OrderSubmitError::Uncertain {
             code: OrderErrorCode::PostTimeout,
         })));
-        let breaker = test_breaker(marker.clone());
         let executor = OrderExecutor::new_with_live_components(
             cfg,
             RiskGuard::new(test_cfg()),
@@ -694,12 +785,60 @@ mod tests {
         cfg.credentials.api_passphrase = None;
     }
 
-    fn test_breaker(path: std::path::PathBuf) -> Arc<ExecutionCircuitBreaker> {
+    fn test_live_components(
+        path: std::path::PathBuf,
+    ) -> (
+        Arc<ExecutionLedger>,
+        Arc<PositionStore>,
+        Arc<ExecutionCircuitBreaker>,
+    ) {
         let ledger = Arc::new(
             ExecutionLedger::open_live(path.parent().unwrap().join("execution-ledger.jsonl"))
                 .unwrap(),
         );
-        ExecutionCircuitBreaker::new_live(ledger, path).unwrap()
+        let positions = PositionStore::from_ledger(Arc::clone(&ledger)).unwrap();
+        let breaker = ExecutionCircuitBreaker::new_live(Arc::clone(&ledger), path).unwrap();
+        (ledger, positions, breaker)
+    }
+
+    fn prepare_matched_entry(ledger: &ExecutionLedger, order_id: OrderId) {
+        let intent_id = IntentId(uuid::Uuid::from_u128(500));
+        ledger
+            .append(
+                intent_id,
+                LedgerPayload::IntentPrepared(PreparedIntent {
+                    order_id,
+                    protocol_version: ORDER_PROTOCOL_VERSION,
+                    venue: Venue::PolymarketClob,
+                    token_id: TokenId::from_decimal("12345").unwrap(),
+                    neg_risk: false,
+                    side: OrderSide::Buy,
+                    order_type: LedgerOrderType::Fok,
+                    expected_maker_micros: 19_500_000,
+                    expected_taker_micros: 39_000_000,
+                    source_hash: None,
+                    purpose: IntentPurpose::Entry(PositionSeed {
+                        slug: "fixture-market".into(),
+                        category: "Politics".into(),
+                        tags: vec!["election".into()],
+                        take_profit_bps: 4_000,
+                        stop_loss_bps: 2_500,
+                    }),
+                }),
+            )
+            .unwrap();
+        ledger
+            .append(intent_id, LedgerPayload::SubmitStarted)
+            .unwrap();
+        ledger
+            .append(
+                intent_id,
+                LedgerPayload::RemoteMatched(MatchedAmounts {
+                    shares_micros: 39_000_000,
+                    usd_micros: 19_500_000,
+                }),
+            )
+            .unwrap();
     }
 
     struct FakeGateway {

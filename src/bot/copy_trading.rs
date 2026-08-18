@@ -36,7 +36,6 @@ use crate::service::{
     order_gateway::{order_id_hint, OrderGateway, OrderReceipt, OrderSubmitError},
     parse::{decode_whale_trade, order_filled_topic},
     position_monitor,
-    position_store::PositionStore,
     risk_guard::RiskGuard,
 };
 use anyhow::{anyhow, Result};
@@ -69,15 +68,8 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
         .build()?;
     let risk = RiskGuard::new(cfg.risk.clone());
     let markets = MarketCache::new(http.clone(), cfg.site.gamma_api_base.clone());
-    let positions = PositionStore::new();
-
-    let executor = OrderExecutor::new(
-        cfg.clone(),
-        Arc::clone(&risk),
-        Arc::clone(&markets),
-        Arc::clone(&positions),
-    )
-    .await?;
+    let executor = OrderExecutor::new(cfg.clone(), Arc::clone(&risk), Arc::clone(&markets)).await?;
+    let positions = executor.positions();
 
     let mut tp_sl_monitor = None;
     if let Some((gateway, breaker)) = live_tp_sl_components(&cfg, &executor) {
@@ -242,9 +234,11 @@ mod tests {
 
     use super::*;
     use crate::models::{OrderType, PlannedOrder, Side, VenueId};
-    use crate::service::execution_ledger::ExecutionLedger;
+    use crate::service::execution_ledger::{
+        ExecutionLedger, IntentId, OrderId, OrderSide, PositionId, TokenId, Venue,
+    };
     use crate::service::order_gateway::OrderErrorCode;
-    use crate::service::position_store::OpenPosition;
+    use crate::service::position_store::{OpenPosition, PositionStore};
 
     #[tokio::test]
     async fn strict_dry_run_never_exposes_tp_sl_live_components() {
@@ -261,7 +255,7 @@ mod tests {
         cfg.site.clob_api_base = "http://127.0.0.1:9".into();
         let risk = RiskGuard::new(cfg.risk.clone());
         let markets = MarketCache::new(Client::new(), cfg.site.gamma_api_base.clone());
-        let executor = OrderExecutor::new(cfg.clone(), risk, markets, PositionStore::new())
+        let executor = OrderExecutor::new(cfg.clone(), risk, markets)
             .await
             .unwrap();
 
@@ -273,21 +267,25 @@ mod tests {
         let mut cfg: AppConfig = serde_json::from_str(include_str!("../../config.json")).unwrap();
         cfg.tp_sl.enabled = true;
         cfg.tp_sl.poll_interval_secs = 1;
-        let positions = PositionStore::new();
-        positions.open(OpenPosition {
-            token_id: "fatal-exit-token".to_owned(),
+        let positions = PositionStore::new_paper();
+        let position = OpenPosition {
+            position_id: PositionId(uuid::Uuid::from_u128(700)),
+            opening_intent_id: IntentId(uuid::Uuid::from_u128(700)),
+            opening_order_id: OrderId::from_hex(format!("0x{}", "70".repeat(32))).unwrap(),
+            venue: Venue::PolymarketClob,
+            token_id: TokenId::from_decimal("700").unwrap(),
             slug: "fatal-exit-market".to_owned(),
-            category: None,
+            category: String::new(),
             tags: Vec::new(),
             neg_risk: false,
-            side: Side::Buy,
-            entry_price: 0.50,
-            shares: 100.0,
-            usd_notional: 50.0,
-            take_profit_pct: 30.0,
-            stop_loss_pct: 20.0,
+            side: OrderSide::Buy,
+            shares_micros: 100_000_000,
+            usd_notional_micros: 50_000_000,
+            take_profit_bps: 3_000,
+            stop_loss_bps: 2_000,
             opened_at: Utc::now(),
-        });
+        };
+        positions.apply_open(position.clone()).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("DYNAMIC_FILESYSTEM_ERROR_SENTINEL");
         let ledger = Arc::new(
@@ -314,14 +312,14 @@ mod tests {
         .expect("fatal monitor termination must reach its supervisor");
 
         assert!(breaker.is_halted());
-        assert!(positions.get("fatal-exit-token").is_some());
+        assert!(positions.get_by_id(&position.position_id).is_some());
         assert_eq!(gateway.calls(), 1);
         let retry = breaker
             .submit_fok(
                 gateway.as_ref(),
                 &PlannedOrder {
                     venue: VenueId::Polymarket,
-                    token_id: "fatal-exit-token".to_owned(),
+                    token_id: position.token_id.to_string(),
                     neg_risk: false,
                     side: Side::Sell,
                     shares: 100.0,

@@ -11,6 +11,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::TpSlConfig;
 use crate::models::{OrderType, PlannedOrder, Side, VenueId};
 use crate::service::execution_circuit_breaker::ExecutionCircuitBreaker;
+use crate::service::execution_ledger::{IntentId, OrderId, OrderSide, PositionClose, Venue};
 use crate::service::midprice::MidpriceSource;
 use crate::service::order_gateway::{OrderGateway, OrderReceipt, OrderSubmitError};
 use crate::service::position_store::{OpenPosition, PositionStore};
@@ -31,9 +32,9 @@ pub enum ExitOutcome {
 
 pub fn check_exit(pos: &OpenPosition, midprice: f64) -> Option<ExitReason> {
     let pnl = pos.pnl_pct(midprice);
-    if pnl >= pos.take_profit_pct {
+    if pnl >= pos.take_profit_pct() {
         Some(ExitReason::TakeProfit)
-    } else if pnl <= -pos.stop_loss_pct {
+    } else if pnl <= -pos.stop_loss_pct() {
         Some(ExitReason::StopLoss)
     } else {
         None
@@ -106,12 +107,13 @@ async fn monitor_once(
     midprice: &dyn MidpriceSource,
     price_buffer: f64,
 ) -> Result<ExitOutcome> {
-    let mid = midprice.midprice(&pos.token_id).await?;
+    let token_id = pos.token_id.to_string();
+    let mid = midprice.midprice(&token_id).await?;
     let pnl = pos.pnl_pct(mid);
     debug!(
         token = %pos.token_id,
         mid,
-        entry = pos.entry_price,
+        entry = pos.entry_price(),
         pnl_pct = pnl,
         "tp/sl tick"
     );
@@ -131,7 +133,28 @@ async fn monitor_once(
     let planned = exit_plan(pos, mid, price_buffer);
     match breaker.submit_fok(gateway, &planned).await {
         Ok(receipt) => {
-            positions.close(&pos.token_id);
+            if receipt.filled_shares_micros != pos.shares_micros || receipt.filled_usd_micros == 0 {
+                return Err(anyhow::anyhow!(
+                    "confirmed exit receipt has conflicting amounts"
+                ));
+            }
+            let order_id = OrderId::from_hex(receipt.order_id.clone())
+                .ok_or_else(|| anyhow::anyhow!("confirmed exit receipt has invalid order id"))?;
+            let closing_intent_id = if positions.is_paper() {
+                IntentId(uuid::Uuid::new_v4())
+            } else {
+                positions
+                    .pending_exit_intent(&order_id, pos.position_id)
+                    .ok_or_else(|| anyhow::anyhow!("confirmed exit has no journaled intent"))?
+            };
+            positions.apply_close(PositionClose {
+                position_id: pos.position_id,
+                closing_intent_id,
+                closing_order_id: order_id,
+                shares_micros: receipt.filled_shares_micros,
+                usd_micros: receipt.filled_usd_micros,
+                closed_at: chrono::Utc::now(),
+            })?;
             Ok(ExitOutcome::Filled(receipt))
         }
         Err(error @ (OrderSubmitError::Preflight { .. } | OrderSubmitError::Rejected { .. })) => {
@@ -142,19 +165,24 @@ async fn monitor_once(
 }
 
 fn exit_plan(pos: &OpenPosition, midprice: f64, price_buffer: f64) -> PlannedOrder {
-    let side = pos.side.flip();
+    let side = match pos.side {
+        OrderSide::Buy => Side::Sell,
+        OrderSide::Sell => Side::Buy,
+    };
     let limit_price = match side {
         Side::Sell => utils::clamp_price(midprice - price_buffer),
         Side::Buy => utils::clamp_price(midprice + price_buffer),
     };
     PlannedOrder {
-        venue: VenueId::Polymarket,
-        token_id: pos.token_id.clone(),
+        venue: match pos.venue {
+            Venue::PolymarketClob => VenueId::Polymarket,
+        },
+        token_id: pos.token_id.to_string(),
         neg_risk: pos.neg_risk,
         side,
-        shares: pos.shares,
+        shares: pos.shares(),
         limit_price,
-        usd_notional: pos.shares * limit_price,
+        usd_notional: pos.shares() * limit_price,
         order_type: OrderType::Fok,
         source_trade_hash: None,
     }
@@ -173,7 +201,11 @@ mod tests {
     use super::*;
     use crate::config::AppConfig;
     use crate::service::execution_circuit_breaker::ExecutionCircuitBreaker;
-    use crate::service::execution_ledger::ExecutionLedger;
+    use crate::service::execution_ledger::{
+        ExecutionLedger, IntentId, IntentPurpose, LedgerPayload, MatchedAmounts, OrderId,
+        OrderSide, OrderType as LedgerOrderType, PositionId, PositionSeed, PreparedIntent, TokenId,
+        Venue, ORDER_PROTOCOL_VERSION,
+    };
     use crate::service::market_cache::MarketCache;
     use crate::service::order_executor::test_support;
     use crate::service::order_gateway::{
@@ -183,19 +215,87 @@ mod tests {
 
     fn pos(entry: f64, tp: f64, sl: f64, side: Side) -> OpenPosition {
         OpenPosition {
-            token_id: "t".into(),
+            position_id: PositionId(uuid::Uuid::from_u128(1)),
+            opening_intent_id: IntentId(uuid::Uuid::from_u128(1)),
+            opening_order_id: OrderId::from_hex(format!("0x{}", "11".repeat(32))).unwrap(),
+            venue: Venue::PolymarketClob,
+            token_id: TokenId::from_decimal("100").unwrap(),
             slug: "s".into(),
-            category: None,
+            category: String::new(),
             tags: vec![],
             neg_risk: false,
-            side,
-            entry_price: entry,
-            shares: 100.0,
-            usd_notional: 100.0 * entry,
-            take_profit_pct: tp,
-            stop_loss_pct: sl,
+            side: match side {
+                Side::Buy => OrderSide::Buy,
+                Side::Sell => OrderSide::Sell,
+            },
+            shares_micros: 100_000_000,
+            usd_notional_micros: (100.0 * entry * 1_000_000.0) as u128,
+            take_profit_bps: (tp * 100.0) as u32,
+            stop_loss_bps: (sl * 100.0) as u32,
             opened_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn tp_sl_snapshot_after_reopen_uses_exact_durable_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("execution-ledger.jsonl");
+        let position = pos(0.50, 30.0, 20.0, Side::Buy);
+        {
+            let ledger = Arc::new(ExecutionLedger::open_live(&path).unwrap());
+            let store = PositionStore::from_ledger(Arc::clone(&ledger)).unwrap();
+            ledger
+                .append(
+                    position.opening_intent_id,
+                    LedgerPayload::IntentPrepared(PreparedIntent {
+                        order_id: position.opening_order_id.clone(),
+                        protocol_version: ORDER_PROTOCOL_VERSION,
+                        venue: position.venue,
+                        token_id: position.token_id,
+                        neg_risk: position.neg_risk,
+                        side: position.side,
+                        order_type: LedgerOrderType::Fok,
+                        expected_maker_micros: position.usd_notional_micros,
+                        expected_taker_micros: position.shares_micros,
+                        source_hash: None,
+                        purpose: IntentPurpose::Entry(PositionSeed {
+                            slug: position.slug.clone(),
+                            category: position.category.clone(),
+                            tags: position.tags.clone(),
+                            take_profit_bps: position.take_profit_bps,
+                            stop_loss_bps: position.stop_loss_bps,
+                        }),
+                    }),
+                )
+                .unwrap();
+            ledger
+                .append(position.opening_intent_id, LedgerPayload::SubmitStarted)
+                .unwrap();
+            ledger
+                .append(
+                    position.opening_intent_id,
+                    LedgerPayload::RemoteMatched(MatchedAmounts {
+                        shares_micros: position.shares_micros,
+                        usd_micros: position.usd_notional_micros,
+                    }),
+                )
+                .unwrap();
+            store.apply_open(position.clone()).unwrap();
+            ledger
+                .append(
+                    position.opening_intent_id,
+                    LedgerPayload::SubmissionCommitted,
+                )
+                .unwrap();
+        }
+
+        let ledger = Arc::new(ExecutionLedger::open_live(&path).unwrap());
+        let reopened = PositionStore::from_ledger(ledger).unwrap();
+        let actual = reopened.snapshot().pop().unwrap();
+
+        assert_eq!(actual, position);
+        assert_eq!(check_exit(&actual, 0.70), Some(ExitReason::TakeProfit));
+        assert_eq!(exit_plan(&actual, 0.70, 0.005).shares, 100.0);
     }
 
     #[test]
@@ -237,13 +337,13 @@ mod tests {
 
     #[tokio::test]
     async fn matched_sell_exit_closes_position_with_fok_for_open_shares() {
-        let positions = PositionStore::new();
+        let positions = PositionStore::new_paper();
         let position = pos(0.50, 30.0, 20.0, Side::Buy);
-        positions.open(position.clone());
+        positions.apply_open(position.clone()).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let breaker = test_breaker(dir.path().join("execution-halt.json"));
         let gateway = Arc::new(FakeGateway::returning(Ok(OrderReceipt {
-            order_id: "order-public-fixture".into(),
+            order_id: format!("0x{}", "31".repeat(32)),
             filled_shares_micros: 100_000_000,
             filled_usd_micros: 70_000_000,
         })));
@@ -260,18 +360,18 @@ mod tests {
         .unwrap();
 
         assert!(matches!(outcome, ExitOutcome::Filled(_)));
-        assert!(positions.get("t").is_none());
+        assert!(positions.get_by_token(&position.token_id).is_none());
         let planned = gateway.plans.lock().pop().unwrap();
         assert_eq!(planned.side, Side::Sell);
         assert_eq!(planned.order_type, OrderType::Fok);
-        assert_eq!(planned.shares, position.shares);
+        assert_eq!(planned.shares, position.shares());
     }
 
     #[tokio::test]
     async fn rejected_exit_keeps_position_and_breaker_open() {
-        let positions = PositionStore::new();
+        let positions = PositionStore::new_paper();
         let position = pos(0.50, 30.0, 20.0, Side::Buy);
-        positions.open(position.clone());
+        positions.apply_open(position.clone()).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let breaker = test_breaker(dir.path().join("execution-halt.json"));
         let gateway = Arc::new(FakeGateway::returning(Err(OrderSubmitError::Rejected {
@@ -291,15 +391,15 @@ mod tests {
         .unwrap();
 
         assert!(matches!(outcome, ExitOutcome::Rejected(_)));
-        assert!(positions.get("t").is_some());
+        assert!(positions.get_by_token(&position.token_id).is_some());
         assert!(!breaker.is_halted());
     }
 
     #[tokio::test]
     async fn uncertain_exit_keeps_position_persists_halt_and_blocks_later_entry() {
-        let positions = PositionStore::new();
+        let positions = PositionStore::new_paper();
         let position = pos(0.50, 30.0, 20.0, Side::Buy);
-        positions.open(position.clone());
+        positions.apply_open(position.clone()).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("execution-halt.json");
         let breaker = test_breaker(marker.clone());
@@ -319,7 +419,7 @@ mod tests {
         .await;
 
         assert!(result.is_err());
-        assert!(positions.get("t").is_some());
+        assert!(positions.get_by_token(&position.token_id).is_some());
         assert!(breaker.is_halted());
         assert!(marker.is_file());
 
@@ -347,7 +447,9 @@ mod tests {
             error.downcast_ref::<OrderSubmitError>(),
             Some(OrderSubmitError::Halted { .. })
         ));
-        assert!(positions.get("12345").is_none());
+        assert!(positions
+            .get_by_token(&TokenId::from_decimal("12345").unwrap())
+            .is_none());
         assert_eq!(positions.len(), 1);
         assert_eq!(gateway_fake.calls(), 1);
     }
