@@ -78,6 +78,7 @@ pub enum OrderErrorCode {
     AmountConversion,
     SdkBuild,
     SdkSign,
+    ExactOrderIdUnavailable,
     HttpRejected,
     ServerRejected,
     PostTimeout,

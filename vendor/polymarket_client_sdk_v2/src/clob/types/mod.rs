@@ -1,6 +1,8 @@
 use std::fmt;
 
+pub use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{B256, Signature, U256};
+use alloy::sol_types::SolStruct as _;
 use bon::Builder;
 use rust_decimal_macros::dec;
 use serde::ser::{Error as _, SerializeStruct as _};
@@ -619,6 +621,16 @@ impl SignableOrder {
 }
 
 impl SignedOrder {
+    /// Returns the exact CTF Exchange V2 EIP-712 order hash used as the order ID.
+    pub fn v2_order_hash(&self, domain: &Eip712Domain) -> Result<B256> {
+        match &self.payload {
+            OrderPayload::V2(payload) => Ok(payload.order.eip712_signing_hash(domain)),
+            OrderPayload::V1(_) => Err(Error::validation(
+                "V2 order hash requested for a V1 payload".to_owned(),
+            )),
+        }
+    }
+
     /// Returns the V2 order struct.
     ///
     /// # Panics

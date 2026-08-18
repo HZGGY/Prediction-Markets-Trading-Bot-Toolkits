@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt;
 use std::str::FromStr as _;
 use std::time::Duration;
@@ -9,13 +10,14 @@ use polymarket_client_sdk_v2::auth::{
 };
 use polymarket_client_sdk_v2::clob::types::response::PostOrderResponse;
 use polymarket_client_sdk_v2::clob::types::{
-    OrderStatusType, OrderType as SdkOrderType, Side as SdkSide, SignedOrder as SdkSignedOrder,
+    Eip712Domain, OrderStatusType, OrderType as SdkOrderType, Side as SdkSide,
+    SignedOrder as SdkSignedOrder,
 };
 use polymarket_client_sdk_v2::clob::{Client, Config as SdkConfig};
 use polymarket_client_sdk_v2::error::EmptyResponse as SdkEmptyResponse;
 use polymarket_client_sdk_v2::error::{Error as SdkError, Status as SdkStatus};
 use polymarket_client_sdk_v2::types::{Address, Decimal, U256};
-use polymarket_client_sdk_v2::POLYGON;
+use polymarket_client_sdk_v2::{contract_config, POLYGON};
 
 use crate::config::{AppConfig, OFFICIAL_CLOB_V2_HOST};
 use crate::models::{OrderType, PlannedOrder, Side};
@@ -218,6 +220,27 @@ impl SdkOrderGateway {
 
 fn preflight(stage: OrderStage, code: OrderErrorCode) -> OrderSubmitError {
     OrderSubmitError::Preflight { stage, code }
+}
+
+#[allow(
+    dead_code,
+    reason = "Task 1 proves the ID before later pre-POST wiring"
+)]
+fn exact_v2_order_id(signed: &SdkSignedOrder, neg_risk: bool) -> Result<String, OrderSubmitError> {
+    let exchange = contract_config(POLYGON, neg_risk)
+        .and_then(|config| config.exchange_v2)
+        .ok_or_else(|| preflight(OrderStage::Sign, OrderErrorCode::ExactOrderIdUnavailable))?;
+    let mut domain = Eip712Domain::default();
+    domain.name = Some(Cow::Borrowed("Polymarket CTF Exchange"));
+    domain.version = Some(Cow::Borrowed("2"));
+    domain.chain_id = Some(U256::from(POLYGON));
+    domain.verifying_contract = Some(exchange);
+    Ok(format!(
+        "{:#x}",
+        signed.v2_order_hash(&domain).map_err(|_| {
+            preflight(OrderStage::Sign, OrderErrorCode::ExactOrderIdUnavailable)
+        })?
+    ))
 }
 
 fn decimal_from_f64(value: f64, code: OrderErrorCode) -> Result<Decimal, OrderSubmitError> {
@@ -427,13 +450,13 @@ mod tests {
     use std::str::FromStr as _;
     use std::time::Duration;
 
+    use alloy_sol_types::SolStruct as _;
     use alloy_sol_types_v1::{eip712_domain, SolStruct as _};
     use polymarket_client_sdk_v2::clob::types::response::PostOrderResponse;
     use polymarket_client_sdk_v2::clob::types::{
-        OrderSignature, OrderStatusType, OrderType as SdkOrderType, Side as SdkSide,
+        OrderSignature, OrderStatusType, OrderType as SdkOrderType, OrderV2, Side as SdkSide,
     };
-    use polymarket_client_sdk_v2::contract_config;
-    use polymarket_client_sdk_v2::types::Decimal;
+    use polymarket_client_sdk_v2::types::{address, b256, Decimal, B256};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::TcpListener;
 
@@ -476,6 +499,43 @@ mod tests {
         ($value:literal) => {
             Decimal::from_str(stringify!($value)).unwrap()
         };
+    }
+
+    mod independent_v2 {
+        alloy_sol_types_v1::sol! {
+            #![sol(alloy_sol_types = ::alloy_sol_types_v1)]
+            struct Order {
+                uint256 salt;
+                address maker;
+                address signer;
+                uint256 tokenId;
+                uint256 makerAmount;
+                uint256 takerAmount;
+                uint8 side;
+                uint8 signatureType;
+                uint256 timestamp;
+                bytes32 metadata;
+                bytes32 builder;
+            }
+        }
+    }
+
+    mod independent_v08 {
+        alloy_sol_types::sol! {
+            struct Order {
+                uint256 salt;
+                address maker;
+                address signer;
+                uint256 tokenId;
+                uint256 makerAmount;
+                uint256 takerAmount;
+                uint8 side;
+                uint8 signatureType;
+                uint256 timestamp;
+                bytes32 metadata;
+                bytes32 builder;
+            }
+        }
     }
 
     fn response(
@@ -877,6 +937,244 @@ mod tests {
             order_type: OrderType::Fok,
             source_trade_hash: None,
         }
+    }
+
+    fn fixed_sdk_v2_order() -> OrderV2 {
+        let mut order = OrderV2::default();
+        order.salt = U256::from(1);
+        order.maker = address!("1111111111111111111111111111111111111111");
+        order.signer = address!("1111111111111111111111111111111111111111");
+        order.tokenId = U256::from(12_345);
+        order.makerAmount = U256::from(19_500_000);
+        order.takerAmount = U256::from(39_000_000);
+        order.side = 0;
+        order.signatureType = 0;
+        order.timestamp = U256::from(1_700_000_000_000_u64);
+        order.metadata = B256::ZERO;
+        order.builder = B256::ZERO;
+        order
+    }
+
+    fn independent_v2_order() -> independent_v2::Order {
+        independent_v2::Order {
+            salt: U256::from(1),
+            maker: address!("1111111111111111111111111111111111111111"),
+            signer: address!("1111111111111111111111111111111111111111"),
+            tokenId: U256::from(12_345),
+            makerAmount: U256::from(19_500_000),
+            takerAmount: U256::from(39_000_000),
+            side: 0,
+            signatureType: 0,
+            timestamp: U256::from(1_700_000_000_000_u64),
+            metadata: B256::ZERO,
+            builder: B256::ZERO,
+        }
+    }
+
+    fn independent_v08_order() -> independent_v08::Order {
+        independent_v08::Order {
+            salt: alloy_primitives::U256::from(1),
+            maker: alloy_primitives::address!("1111111111111111111111111111111111111111"),
+            signer: alloy_primitives::address!("1111111111111111111111111111111111111111"),
+            tokenId: alloy_primitives::U256::from(12_345),
+            makerAmount: alloy_primitives::U256::from(19_500_000),
+            takerAmount: alloy_primitives::U256::from(39_000_000),
+            side: 0,
+            signatureType: 0,
+            timestamp: alloy_primitives::U256::from(1_700_000_000_000_u64),
+            metadata: alloy_primitives::B256::ZERO,
+            builder: alloy_primitives::B256::ZERO,
+        }
+    }
+
+    // Official proof sources:
+    // https://github.com/Polymarket/ctf-exchange-v2/blob/main/src/exchange/mixins/Hashing.sol
+    // https://github.com/Polymarket/ctf-exchange-v2/blob/main/src/exchange/libraries/Structs.sol
+    #[test]
+    fn v2_order_hash_matches_official_contract_algorithm() {
+        let order = fixed_sdk_v2_order();
+        let domain = eip712_domain! {
+            name: "Polymarket CTF Exchange",
+            version: "2",
+            chain_id: 137,
+            verifying_contract: address!("E111180000d2663C0091e4f400237545B87B996B"),
+        };
+        let expected = independent_v2_order().eip712_signing_hash(&domain);
+        let actual = order.eip712_signing_hash(&domain);
+        let domain_v08 = alloy_sol_types::eip712_domain! {
+            name: "Polymarket CTF Exchange",
+            version: "2",
+            chain_id: 137,
+            verifying_contract: alloy_primitives::address!(
+                "E111180000d2663C0091e4f400237545B87B996B"
+            ),
+        };
+        let alloy_v08 = independent_v08_order().eip712_signing_hash(&domain_v08);
+
+        assert_eq!(actual, expected);
+        assert_eq!(actual.as_slice(), alloy_v08.as_slice());
+        assert_eq!(
+            actual,
+            b256!("dee0837cae29a8c41bd52f1f614e7e163739ff5ae52343da8f0501189c02e020")
+        );
+        assert_eq!(
+            alloy_v08,
+            alloy_primitives::b256!(
+                "dee0837cae29a8c41bd52f1f614e7e163739ff5ae52343da8f0501189c02e020"
+            )
+        );
+    }
+
+    #[test]
+    fn v2_order_hash_changes_for_every_identity_field() {
+        fn mutated(
+            field: &'static str,
+            mutate: impl FnOnce(&mut OrderV2),
+        ) -> (&'static str, OrderV2) {
+            let mut order = fixed_sdk_v2_order();
+            mutate(&mut order);
+            (field, order)
+        }
+
+        let domain = eip712_domain! {
+            name: "Polymarket CTF Exchange",
+            version: "2",
+            chain_id: 137,
+            verifying_contract: address!("E111180000d2663C0091e4f400237545B87B996B"),
+        };
+        let baseline = fixed_sdk_v2_order().eip712_signing_hash(&domain);
+        let mutations = vec![
+            mutated("salt", |order| order.salt = U256::from(2)),
+            mutated("maker", |order| {
+                order.maker = address!("2222222222222222222222222222222222222222")
+            }),
+            mutated("signer", |order| {
+                order.signer = address!("3333333333333333333333333333333333333333")
+            }),
+            mutated("tokenId", |order| order.tokenId = U256::from(12_346)),
+            mutated("makerAmount", |order| {
+                order.makerAmount = U256::from(19_500_001)
+            }),
+            mutated("takerAmount", |order| {
+                order.takerAmount = U256::from(39_000_001)
+            }),
+            mutated("side", |order| order.side = 1),
+            mutated("signatureType", |order| order.signatureType = 1),
+            mutated("timestamp", |order| {
+                order.timestamp = U256::from(1_700_000_000_001_u64)
+            }),
+            mutated("metadata", |order| {
+                order.metadata =
+                    b256!("0000000000000000000000000000000000000000000000000000000000000001")
+            }),
+            mutated("builder", |order| {
+                order.builder =
+                    b256!("0000000000000000000000000000000000000000000000000000000000000002")
+            }),
+        ];
+
+        for (field, order) in mutations {
+            assert_ne!(
+                order.eip712_signing_hash(&domain),
+                baseline,
+                "mutating {field} must change the V2 order hash"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_order_hash_is_signature_independent_for_signed_loopback_order() {
+        let (host, server) = spawn_scripted_server(vec![
+            (
+                "GET /tick-size?token_id=12345",
+                r#"{"minimum_tick_size":"0.01"}"#,
+            ),
+            ("GET /neg-risk?token_id=12345", r#"{"neg_risk":false}"#),
+            ("GET /version", r#"{"version":2}"#),
+        ])
+        .await;
+        let cfg = fixture_config();
+        let gateway = SdkOrderGateway::new_with_host(&cfg, &host, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let mut prepared = gateway.prepare_fok(&planned_order(false)).await.unwrap();
+        let exchange = contract_config(POLYGON, false)
+            .unwrap()
+            .exchange_v2
+            .unwrap();
+        let domain = eip712_domain! {
+            name: "Polymarket CTF Exchange",
+            version: "2",
+            chain_id: POLYGON,
+            verifying_contract: exchange,
+        };
+
+        let expected = prepared.signed.order().eip712_signing_hash(&domain);
+        let before = prepared.signed.v2_order_hash(&domain).unwrap();
+        prepared.signed.signature = OrderSignature::Wrapped("0x00".to_owned());
+        let after = prepared.signed.v2_order_hash(&domain).unwrap();
+        let requests = server.await.unwrap();
+
+        assert!(before == expected);
+        assert!(after == expected);
+        assert_eq!(
+            requests,
+            vec![
+                "GET /tick-size?token_id=12345",
+                "GET /neg-risk?token_id=12345",
+                "GET /version",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_order_id_uses_configured_exchange_and_canonical_lowercase_hex() {
+        let (host, server) = spawn_scripted_server(vec![
+            (
+                "GET /tick-size?token_id=12345",
+                r#"{"minimum_tick_size":"0.01"}"#,
+            ),
+            ("GET /neg-risk?token_id=12345", r#"{"neg_risk":false}"#),
+            ("GET /version", r#"{"version":2}"#),
+        ])
+        .await;
+        let cfg = fixture_config();
+        let gateway = SdkOrderGateway::new_with_host(&cfg, &host, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let prepared = gateway.prepare_fok(&planned_order(false)).await.unwrap();
+
+        for neg_risk in [false, true] {
+            let id = exact_v2_order_id(&prepared.signed, neg_risk).unwrap();
+            let exchange = contract_config(POLYGON, neg_risk)
+                .unwrap()
+                .exchange_v2
+                .unwrap();
+            let domain = eip712_domain! {
+                name: "Polymarket CTF Exchange",
+                version: "2",
+                chain_id: POLYGON,
+                verifying_contract: exchange,
+            };
+            let expected = prepared.signed.order().eip712_signing_hash(&domain);
+            let decoded = hex::decode(&id[2..]).unwrap();
+
+            assert_eq!(id.len(), 66);
+            assert!(id.starts_with("0x"));
+            assert!(id[2..]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+            assert!(decoded.as_slice() == expected.as_slice());
+        }
+
+        assert_eq!(
+            server.await.unwrap(),
+            vec![
+                "GET /tick-size?token_id=12345",
+                "GET /neg-risk?token_id=12345",
+                "GET /version",
+            ]
+        );
     }
 
     #[tokio::test]
