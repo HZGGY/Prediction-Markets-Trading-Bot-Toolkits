@@ -54,7 +54,6 @@ rand = "0.8"
 parking_lot = "0.12"
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4", "serde"] }
-fs2 = "0.4"
 
 # Official Polymarket V2 SDK — current EOA-only SDK phases own production order execution.
 polymarket_client_sdk_v2 = { version = "=0.6.0", default-features = false, features = ["clob"] }
