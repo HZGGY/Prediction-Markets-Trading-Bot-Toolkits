@@ -64,7 +64,10 @@ pub enum OrderErrorCode {
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum OrderSubmitError {
     #[error("order preflight failed at {stage:?} ({code:?})")]
-    Preflight { stage: OrderStage, code: OrderErrorCode },
+    Preflight {
+        stage: OrderStage,
+        code: OrderErrorCode,
+    },
     #[error("order rejected with status {http_status:?} ({code:?})")]
     Rejected {
         http_status: Option<u16>,
@@ -93,10 +96,7 @@ impl OrderSubmitError {
 
 #[async_trait]
 pub trait OrderGateway: Send + Sync {
-    async fn submit_fok(
-        &self,
-        planned: &PlannedOrder,
-    ) -> Result<OrderReceipt, OrderSubmitError>;
+    async fn submit_fok(&self, planned: &PlannedOrder) -> Result<OrderReceipt, OrderSubmitError>;
 }
 
 #[cfg(test)]

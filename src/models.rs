@@ -103,10 +103,7 @@ impl BookSnapshot {
             Side::Buy => &self.asks,
             Side::Sell => &self.bids,
         };
-        book.iter()
-            .take(levels)
-            .map(|lv| lv.price * lv.size)
-            .sum()
+        book.iter().take(levels).map(|lv| lv.price * lv.size).sum()
     }
 }
 
