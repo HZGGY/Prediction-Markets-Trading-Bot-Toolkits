@@ -15,6 +15,7 @@
 pub mod clob;
 pub mod clob_auth;
 pub mod eligibility;
+pub mod execution_circuit_breaker;
 pub mod market_cache;
 pub mod midprice;
 pub mod onchain;
