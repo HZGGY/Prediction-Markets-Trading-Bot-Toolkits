@@ -828,6 +828,16 @@ mod tests {
     }
 
     #[test]
+    fn serializes_fok_order_type_as_fok() {
+        let body =
+            serialize_order_request(fixture_signed_order(), "api-key-fixture", OrderType::Fok)
+                .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(json["orderType"], "FOK");
+    }
+
+    #[test]
     fn sha256_known_vectors() {
         // "abc" → ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
         let h = sha256(b"abc");
