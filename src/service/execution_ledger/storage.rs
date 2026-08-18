@@ -1,6 +1,6 @@
 use std::{
     fmt,
-    fs::{self, File, OpenOptions},
+    fs::{self, File, OpenOptions, TryLockError},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     sync::Arc,
@@ -97,6 +97,8 @@ impl LedgerPaths {
 pub struct ExecutionLedger {
     state: Mutex<LedgerState>,
     lock_file: File,
+    #[cfg(unix)]
+    parent_lock_file: File,
     durability: Arc<dyn DurabilityOps>,
 }
 
@@ -130,12 +132,12 @@ impl ExecutionLedger {
 
     fn open_with_ops(path: &Path, durability: Arc<dyn DurabilityOps>) -> Result<Self, LedgerError> {
         let paths = LedgerPaths::derive(path)?;
+        #[cfg(unix)]
+        let parent_lock_file = open_parent_lock(&paths.parent)?;
         let OpenedFile {
             file: lock_file, ..
         } = open_restrictive(&paths.lock, true)?;
-        lock_file
-            .try_lock()
-            .map_err(|_| LedgerError::new(LedgerErrorCode::Locked))?;
+        acquire_lifetime_lock(&lock_file)?;
 
         run_durability_probe(&paths, durability.as_ref())?;
 
@@ -159,6 +161,8 @@ impl ExecutionLedger {
                 fatal: false,
             }),
             lock_file,
+            #[cfg(unix)]
+            parent_lock_file,
             durability,
         })
     }
@@ -219,6 +223,8 @@ impl ExecutionLedger {
 impl Drop for ExecutionLedger {
     fn drop(&mut self) {
         let _ = self.lock_file.unlock();
+        #[cfg(unix)]
+        let _ = self.parent_lock_file.unlock();
     }
 }
 
@@ -362,6 +368,49 @@ fn open_restrictive(path: &Path, append: bool) -> Result<OpenedFile, LedgerError
         file,
         created: false,
     })
+}
+
+fn acquire_lifetime_lock(file: &File) -> Result<(), LedgerError> {
+    match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(TryLockError::WouldBlock) => Err(LedgerError::new(LedgerErrorCode::Locked)),
+        Err(TryLockError::Error(_)) => Err(LedgerError::new(LedgerErrorCode::Unavailable)),
+    }
+}
+
+#[cfg(unix)]
+fn open_parent_lock(path: &Path) -> Result<File, LedgerError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = OpenOptions::new();
+    options.read(true).custom_flags(unix_no_follow_flag()?);
+    let file = options
+        .open(path)
+        .map_err(|error| classify_open_error(path, error))?;
+    validate_opened_directory(&file, path)?;
+    acquire_lifetime_lock(&file)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn validate_opened_directory(file: &File, path: &Path) -> Result<(), LedgerError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let opened = file
+        .metadata()
+        .map_err(|_| LedgerError::new(LedgerErrorCode::UnsafePath))?;
+    let named =
+        fs::symlink_metadata(path).map_err(|_| LedgerError::new(LedgerErrorCode::UnsafePath))?;
+    reject_metadata(&opened)?;
+    reject_metadata(&named)?;
+    if !opened.is_dir()
+        || !named.is_dir()
+        || opened.dev() != named.dev()
+        || opened.ino() != named.ino()
+    {
+        return Err(LedgerError::new(LedgerErrorCode::UnsafePath));
+    }
+    Ok(())
 }
 
 fn restrictive_open_options(append: bool) -> Result<OpenOptions, LedgerError> {
@@ -1079,6 +1128,39 @@ mod tests {
         fs::write(&release, b"release").unwrap();
         assert!(child.wait().unwrap().success());
 
+        ExecutionLedger::open_live(&path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_lifetime_lock_survives_sibling_lock_unlink_and_recreate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("execution-ledger.jsonl");
+        let ready = dir.path().join("child.ready");
+        let release = dir.path().join("child.release");
+        let mut child = spawn_lock_holder(&path, &ready, &release);
+
+        if !wait_for_path(&ready, Duration::from_secs(10)) {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!("lock holder did not become ready: {output:?}");
+        }
+
+        let lock_path = derived(&path, ".lock");
+        fs::remove_file(&lock_path).unwrap();
+        fs::write(&lock_path, b"replacement").unwrap();
+
+        let second_open_code = match ExecutionLedger::open_live(&path) {
+            Ok(second) => {
+                drop(second);
+                None
+            }
+            Err(error) => Some(error.code()),
+        };
+
+        fs::write(&release, b"release").unwrap();
+        assert!(child.wait().unwrap().success());
+        assert_eq!(second_open_code, Some(LedgerErrorCode::Locked));
         ExecutionLedger::open_live(&path).unwrap();
     }
 
