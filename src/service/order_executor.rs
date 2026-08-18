@@ -205,7 +205,7 @@ impl OrderExecutor {
                 side = ?planned.side,
                 shares = planned.shares,
                 price = planned.limit_price,
-                "dry-run: order planned but not signed or submitted"
+                "dry-run: order planned without a signature or submission"
             );
             self.record_open_from_plan(&market, &planned);
             return Ok(ExecutionOutcome::DryRunPlanned(planned));

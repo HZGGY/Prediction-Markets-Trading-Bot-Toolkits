@@ -104,27 +104,9 @@ version = "1.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8421a5ee9019b6d89f92935d0f8facd9f6ca088b41d7cc47244a02ccde4545f"
 dependencies = [
- "alloy-dyn-abi 1.6.1",
+ "alloy-dyn-abi",
  "alloy-primitives 1.6.1",
  "alloy-sol-types 1.6.1",
-]
-
-[[package]]
-name = "alloy-dyn-abi"
-version = "0.8.26"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf69d3061e2e908a4370bda5d8d6529d5080232776975489eec0b49ce971027e"
-dependencies = [
- "alloy-json-abi 0.8.26",
- "alloy-primitives 0.8.26",
- "alloy-sol-type-parser 0.8.26",
- "alloy-sol-types 0.8.26",
- "const-hex",
- "derive_more",
- "itoa",
- "serde",
- "serde_json",
- "winnow 0.7.15",
 ]
 
 [[package]]
@@ -3348,16 +3330,13 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 name = "polymarket-toolkits"
 version = "0.1.0"
 dependencies = [
- "alloy-dyn-abi 0.8.26",
  "alloy-primitives 0.8.26",
- "alloy-primitives 1.6.1",
  "alloy-signer",
  "alloy-signer-local",
  "alloy-sol-types 0.8.26",
  "alloy-sol-types 1.6.1",
  "anyhow",
  "async-trait",
- "base64",
  "chrono",
  "clap",
  "crossterm",

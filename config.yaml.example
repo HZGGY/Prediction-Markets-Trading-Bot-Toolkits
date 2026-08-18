@@ -6,11 +6,11 @@ bot:
   # Your trading wallet private key — 64 hex chars, no 0x prefix.
   private_key: "0000000000000000000000000000000000000000000000000000000000000000"
 
-  # Phase 1 supports EOA accounts only. This must equal the address derived
+  # Current EOA-only SDK phases support EOA accounts only. This must equal the address derived
   # from private_key. Proxy, Safe, and POLY_1271 accounts are rejected.
   funder_address: "0x0000000000000000000000000000000000000000"
 
-  # Explicit Polymarket signature type. Only EOA (0) is supported in phase 1.
+  # Explicit Polymarket signature type. Only EOA (0) is supported in the current EOA-only SDK phases.
   signature_type: 0
 
   # Copy this example to config.yaml and fill the EOA fields before running

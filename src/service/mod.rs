@@ -5,14 +5,13 @@
 //! - [`market_cache`]     — slug ↔ CLOB token-id ↔ category/tags resolution
 //! - [`onchain`]          — Polygon WebSocket subscription
 //! - [`parse`]            — ABI log decoding for Polymarket exchange events
-//! - [`clob`]             — Polymarket CLOB v2 client: EIP-712 signing, order POST
+//! - [`clob_sdk_orders`]  — official Rust V2 SDK FOK order build/sign/L2/POST
 //! - [`order_executor`]   — applies sizing, eligibility, exposure, risk, and dispatch
 //! - [`eligibility`]      — allowlist/blocklist filter for slugs, categories, tags
 //! - [`position_store`]   — open-position tracking + exposure totals
 //! - [`midprice`]         — `/midpoint` HTTP client (trait, swappable)
-//! - [`position_monitor`] — TP/SL polling loop, posts exit FAKs through the CLOB
+//! - [`position_monitor`] — TP/SL polling loop, submits guarded FOK exits
 
-pub mod clob;
 pub mod clob_auth;
 pub mod clob_sdk_orders;
 pub mod eligibility;

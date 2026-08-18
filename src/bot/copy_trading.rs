@@ -14,15 +14,17 @@
 //!    via [`service::position_store`].
 //! 6. **Risk**: fast in-memory check, optional book/depth check
 //!    ([`service::risk_guard`]).
-//! 7. **Execute**: build EIP-712 signed CTF order, post via L2 auth
-//!    ([`service::clob`], [`service::order_executor`]).
+//! 7. **Execute**: the official Rust V2 SDK builds, signs, L2-authenticates,
+//!    and posts true FOK CTF orders through [`service::order_executor`] and
+//!    [`service::clob_sdk_orders`].
 //! 8. **TP/SL**: live-only background monitor polls midprice for every open
 //!    position and submits a guarded FOK exit when P&L crosses the configured
 //!    thresholds ([`service::position_monitor`]).
 //!
 //! Safety: `enable_trading=false` OR `mock_trading=true` keeps the executor
-//! in dry-run mode — the full pipeline runs but plans are recorded without
-//! SDK initialization, signing, CLOB requests, or TP/SL midpoint polling.
+//! in strict paper mode — the full pipeline records plans without SDK
+//! initialization, signing, any CLOB request (including midpoint), or TP/SL
+//! midpoint polling.
 
 use crate::config::AppConfig;
 use crate::service::{
@@ -153,7 +155,7 @@ async fn handle_log(executor: &OrderExecutor, whale: &str, log: &RawLog) -> Resu
             shares = planned.shares,
             usd = planned.usd_notional,
             price = planned.limit_price,
-            "dry-run order planned (not signed or submitted)"
+            "dry-run order planned (without a signature or submission)"
         ),
         ExecutionOutcome::NotSubmitted(error) => log_not_submitted(&error),
         ExecutionOutcome::Filled(receipt) => log_filled(&receipt),

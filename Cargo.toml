@@ -25,7 +25,6 @@ url = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
-base64 = "0.22"
 
 # Errors / logging
 anyhow = "1"
@@ -44,8 +43,6 @@ alloy-primitives = { version = "0.8", features = ["serde", "k256"] }
 alloy-sol-types = "0.8"
 alloy-signer = "=1.8.3"
 alloy-signer-local = "=1.8.3"
-alloy-primitives-v1 = { package = "alloy-primitives", version = "=1.6.1" }
-alloy-dyn-abi = { version = "0.8", features = ["eip712"] }
 hex = "0.4"
 
 # TUI
@@ -56,7 +53,7 @@ crossterm = "0.28"
 rand = "0.8"
 parking_lot = "0.12"
 
-# Official Polymarket V2 SDK — phase 1 uses only L1 CLOB authentication.
+# Official Polymarket V2 SDK — current EOA-only SDK phases own production order execution.
 polymarket_client_sdk_v2 = { version = "=0.6.0", default-features = false, features = ["clob"] }
 
 # Same-directory atomic persistence for the gitignored credentials YAML.

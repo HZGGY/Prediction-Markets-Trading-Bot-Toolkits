@@ -59,7 +59,7 @@ cargo run --release -- run copy-trading
 
 Every bot ships with `enable_trading: false` by default — the full execution path runs in dry-run until *you* flip it. Per-venue configs and walkthroughs live in each [venue repo](#venue-coverage).
 
-> **Local Polymarket CLOB V2 status (2026-08-17):** official Rust SDK L1 API-key creation/derivation and the existing raw V2 order path are available for EOA accounts only (`signature_type: 0`). Proxy, Safe, and POLY_1271 accounts are rejected. pUSD funding/approval and live order round-trips remain separate prerequisites; the default configuration stays in dry-run and must not be treated as live-trading approval.
+> **Local Polymarket CLOB V2 status (2026-08-18):** the official Rust V2 SDK 0.6 is the only local production path for order build, signing, L2 authentication, and POST. It is available for EOA accounts only (`signature_type: 0`); proxy, Safe, and POLY_1271 accounts are rejected. Copy entries and TP/SL exits are true FOK orders. The committed defaults remain strict paper mode and are not live-trading authorization.
 
 #### Explicit CLOB API credential commands
 
@@ -77,7 +77,9 @@ After copying `config.yaml.example` to an existing `config.yaml` and filling the
   auth derive-api-key
 ```
 
-These commands contact only `https://clob-v2.polymarket.com`. Create and derive are explicit and never silently fall back to each other. If `PM_PRIVATE_KEY` or `PM_FUNDER_ADDRESS` is set, its effective account must match the account already stored in the target YAML; otherwise the command stops before signing or networking. On success, only the three API credential fields in the existing YAML are atomically updated; terminal/log output shows only a redacted API-key summary. HTTP failures expose only safe status/method/path details, and a create conflict tells you to run `derive-api-key` explicitly. Obtaining credentials does not enable trading or disable mock mode. The tested SDK dependency graph is fixed by the tracked `Cargo.lock`. This development phase validated the flow with local loopback tests and did not execute either command against the real CLOB.
+These commands contact only `https://clob-v2.polymarket.com`. Create and derive are explicit and never silently fall back to each other. If `PM_PRIVATE_KEY` or `PM_FUNDER_ADDRESS` is set, its effective account must match the account already stored in the target YAML; otherwise the command stops before signing or networking. On success, only the three API credential fields in the existing YAML are atomically updated; terminal/log output shows only a redacted API-key summary. HTTP failures expose only safe status/method/path details, and a create conflict tells you to run `derive-api-key` explicitly. Obtaining credentials does not enable trading or disable mock mode. The tested SDK dependency graph is fixed by the tracked `Cargo.lock`. Phase 2 validated the flow with local loopback tests only and did not execute either command against the real CLOB.
+
+**Phase-2 execution boundary:** strict paper mode neither signs nor calls any CLOB endpoint, including midpoint. Only an exact fully matched SDK response updates local positions. Any uncertain result writes the persistent `execution-halt.json` marker, blocks every later entry and exit, and is never retried; do not delete that marker before external reconciliation. Phase 2 does not authorize live trading. Balance and allowance checks, reconciliation, cancellation, in-flight journaling, and controlled real-endpoint validation remain phase 3 work.
 
 </td>
 <td width="50%" valign="top">
@@ -122,7 +124,7 @@ A complete suite of ten production-grade trading bots, each engineered around a 
 
 | # | Strategy | Edge in one line | Key spec |
 |---|----------|------------------|----------|
-| 1 | 🎯 **Copy Trading** | Mirror wallets that already proved they have alpha | Multi-wallet · FAK/GTD · circuit breaker |
+| 1 | 🎯 **Copy Trading** | Mirror wallets that already proved they have alpha | Multi-wallet · true FOK · circuit breaker |
 | 2 | ⚡ **BTC 5m / 15m / 1hr Arbitrage** | Speed on short-window BTC Up/Down | ~42ms end-to-end · FAK |
 | 3 | 💰 **Cross-Market Arbitrage** | Lock the spread, not the direction | Polymarket ↔ Kalshi ↔ PredictIt · hedged legs |
 | 4 | 🎯 **Directional Arbitrage** | Arb base (Up + Down < $1), then tilt toward the side with more edge | Hedged base · limit-only |
@@ -138,7 +140,7 @@ A complete suite of ten production-grade trading bots, each engineered around a 
 
 <br/>
 
-**🎯 Copy Trading —** Point the bot at one or more wallets with a proven on-chain record. It mirrors their fills at your chosen scale, with per-wallet caps, FAK/GTD order types, and a circuit breaker that halts on abnormal bursts. Pair it with the [on-chain leaderboard](#-managed--copy-trading--early-access) to pick who to follow.
+**🎯 Copy Trading —** Point the bot at one or more wallets with a proven on-chain record. It mirrors their fills at your chosen scale, with per-wallet caps, true FOK order types, and a circuit breaker that halts on abnormal bursts. Pair it with the [on-chain leaderboard](#-managed--copy-trading--early-access) to pick who to follow.
 
 **💰 Cross-Market Arbitrage —** The same real-world question is often listed on Polymarket, Kalshi *and* PredictIt at slightly different prices. The engine matches the same contract across venues (strict matching — no fuzzy false pairs), and captures the gap **only when it beats round-trip fees**. Cross-listed markets are mostly efficient, so this is a patience game: it waits for a real dislocation instead of forcing trades.
 
