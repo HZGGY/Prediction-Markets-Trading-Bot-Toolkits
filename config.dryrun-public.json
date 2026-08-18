@@ -30,7 +30,8 @@
     "price_buffer": 0.005,
     "fee_rate_bps": 0,
     "order_expiration_secs": 60,
-    "execution_halt_path": "execution-halt.json"
+    "execution_halt_path": "execution-halt.json",
+    "execution_ledger_path": "execution-ledger.jsonl"
   },
   "risk": {
     "large_trade_shares": 1500.0,

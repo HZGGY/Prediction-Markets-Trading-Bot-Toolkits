@@ -99,6 +99,8 @@ pub struct TradingConfig {
     pub order_expiration_secs: u64,
     #[serde(default = "default_execution_halt_path")]
     pub execution_halt_path: PathBuf,
+    #[serde(default = "default_execution_ledger_path")]
+    pub execution_ledger_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -428,6 +430,10 @@ fn default_execution_halt_path() -> PathBuf {
     PathBuf::from("execution-halt.json")
 }
 
+fn default_execution_ledger_path() -> PathBuf {
+    PathBuf::from("execution-ledger.jsonl")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,6 +479,37 @@ mod tests {
             assert_eq!(
                 cfg.trading.execution_halt_path,
                 PathBuf::from("execution-halt.json")
+            );
+            assert!(!cfg.bot.enable_trading);
+            assert!(cfg.bot.mock_trading);
+        }
+    }
+
+    #[test]
+    fn execution_ledger_path_defaults_when_omitted() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(include_str!("../config.json")).unwrap();
+        value["trading"]
+            .as_object_mut()
+            .unwrap()
+            .remove("execution_ledger_path");
+        let cfg: AppConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            cfg.trading.execution_ledger_path,
+            PathBuf::from("execution-ledger.jsonl")
+        );
+    }
+
+    #[test]
+    fn committed_configs_pin_safe_ledger_and_trading_flags() {
+        for raw in [
+            include_str!("../config.json"),
+            include_str!("../config.dryrun-public.json"),
+        ] {
+            let cfg: AppConfig = serde_json::from_str(raw).unwrap();
+            assert_eq!(
+                cfg.trading.execution_ledger_path,
+                PathBuf::from("execution-ledger.jsonl")
             );
             assert!(!cfg.bot.enable_trading);
             assert!(cfg.bot.mock_trading);
