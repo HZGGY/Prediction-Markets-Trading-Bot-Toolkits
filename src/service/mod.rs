@@ -19,6 +19,7 @@ pub mod market_cache;
 pub mod midprice;
 pub mod onchain;
 pub mod order_executor;
+pub mod order_gateway;
 pub mod parse;
 pub mod position_monitor;
 pub mod position_store;
