@@ -827,6 +827,20 @@ impl<'de> Deserialize<'de> for LedgerEvent {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LedgerErrorCode {
+    Unavailable,
+    UnsafePath,
+    Locked,
+    TruncatedTail,
+    InvalidJson,
+    UnsupportedEventKind,
+    EventHashMismatch,
+    SerializationFailed,
+    AppendFailed,
+    FlushFailed,
+    SyncFailed,
+    PersistFailed,
+    DirectorySyncFailed,
+    Fatal,
     UnsupportedSchema,
     SequenceExhausted,
     SequenceMismatch,
@@ -842,6 +856,20 @@ pub enum LedgerErrorCode {
 impl fmt::Display for LedgerErrorCode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::Unavailable => "unavailable",
+            Self::UnsafePath => "unsafe_path",
+            Self::Locked => "locked",
+            Self::TruncatedTail => "truncated_tail",
+            Self::InvalidJson => "invalid_json",
+            Self::UnsupportedEventKind => "unsupported_event_kind",
+            Self::EventHashMismatch => "event_hash_mismatch",
+            Self::SerializationFailed => "serialization_failed",
+            Self::AppendFailed => "append_failed",
+            Self::FlushFailed => "flush_failed",
+            Self::SyncFailed => "sync_failed",
+            Self::PersistFailed => "persist_failed",
+            Self::DirectorySyncFailed => "directory_sync_failed",
+            Self::Fatal => "fatal",
             Self::UnsupportedSchema => "unsupported_schema",
             Self::SequenceExhausted => "sequence_exhausted",
             Self::SequenceMismatch => "sequence_mismatch",

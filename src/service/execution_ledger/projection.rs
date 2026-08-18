@@ -98,29 +98,91 @@ pub struct LedgerProjection {
     pub order_intents: HashMap<OrderId, IntentId>,
 }
 
+pub(crate) struct StagedProjection {
+    outcome: ApplyOutcome,
+    changes: ProjectionChanges,
+}
+
+#[derive(Default)]
+struct ProjectionChanges {
+    active: ActiveChange,
+    position: PositionChange,
+    identity: Option<(IntentId, OrderId)>,
+}
+
+#[derive(Default)]
+enum ActiveChange {
+    #[default]
+    Unchanged,
+    Set(Box<ActiveIntent>),
+    Clear,
+}
+
+#[derive(Default)]
+enum PositionChange {
+    #[default]
+    Unchanged,
+    Upsert(Box<DurablePosition>),
+}
+
 impl LedgerProjection {
     pub fn apply(&mut self, event: &LedgerEvent) -> Result<ApplyOutcome, LedgerError> {
         self.validate_and_apply(event)
     }
 
     pub fn validate_and_apply(&mut self, event: &LedgerEvent) -> Result<ApplyOutcome, LedgerError> {
+        let staged = self.stage_next(event)?;
+        let outcome = staged.outcome;
+        self.publish_staged(event, staged);
+        Ok(outcome)
+    }
+
+    pub(crate) fn stage_next(&self, event: &LedgerEvent) -> Result<StagedProjection, LedgerError> {
         if event.schema_version != LEDGER_SCHEMA_VERSION {
             return Err(LedgerError::new(LedgerErrorCode::UnsupportedSchema));
         }
         if let Some(existing_event) = self.event_ids.get(&event.event_id) {
             return if existing_event == event {
-                Ok(ApplyOutcome::AlreadyApplied)
+                Ok(StagedProjection {
+                    outcome: ApplyOutcome::AlreadyApplied,
+                    changes: ProjectionChanges::default(),
+                })
             } else {
                 Err(LedgerError::new(LedgerErrorCode::IdempotencyConflict))
             };
         }
 
         self.validate_envelope(event)?;
-        self.apply_payload(event)?;
+        let changes = self.stage_payload(event)?;
+        Ok(StagedProjection {
+            outcome: ApplyOutcome::Applied,
+            changes,
+        })
+    }
+
+    pub(crate) fn publish_staged(&mut self, event: &LedgerEvent, staged: StagedProjection) {
+        if staged.outcome == ApplyOutcome::AlreadyApplied {
+            return;
+        }
+
+        if let Some((intent_id, order_id)) = staged.changes.identity {
+            self.intent_orders.insert(intent_id, order_id.clone());
+            self.order_intents.insert(order_id, intent_id);
+        }
+        match staged.changes.position {
+            PositionChange::Unchanged => {}
+            PositionChange::Upsert(position) => {
+                self.positions.insert(position.position_id, *position);
+            }
+        }
+        match staged.changes.active {
+            ActiveChange::Unchanged => {}
+            ActiveChange::Set(active) => self.active = Some(*active),
+            ActiveChange::Clear => self.active = None,
+        }
         self.sequence = event.sequence;
         self.head_hash = event.event_hash.clone();
         self.event_ids.insert(event.event_id, event.clone());
-        Ok(ApplyOutcome::Applied)
     }
 
     fn validate_envelope(&self, event: &LedgerEvent) -> Result<(), LedgerError> {
@@ -140,103 +202,114 @@ impl LedgerProjection {
         Ok(())
     }
 
-    fn apply_payload(&mut self, event: &LedgerEvent) -> Result<(), LedgerError> {
+    fn stage_payload(&self, event: &LedgerEvent) -> Result<ProjectionChanges, LedgerError> {
         match &event.payload {
-            LedgerPayload::IntentPrepared(prepared) => self.prepare(event.intent_id, prepared),
-            LedgerPayload::SubmitStarted => self.transition(
+            LedgerPayload::IntentPrepared(prepared) => {
+                self.stage_prepare(event.intent_id, prepared)
+            }
+            LedgerPayload::SubmitStarted => self.stage_transition(
                 event.intent_id,
                 ActiveIntentState::NotSent,
                 ActiveIntentState::SubmitStarted,
             ),
             LedgerPayload::RemoteMatched(amounts) => {
                 self.validate_match(event.intent_id, *amounts)?;
-                let active = self.active_mut(event.intent_id)?;
+                let mut active = self.active_for(event.intent_id)?.clone();
                 if active.state != ActiveIntentState::SubmitStarted {
                     return Err(LedgerError::new(LedgerErrorCode::IllegalTransition));
                 }
                 active.state = ActiveIntentState::RemoteMatched;
                 active.evidence = ActiveEvidence::RemoteMatched(*amounts);
                 active.durable_remote_outcome = Some(DurableRemoteOutcome::Matched(*amounts));
-                Ok(())
+                Ok(Self::active_changes(active))
             }
             LedgerPayload::RemoteRejected { code } => {
-                let active = self.active_mut(event.intent_id)?;
+                let mut active = self.active_for(event.intent_id)?.clone();
                 if active.state != ActiveIntentState::SubmitStarted {
                     return Err(LedgerError::new(LedgerErrorCode::IllegalTransition));
                 }
                 active.state = ActiveIntentState::RemoteRejected;
                 active.evidence = ActiveEvidence::RemoteRejected(*code);
                 active.durable_remote_outcome = Some(DurableRemoteOutcome::Rejected(*code));
-                Ok(())
+                Ok(Self::active_changes(active))
             }
             LedgerPayload::RemoteUncertain { code } => {
-                self.transition(
+                let mut changes = self.stage_transition(
                     event.intent_id,
                     ActiveIntentState::SubmitStarted,
                     ActiveIntentState::RemoteUncertain,
                 )?;
-                self.active_mut(event.intent_id)?.evidence = ActiveEvidence::RemoteUncertain(*code);
-                Ok(())
+                let ActiveChange::Set(active) = &mut changes.active else {
+                    unreachable!("transition always stages active state")
+                };
+                active.evidence = ActiveEvidence::RemoteUncertain(*code);
+                Ok(changes)
             }
             LedgerPayload::SubmissionCommitted => {
-                self.clear_normal(event.intent_id, ActiveIntentState::PositionRecorded)
+                self.stage_clear_normal(event.intent_id, ActiveIntentState::PositionRecorded)
             }
             LedgerPayload::SubmissionCommittedNoFill => {
-                self.clear_normal(event.intent_id, ActiveIntentState::RemoteRejected)
+                self.stage_clear_normal(event.intent_id, ActiveIntentState::RemoteRejected)
             }
-            LedgerPayload::PositionOpened(position) => self.open_position(event, position),
-            LedgerPayload::PositionClosed(close) => self.close_position(event, close),
-            LedgerPayload::ReconciliationStarted => self.start_reconciliation(event.intent_id),
+            LedgerPayload::PositionOpened(position) => self.stage_open_position(event, position),
+            LedgerPayload::PositionClosed(close) => self.stage_close_position(event, close),
+            LedgerPayload::ReconciliationStarted => {
+                self.stage_start_reconciliation(event.intent_id)
+            }
             LedgerPayload::ReconciledMatched(amounts) => {
-                self.classify_matched(event.intent_id, *amounts)
+                self.stage_classify_matched(event.intent_id, *amounts)
             }
-            LedgerPayload::ReconciledNoFill { status } => self.classify_without_position(
+            LedgerPayload::ReconciledNoFill { status } => self.stage_classify_without_position(
                 event.intent_id,
                 ActiveIntentState::ReconciledNoFill,
                 ActiveEvidence::ReconciledNoFill(*status),
             ),
-            LedgerPayload::ReconciledLive => self.classify_without_position(
+            LedgerPayload::ReconciledLive => self.stage_classify_without_position(
                 event.intent_id,
                 ActiveIntentState::ReconciledLive,
                 ActiveEvidence::ReconciledLive,
             ),
-            LedgerPayload::ReconciledPending => self.classify_without_position(
+            LedgerPayload::ReconciledPending => self.stage_classify_without_position(
                 event.intent_id,
                 ActiveIntentState::ReconciledPending,
                 ActiveEvidence::ReconciledPending,
             ),
-            LedgerPayload::ReconciledUncertain { code } => self.classify_without_position(
+            LedgerPayload::ReconciledUncertain { code } => self.stage_classify_without_position(
                 event.intent_id,
                 ActiveIntentState::ReconciledUncertain,
                 ActiveEvidence::ReconciledUncertain(*code),
             ),
-            LedgerPayload::CancelStarted => self.transition(
+            LedgerPayload::CancelStarted => self.stage_transition(
                 event.intent_id,
                 ActiveIntentState::ReconciledLive,
                 ActiveIntentState::CancelStarted,
             ),
             LedgerPayload::CancelResponseObserved { result } => {
-                self.transition(
+                let mut changes = self.stage_transition(
                     event.intent_id,
                     ActiveIntentState::CancelStarted,
                     ActiveIntentState::CancelResponseObserved,
                 )?;
-                self.active_mut(event.intent_id)?.evidence =
-                    ActiveEvidence::CancelResponseObserved(*result);
-                Ok(())
+                let ActiveChange::Set(active) = &mut changes.active else {
+                    unreachable!("transition always stages active state")
+                };
+                active.evidence = ActiveEvidence::CancelResponseObserved(*result);
+                Ok(changes)
             }
             LedgerPayload::RecoveryApplied { position_event_id } => {
-                self.apply_recovery(event.intent_id, *position_event_id)
+                self.stage_apply_recovery(event.intent_id, *position_event_id)
             }
-            LedgerPayload::Acknowledged { reason } => self.acknowledge(event.intent_id, *reason),
+            LedgerPayload::Acknowledged { reason } => {
+                self.stage_acknowledge(event.intent_id, *reason)
+            }
         }
     }
 
-    fn prepare(
-        &mut self,
+    fn stage_prepare(
+        &self,
         intent_id: IntentId,
         prepared: &PreparedIntent,
-    ) -> Result<(), LedgerError> {
+    ) -> Result<ProjectionChanges, LedgerError> {
         if self.intent_orders.contains_key(&intent_id)
             || self.order_intents.contains_key(&prepared.order_id)
         {
@@ -251,7 +324,7 @@ impl LedgerProjection {
             return Err(LedgerError::new(LedgerErrorCode::IllegalTransition));
         }
 
-        match prepared.purpose {
+        match &prepared.purpose {
             IntentPurpose::Entry(_) => {
                 if self
                     .positions
@@ -264,7 +337,7 @@ impl LedgerProjection {
             IntentPurpose::Exit { position_id } => {
                 let position = self
                     .positions
-                    .get(&position_id)
+                    .get(position_id)
                     .ok_or_else(|| LedgerError::new(LedgerErrorCode::IllegalTransition))?;
                 let expected_shares = match prepared.side {
                     OrderSide::Buy => prepared.expected_taker_micros,
@@ -282,26 +355,25 @@ impl LedgerProjection {
             }
         }
 
-        self.intent_orders
-            .insert(intent_id, prepared.order_id.clone());
-        self.order_intents
-            .insert(prepared.order_id.clone(), intent_id);
-        self.active = Some(ActiveIntent {
-            intent_id,
-            prepared: prepared.clone(),
-            state: ActiveIntentState::NotSent,
-            position_event_id: None,
-            evidence: ActiveEvidence::None,
-            reconciliation_origin: None,
-            durable_remote_outcome: None,
-        });
-        Ok(())
+        Ok(ProjectionChanges {
+            active: ActiveChange::Set(Box::new(ActiveIntent {
+                intent_id,
+                prepared: prepared.clone(),
+                state: ActiveIntentState::NotSent,
+                position_event_id: None,
+                evidence: ActiveEvidence::None,
+                reconciliation_origin: None,
+                durable_remote_outcome: None,
+            })),
+            identity: Some((intent_id, prepared.order_id.clone())),
+            ..ProjectionChanges::default()
+        })
     }
 
-    fn active_mut(&mut self, intent_id: IntentId) -> Result<&mut ActiveIntent, LedgerError> {
+    fn active_for(&self, intent_id: IntentId) -> Result<&ActiveIntent, LedgerError> {
         let active = self
             .active
-            .as_mut()
+            .as_ref()
             .ok_or_else(|| LedgerError::new(LedgerErrorCode::IllegalTransition))?;
         if active.intent_id != intent_id {
             return Err(LedgerError::new(LedgerErrorCode::IntentMismatch));
@@ -309,31 +381,33 @@ impl LedgerProjection {
         Ok(active)
     }
 
-    fn transition(
-        &mut self,
+    fn stage_transition(
+        &self,
         intent_id: IntentId,
         from: ActiveIntentState,
         to: ActiveIntentState,
-    ) -> Result<(), LedgerError> {
-        let active = self.active_mut(intent_id)?;
+    ) -> Result<ProjectionChanges, LedgerError> {
+        let mut active = self.active_for(intent_id)?.clone();
         if active.state != from {
             return Err(LedgerError::new(LedgerErrorCode::IllegalTransition));
         }
         active.state = to;
-        Ok(())
+        Ok(Self::active_changes(active))
     }
 
-    fn clear_normal(
-        &mut self,
+    fn stage_clear_normal(
+        &self,
         intent_id: IntentId,
         expected: ActiveIntentState,
-    ) -> Result<(), LedgerError> {
-        let active = self.active_mut(intent_id)?;
+    ) -> Result<ProjectionChanges, LedgerError> {
+        let active = self.active_for(intent_id)?;
         if active.state != expected {
             return Err(LedgerError::new(LedgerErrorCode::IllegalTransition));
         }
-        self.active = None;
-        Ok(())
+        Ok(ProjectionChanges {
+            active: ActiveChange::Clear,
+            ..ProjectionChanges::default()
+        })
     }
 
     fn validate_match(
@@ -364,12 +438,12 @@ impl LedgerProjection {
         Ok(())
     }
 
-    fn open_position(
-        &mut self,
+    fn stage_open_position(
+        &self,
         event: &LedgerEvent,
         position: &DurablePosition,
-    ) -> Result<(), LedgerError> {
-        let active = self.active_mut(event.intent_id)?.clone();
+    ) -> Result<ProjectionChanges, LedgerError> {
+        let mut active = self.active_for(event.intent_id)?.clone();
         if !matches!(
             active.state,
             ActiveIntentState::RemoteMatched | ActiveIntentState::ReconciledMatched
@@ -408,24 +482,25 @@ impl LedgerProjection {
         {
             return Err(LedgerError::new(LedgerErrorCode::PositionConflict));
         }
-        self.positions
-            .insert(position.position_id, position.clone());
-        let active = self.active_mut(event.intent_id)?;
         active.state = if active.state == ActiveIntentState::RemoteMatched {
             ActiveIntentState::PositionRecorded
         } else {
             ActiveIntentState::RecoveryPositionRecorded
         };
         active.position_event_id = Some(event.event_id);
-        Ok(())
+        Ok(ProjectionChanges {
+            active: ActiveChange::Set(Box::new(active)),
+            position: PositionChange::Upsert(Box::new(position.clone())),
+            ..ProjectionChanges::default()
+        })
     }
 
-    fn close_position(
-        &mut self,
+    fn stage_close_position(
+        &self,
         event: &LedgerEvent,
         close: &PositionClose,
-    ) -> Result<(), LedgerError> {
-        let active = self.active_mut(event.intent_id)?.clone();
+    ) -> Result<ProjectionChanges, LedgerError> {
+        let mut active = self.active_for(event.intent_id)?.clone();
         if !matches!(
             active.state,
             ActiveIntentState::RemoteMatched | ActiveIntentState::ReconciledMatched
@@ -446,9 +521,10 @@ impl LedgerProjection {
         {
             return Err(LedgerError::new(LedgerErrorCode::PositionConflict));
         }
-        let position = self
+        let mut position = self
             .positions
-            .get_mut(&position_id)
+            .get(&position_id)
+            .cloned()
             .ok_or_else(|| LedgerError::new(LedgerErrorCode::PositionConflict))?;
         if !position.is_open()
             || position.token_id != active.prepared.token_id
@@ -461,18 +537,24 @@ impl LedgerProjection {
         position.closing_shares_micros = Some(close.shares_micros);
         position.closing_usd_micros = Some(close.usd_micros);
         position.closed_at = Some(close.closed_at);
-        let active = self.active_mut(event.intent_id)?;
         active.state = if active.state == ActiveIntentState::RemoteMatched {
             ActiveIntentState::PositionRecorded
         } else {
             ActiveIntentState::RecoveryPositionRecorded
         };
         active.position_event_id = Some(event.event_id);
-        Ok(())
+        Ok(ProjectionChanges {
+            active: ActiveChange::Set(Box::new(active)),
+            position: PositionChange::Upsert(Box::new(position)),
+            ..ProjectionChanges::default()
+        })
     }
 
-    fn start_reconciliation(&mut self, intent_id: IntentId) -> Result<(), LedgerError> {
-        let active = self.active_mut(intent_id)?;
+    fn stage_start_reconciliation(
+        &self,
+        intent_id: IntentId,
+    ) -> Result<ProjectionChanges, LedgerError> {
+        let mut active = self.active_for(intent_id)?.clone();
         let origin = match active.state {
             ActiveIntentState::SubmitStarted => ReconciliationOrigin::SubmitStarted,
             ActiveIntentState::RemoteMatched => ReconciliationOrigin::RemoteMatched,
@@ -490,15 +572,15 @@ impl LedgerProjection {
         };
         active.state = ActiveIntentState::ReconciliationStarted;
         active.reconciliation_origin = Some(origin);
-        Ok(())
+        Ok(Self::active_changes(active))
     }
 
-    fn classify_matched(
-        &mut self,
+    fn stage_classify_matched(
+        &self,
         intent_id: IntentId,
         amounts: MatchedAmounts,
-    ) -> Result<(), LedgerError> {
-        let active = self.active_mut(intent_id)?;
+    ) -> Result<ProjectionChanges, LedgerError> {
+        let active = self.active_for(intent_id)?;
         if active.state != ActiveIntentState::ReconciliationStarted {
             return Err(LedgerError::new(LedgerErrorCode::IllegalTransition));
         }
@@ -509,19 +591,19 @@ impl LedgerProjection {
             return Err(LedgerError::new(LedgerErrorCode::EvidenceConflict));
         }
         self.validate_match(intent_id, amounts)?;
-        let active = self.active_mut(intent_id)?;
+        let mut active = active.clone();
         active.state = ActiveIntentState::ReconciledMatched;
         active.evidence = ActiveEvidence::ReconciledMatched(amounts);
-        Ok(())
+        Ok(Self::active_changes(active))
     }
 
-    fn classify_without_position(
-        &mut self,
+    fn stage_classify_without_position(
+        &self,
         intent_id: IntentId,
         classification: ActiveIntentState,
         evidence: ActiveEvidence,
-    ) -> Result<(), LedgerError> {
-        let active = self.active_mut(intent_id)?;
+    ) -> Result<ProjectionChanges, LedgerError> {
+        let mut active = self.active_for(intent_id)?.clone();
         if active.state != ActiveIntentState::ReconciliationStarted
             || (active.position_event_id.is_some()
                 && classification != ActiveIntentState::ReconciledUncertain)
@@ -543,15 +625,15 @@ impl LedgerProjection {
         }
         active.state = classification;
         active.evidence = evidence;
-        Ok(())
+        Ok(Self::active_changes(active))
     }
 
-    fn apply_recovery(
-        &mut self,
+    fn stage_apply_recovery(
+        &self,
         intent_id: IntentId,
         position_event_id: EventId,
-    ) -> Result<(), LedgerError> {
-        let active = self.active_mut(intent_id)?;
+    ) -> Result<ProjectionChanges, LedgerError> {
+        let mut active = self.active_for(intent_id)?.clone();
         if !matches!(
             active.state,
             ActiveIntentState::RecoveryPositionRecorded | ActiveIntentState::ReconciledMatched
@@ -561,15 +643,15 @@ impl LedgerProjection {
         }
         active.state = ActiveIntentState::RecoveryApplied;
         active.evidence = ActiveEvidence::RecoveryApplied(position_event_id);
-        Ok(())
+        Ok(Self::active_changes(active))
     }
 
-    fn acknowledge(
-        &mut self,
+    fn stage_acknowledge(
+        &self,
         intent_id: IntentId,
         reason: AcknowledgeReason,
-    ) -> Result<(), LedgerError> {
-        let active = self.active_mut(intent_id)?;
+    ) -> Result<ProjectionChanges, LedgerError> {
+        let active = self.active_for(intent_id)?;
         let allowed = matches!(
             (active.state, reason),
             (ActiveIntentState::NotSent, AcknowledgeReason::NotSent)
@@ -585,8 +667,17 @@ impl LedgerProjection {
         if !allowed {
             return Err(LedgerError::new(LedgerErrorCode::IllegalTransition));
         }
-        self.active = None;
-        Ok(())
+        Ok(ProjectionChanges {
+            active: ActiveChange::Clear,
+            ..ProjectionChanges::default()
+        })
+    }
+
+    fn active_changes(active: ActiveIntent) -> ProjectionChanges {
+        ProjectionChanges {
+            active: ActiveChange::Set(Box::new(active)),
+            ..ProjectionChanges::default()
+        }
     }
 }
 
