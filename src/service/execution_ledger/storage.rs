@@ -2,19 +2,21 @@ use std::{
     fmt,
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
-    ops::Deref,
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
 
 use chrono::{DateTime, Utc};
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::Mutex;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
-use super::{model::*, projection::LedgerProjection};
+use super::{
+    model::*,
+    projection::{LedgerProjection, LedgerProjectionSnapshot},
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AppendOutcome {
@@ -113,18 +115,6 @@ struct LedgerState {
     fatal: bool,
 }
 
-pub struct LedgerProjectionGuard<'a> {
-    guard: MutexGuard<'a, LedgerState>,
-}
-
-impl Deref for LedgerProjectionGuard<'_> {
-    type Target = LedgerProjection;
-
-    fn deref(&self) -> &Self::Target {
-        &self.guard.projection
-    }
-}
-
 impl ExecutionLedger {
     pub fn open_live(path: impl AsRef<Path>) -> Result<Self, LedgerError> {
         Self::open_with_ops(path.as_ref(), Arc::new(SystemDurabilityOps))
@@ -140,16 +130,24 @@ impl ExecutionLedger {
 
     fn open_with_ops(path: &Path, durability: Arc<dyn DurabilityOps>) -> Result<Self, LedgerError> {
         let paths = LedgerPaths::derive(path)?;
-        let lock_file = open_restrictive(&paths.lock, true)?;
-        reject_existing_target(&paths.lock)?;
+        let OpenedFile {
+            file: lock_file, ..
+        } = open_restrictive(&paths.lock, true)?;
         lock_file
             .try_lock()
             .map_err(|_| LedgerError::new(LedgerErrorCode::Locked))?;
 
         run_durability_probe(&paths, durability.as_ref())?;
 
-        let mut file = open_restrictive(&paths.ledger, true)?;
-        reject_existing_target(&paths.ledger)?;
+        let OpenedFile { mut file, created } = open_restrictive(&paths.ledger, true)?;
+        if created {
+            durability
+                .sync_file(&file)
+                .map_err(|_| LedgerError::new(LedgerErrorCode::SyncFailed))?;
+            durability
+                .sync_directory(&paths.parent)
+                .map_err(|_| LedgerError::new(LedgerErrorCode::DirectorySyncFailed))?;
+        }
         let projection = replay(&mut file)?;
         file.seek(SeekFrom::End(0))
             .map_err(|_| LedgerError::new(LedgerErrorCode::Unavailable))?;
@@ -213,10 +211,8 @@ impl ExecutionLedger {
         Ok(AppendOutcome::Appended(event))
     }
 
-    pub fn projection(&self) -> LedgerProjectionGuard<'_> {
-        LedgerProjectionGuard {
-            guard: self.state.lock(),
-        }
+    pub fn projection(&self) -> LedgerProjectionSnapshot {
+        self.state.lock().projection.snapshot()
     }
 }
 
@@ -337,17 +333,149 @@ fn metadata_is_reparse_point(_metadata: &fs::Metadata) -> bool {
     false
 }
 
-fn open_restrictive(path: &Path, append: bool) -> Result<File, LedgerError> {
+#[derive(Debug)]
+struct OpenedFile {
+    file: File,
+    created: bool,
+}
+
+fn open_restrictive(path: &Path, append: bool) -> Result<OpenedFile, LedgerError> {
+    let mut create_options = restrictive_open_options(append)?;
+    create_options.create_new(true);
+    match create_options.open(path) {
+        Ok(file) => {
+            validate_opened_target(&file, path)?;
+            return Ok(OpenedFile {
+                file,
+                created: true,
+            });
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(classify_open_error(path, error)),
+    }
+
+    let file = restrictive_open_options(append)?
+        .open(path)
+        .map_err(|error| classify_open_error(path, error))?;
+    validate_opened_target(&file, path)?;
+    Ok(OpenedFile {
+        file,
+        created: false,
+    })
+}
+
+fn restrictive_open_options(append: bool) -> Result<OpenOptions, LedgerError> {
     let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true).append(append);
+    options.read(true).write(true).append(append);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(0o600).custom_flags(unix_no_follow_flag()?);
     }
-    options
-        .open(path)
-        .map_err(|_| LedgerError::new(LedgerErrorCode::Unavailable))
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_WRITE: u32 = 0x2;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    #[cfg(not(any(unix, windows)))]
+    return Err(LedgerError::new(LedgerErrorCode::UnsafePath));
+
+    Ok(options)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn unix_no_follow_flag() -> Result<i32, LedgerError> {
+    Ok(0o400_000)
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+fn unix_no_follow_flag() -> Result<i32, LedgerError> {
+    Ok(0x100)
+}
+
+#[cfg(any(target_os = "solaris", target_os = "illumos"))]
+fn unix_no_follow_flag() -> Result<i32, LedgerError> {
+    Ok(0x20_000)
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "solaris",
+        target_os = "illumos"
+    ))
+))]
+fn unix_no_follow_flag() -> Result<i32, LedgerError> {
+    Err(LedgerError::new(LedgerErrorCode::UnsafePath))
+}
+
+fn classify_open_error(path: &Path, _error: io::Error) -> LedgerError {
+    if fs::symlink_metadata(path)
+        .map(|metadata| reject_metadata(&metadata).is_err())
+        .unwrap_or(false)
+    {
+        LedgerError::new(LedgerErrorCode::UnsafePath)
+    } else {
+        LedgerError::new(LedgerErrorCode::Unavailable)
+    }
+}
+
+fn validate_opened_target(file: &File, path: &Path) -> Result<(), LedgerError> {
+    let opened = file
+        .metadata()
+        .map_err(|_| LedgerError::new(LedgerErrorCode::UnsafePath))?;
+    let named =
+        fs::symlink_metadata(path).map_err(|_| LedgerError::new(LedgerErrorCode::UnsafePath))?;
+    reject_metadata(&opened)?;
+    reject_metadata(&named)?;
+    if !opened.is_file() || !named.is_file() {
+        return Err(LedgerError::new(LedgerErrorCode::UnsafePath));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if opened.dev() != named.dev() || opened.ino() != named.ino() {
+            return Err(LedgerError::new(LedgerErrorCode::UnsafePath));
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        // Denying FILE_SHARE_DELETE keeps this directory entry bound to the
+        // handle. Stable std does not yet expose Windows file IDs, so compare
+        // the stable handle/path fields and fail closed on any mismatch.
+        if opened.file_attributes() != named.file_attributes()
+            || opened.creation_time() != named.creation_time()
+            || opened.file_size() != named.file_size()
+        {
+            return Err(LedgerError::new(LedgerErrorCode::UnsafePath));
+        }
+    }
+    Ok(())
 }
 
 fn run_durability_probe(
@@ -437,7 +565,10 @@ mod tests {
         io::{self, Write},
         path::{Path, PathBuf},
         process::{Child, Command},
-        sync::{Arc, Barrier},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Barrier,
+        },
         thread,
         time::{Duration, Instant},
     };
@@ -456,6 +587,7 @@ mod tests {
     const CHILD_LEDGER_ENV: &str = "POLYMARKET_LEDGER_LOCK_CHILD_PATH";
     const CHILD_READY_ENV: &str = "POLYMARKET_LEDGER_LOCK_CHILD_READY";
     const CHILD_RELEASE_ENV: &str = "POLYMARKET_LEDGER_LOCK_CHILD_RELEASE";
+    const CHILD_PROJECTION_ENV: &str = "POLYMARKET_LEDGER_PROJECTION_CHILD_PATH";
 
     fn intent_id(value: u128) -> IntentId {
         IntentId(Uuid::from_u128(value))
@@ -568,7 +700,7 @@ mod tests {
         let projection = reopened.projection();
         assert_eq!(projection.sequence, 2);
         assert_eq!(projection.head_hash, second.event_hash);
-        assert_eq!(projection.event_ids.len(), 2);
+        assert_eq!(projection.event_count, 2);
     }
 
     #[test]
@@ -606,7 +738,7 @@ mod tests {
         drop(ledger);
 
         let reopened = ExecutionLedger::open_live(&path).unwrap();
-        assert_eq!(reopened.projection().event_ids.len(), 2);
+        assert_eq!(reopened.projection().event_count, 2);
     }
 
     #[test]
@@ -840,6 +972,34 @@ mod tests {
     }
 
     #[test]
+    fn restrictive_open_does_not_follow_a_swapped_symlink_target_where_supported() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside.jsonl");
+        let path = dir.path().join("execution-ledger.jsonl");
+        fs::write(&outside, b"").unwrap();
+        if create_file_symlink(&outside, &path).is_err() {
+            return;
+        }
+
+        let error = open_restrictive(&path, true).unwrap_err();
+        assert_eq!(error.code(), LedgerErrorCode::UnsafePath);
+        assert_eq!(fs::read(&outside).unwrap(), b"");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn opened_windows_handle_denies_path_replacement_for_its_lifetime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("execution-ledger.jsonl");
+        fs::write(&path, b"").unwrap();
+
+        let opened = open_restrictive(&path, true).unwrap();
+        assert!(fs::remove_file(&path).is_err());
+        drop(opened);
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
     fn derived_lock_symlink_is_rejected_where_supported() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("execution-ledger.jsonl");
@@ -973,6 +1133,50 @@ mod tests {
     }
 
     #[test]
+    fn fresh_ledger_file_sync_failure_is_typed_and_releases_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("execution-ledger.jsonl");
+        let ops = Arc::new(FailingDurabilityOps::new(FailurePoint::Sync));
+
+        assert_eq!(
+            ExecutionLedger::open_live_with_ops(&path, ops)
+                .unwrap_err()
+                .code(),
+            LedgerErrorCode::SyncFailed
+        );
+        assert_eq!(
+            ExecutionLedger::open_live(&path)
+                .unwrap()
+                .projection()
+                .sequence,
+            0
+        );
+    }
+
+    #[test]
+    fn fresh_ledger_parent_sync_failure_is_typed_and_releases_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("execution-ledger.jsonl");
+        let ops = Arc::new(FailingDurabilityOps::new(FailurePoint::DirectorySyncCall(
+            2,
+        )));
+
+        assert_eq!(
+            ExecutionLedger::open_live_with_ops(&path, ops)
+                .unwrap_err()
+                .code(),
+            LedgerErrorCode::DirectorySyncFailed
+        );
+        assert_eq!(
+            ExecutionLedger::open_live(&path)
+                .unwrap()
+                .projection()
+                .sequence,
+            0
+        );
+    }
+
+    #[test]
     fn durability_probe_persist_failure_is_typed_and_releases_lock() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("execution-ledger.jsonl");
@@ -1017,9 +1221,55 @@ mod tests {
         ledger.append(intent_id(30), prepared_payload()).unwrap();
     }
 
+    #[test]
+    fn projection_read_is_owned_and_does_not_block_a_later_append() {
+        if env::var_os(CHILD_PROJECTION_ENV).is_some() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("execution-ledger.jsonl");
+        let mut child = Command::new(env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("service::execution_ledger::storage::tests::projection_read_append_child_process")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(CHILD_PROJECTION_ENV, &path)
+            .spawn()
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("projection read retained the ledger mutex across append");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn projection_read_append_child_process() {
+        let Some(path) = env::var_os(CHILD_PROJECTION_ENV).map(PathBuf::from) else {
+            return;
+        };
+
+        let ledger = ExecutionLedger::open_live(path).unwrap();
+        let before = ledger.projection();
+        ledger.append(intent_id(31), prepared_payload()).unwrap();
+        assert_eq!(before.sequence, 0);
+        assert_eq!(ledger.projection().sequence, 1);
+    }
+
     fn assert_complete_line_failure_is_poisoned(point: FailurePoint, code: LedgerErrorCode) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("execution-ledger.jsonl");
+        fs::write(&path, b"").unwrap();
         let ops = Arc::new(FailingDurabilityOps::new(point));
         let ledger = ExecutionLedger::open_live_with_ops(&path, ops).unwrap();
 
@@ -1100,15 +1350,20 @@ mod tests {
         Sync,
         Persist,
         DirectorySync,
+        DirectorySyncCall(usize),
     }
 
     struct FailingDurabilityOps {
         point: FailurePoint,
+        directory_sync_calls: AtomicUsize,
     }
 
     impl FailingDurabilityOps {
         fn new(point: FailurePoint) -> Self {
-            Self { point }
+            Self {
+                point,
+                directory_sync_calls: AtomicUsize::new(0),
+            }
         }
     }
 
@@ -1145,7 +1400,10 @@ mod tests {
         }
 
         fn sync_directory(&self, path: &Path) -> io::Result<()> {
-            if matches!(self.point, FailurePoint::DirectorySync) {
+            let call = self.directory_sync_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if matches!(self.point, FailurePoint::DirectorySync)
+                || matches!(self.point, FailurePoint::DirectorySyncCall(expected) if call == expected)
+            {
                 return Err(io::Error::other("injected directory sync"));
             }
             sync_directory_supported(path)

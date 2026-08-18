@@ -98,6 +98,19 @@ pub struct LedgerProjection {
     pub order_intents: HashMap<OrderId, IntentId>,
 }
 
+/// Owned read state for orchestration that must not retain the ledger mutex.
+///
+/// Event and identity indexes remain internal to the live projection; exposing
+/// only their count avoids cloning replay history for ordinary reads.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LedgerProjectionSnapshot {
+    pub sequence: u64,
+    pub head_hash: EventHash,
+    pub active: Option<ActiveIntent>,
+    pub positions: HashMap<PositionId, DurablePosition>,
+    pub event_count: usize,
+}
+
 pub(crate) struct StagedProjection {
     outcome: ApplyOutcome,
     changes: ProjectionChanges,
@@ -126,6 +139,16 @@ enum PositionChange {
 }
 
 impl LedgerProjection {
+    pub(crate) fn snapshot(&self) -> LedgerProjectionSnapshot {
+        LedgerProjectionSnapshot {
+            sequence: self.sequence,
+            head_hash: self.head_hash.clone(),
+            active: self.active.clone(),
+            positions: self.positions.clone(),
+            event_count: self.event_ids.len(),
+        }
+    }
+
     pub fn apply(&mut self, event: &LedgerEvent) -> Result<ApplyOutcome, LedgerError> {
         self.validate_and_apply(event)
     }
