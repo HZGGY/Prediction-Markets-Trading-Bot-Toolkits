@@ -9,20 +9,23 @@ use std::sync::Arc;
 
 use crate::config::AppConfig;
 use crate::models::{OrderType, PlannedOrder, Side, WhaleTrade};
-use crate::service::clob::{ClobClient, SignedOrder};
+use crate::service::clob_sdk_orders::SdkOrderGateway;
 use crate::service::eligibility::{self, Eligibility};
+use crate::service::execution_circuit_breaker::ExecutionCircuitBreaker;
 use crate::service::market_cache::{MarketCache, MarketInfo};
+use crate::service::order_gateway::{OrderGateway, OrderReceipt, OrderSubmitError};
 use crate::service::position_store::{OpenPosition, PositionStore};
 use crate::service::risk_guard::{BlockReason, RiskCheck, RiskGuard};
 use crate::service::strategy;
 use crate::utils;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use chrono::Utc;
 use tracing::{info, warn};
 
 pub struct OrderExecutor {
     cfg: AppConfig,
-    clob: Option<Arc<ClobClient>>,
+    gateway: Option<Arc<dyn OrderGateway>>,
+    breaker: Option<Arc<ExecutionCircuitBreaker>>,
     risk: Arc<RiskGuard>,
     markets: Arc<MarketCache>,
     positions: Arc<PositionStore>,
@@ -33,11 +36,8 @@ pub enum ExecutionOutcome {
     Skipped(SkipReason),
     /// Paper-only plan produced without credentials; no signature or POST.
     DryRunPlanned(PlannedOrder),
-    DryRun(SignedOrder),
-    Submitted {
-        order_id: Option<String>,
-        signed: SignedOrder,
-    },
+    NotSubmitted(OrderSubmitError),
+    Filled(OrderReceipt),
 }
 
 #[derive(Debug, Clone)]
@@ -45,8 +45,18 @@ pub enum SkipReason {
     BelowSizing,
     MarketMetadataUnavailable,
     Ineligible(Eligibility),
-    ExposureCategoryCap { category: String, cap: f64, current: f64, want: f64 },
-    ExposureTagCap { tag: String, cap: f64, current: f64, want: f64 },
+    ExposureCategoryCap {
+        category: String,
+        cap: f64,
+        current: f64,
+        want: f64,
+    },
+    ExposureTagCap {
+        tag: String,
+        cap: f64,
+        current: f64,
+        want: f64,
+    },
     RiskBlocked(BlockReason),
     TradingDisabled,
     AlreadyOpen,
@@ -56,32 +66,54 @@ pub enum SkipReason {
 }
 
 impl OrderExecutor {
-    pub fn new(
+    pub async fn new(
         cfg: AppConfig,
         risk: Arc<RiskGuard>,
         markets: Arc<MarketCache>,
         positions: Arc<PositionStore>,
     ) -> Result<Self> {
-        let clob = match ClobClient::new(&cfg) {
-            Ok(c) => Some(Arc::new(c)),
-            Err(e) if cfg.bot.mock_trading || !cfg.bot.enable_trading => {
-                warn!(error = ?e, "CLOB client not initialised; dry-run only");
-                None
-            }
-            Err(e) => return Err(e),
-        };
-        Ok(Self {
+        if !cfg.live_trading_allowed() {
+            return Ok(Self::new_with_live_components(
+                cfg, risk, markets, positions, None, None,
+            ));
+        }
+        let breaker = ExecutionCircuitBreaker::new_live(cfg.trading.execution_halt_path.clone())?;
+        let gateway: Arc<dyn OrderGateway> = Arc::new(SdkOrderGateway::new(&cfg).await?);
+        Ok(Self::new_with_live_components(
             cfg,
-            clob,
             risk,
             markets,
             positions,
-        })
+            Some(gateway),
+            Some(breaker),
+        ))
     }
 
-    /// Return the underlying CLOB client (for the position monitor's exit path).
-    pub fn clob(&self) -> Option<Arc<ClobClient>> {
-        self.clob.as_ref().cloned()
+    pub fn new_with_live_components(
+        cfg: AppConfig,
+        risk: Arc<RiskGuard>,
+        markets: Arc<MarketCache>,
+        positions: Arc<PositionStore>,
+        gateway: Option<Arc<dyn OrderGateway>>,
+        breaker: Option<Arc<ExecutionCircuitBreaker>>,
+    ) -> Self {
+        Self {
+            cfg,
+            gateway,
+            breaker,
+            risk,
+            markets,
+            positions,
+        }
+    }
+
+    pub fn live_order_components(
+        &self,
+    ) -> Option<(Arc<dyn OrderGateway>, Arc<ExecutionCircuitBreaker>)> {
+        Some((
+            self.gateway.as_ref()?.clone(),
+            self.breaker.as_ref()?.clone(),
+        ))
     }
 
     pub fn positions(&self) -> Arc<PositionStore> {
@@ -101,8 +133,8 @@ impl OrderExecutor {
         // 1. Resolve market metadata for category/tags/closed lookup.
         let market = match self.markets.by_token_id(&trade.token_id).await {
             Ok(m) => m,
-            Err(e) => {
-                warn!(token = %trade.token_id, error = ?e, "market metadata lookup failed");
+            Err(_) => {
+                warn!(token = %trade.token_id, "market metadata lookup failed");
                 return Ok(ExecutionOutcome::Skipped(
                     SkipReason::MarketMetadataUnavailable,
                 ));
@@ -155,7 +187,6 @@ impl OrderExecutor {
         // 6. Build the order.
         let limit_price = limit_price_for(trade, &self.cfg);
         let shares = utils::usd_to_shares(sizing.copy_usd, limit_price);
-        let order_type = order_type_for(trade.side);
         let planned = PlannedOrder {
             venue: trade.venue,
             token_id: trade.token_id.clone(),
@@ -164,51 +195,40 @@ impl OrderExecutor {
             shares,
             limit_price,
             usd_notional: sizing.copy_usd,
-            order_type,
+            order_type: OrderType::Fok,
             source_trade_hash: trade.tx_hash.clone(),
         };
 
-        let Some(clob) = self.clob.as_ref() else {
-            if !self.cfg.live_trading_allowed() {
-                info!(
-                    token = %planned.token_id,
-                    side = ?planned.side,
-                    shares = planned.shares,
-                    price = planned.limit_price,
-                    "dry-run: order planned but not signed or submitted"
-                );
-                self.record_open(&market, &planned);
-                return Ok(ExecutionOutcome::DryRunPlanned(planned));
-            }
-            return Ok(ExecutionOutcome::Skipped(SkipReason::TradingDisabled));
-        };
-
-        // 7. Sign.
-        let signed = clob
-            .build_signed_order(&planned, order_type, self.cfg.trading.order_expiration_secs)
-            .await?;
-
-        // 8. Dispatch (or dry-run).
         if !self.cfg.live_trading_allowed() {
             info!(
                 token = %planned.token_id,
                 side = ?planned.side,
                 shares = planned.shares,
                 price = planned.limit_price,
-                "dry-run: signed order built but not submitted"
+                "dry-run: order planned but not signed or submitted"
             );
-            // Even in dry-run, record the position so the monitor exercises
-            // the TP/SL path against real midprices.
-            self.record_open(&market, &planned);
-            return Ok(ExecutionOutcome::DryRun(signed));
+            self.record_open_from_plan(&market, &planned);
+            return Ok(ExecutionOutcome::DryRunPlanned(planned));
         }
 
-        let resp = clob.post_order(signed.clone(), order_type).await?;
-        self.record_open(&market, &planned);
-        Ok(ExecutionOutcome::Submitted {
-            order_id: resp.order_id,
-            signed,
-        })
+        let gateway = self
+            .gateway
+            .as_ref()
+            .ok_or_else(|| anyhow!("live gateway unavailable"))?;
+        let breaker = self
+            .breaker
+            .as_ref()
+            .ok_or_else(|| anyhow!("live breaker unavailable"))?;
+        match breaker.submit_fok(gateway.as_ref(), &planned).await {
+            Ok(receipt) => {
+                self.record_open_from_receipt(&market, &planned, &receipt)?;
+                Ok(ExecutionOutcome::Filled(receipt))
+            }
+            Err(
+                error @ (OrderSubmitError::Preflight { .. } | OrderSubmitError::Rejected { .. }),
+            ) => Ok(ExecutionOutcome::NotSubmitted(error)),
+            Err(error) => Err(anyhow::Error::new(error)),
+        }
     }
 
     fn check_exposure(&self, market: &MarketInfo, want_usd: f64) -> Option<SkipReason> {
@@ -252,7 +272,7 @@ impl OrderExecutor {
         None
     }
 
-    fn record_open(&self, market: &MarketInfo, planned: &PlannedOrder) {
+    fn record_open_from_plan(&self, market: &MarketInfo, planned: &PlannedOrder) {
         // Only entries open positions; exits remove them in the monitor.
         if planned.side != Side::Buy {
             return;
@@ -273,6 +293,42 @@ impl OrderExecutor {
             opened_at: Utc::now(),
         };
         self.positions.open(pos);
+    }
+
+    fn record_open_from_receipt(
+        &self,
+        market: &MarketInfo,
+        planned: &PlannedOrder,
+        receipt: &OrderReceipt,
+    ) -> Result<()> {
+        if planned.side != Side::Buy {
+            return Ok(());
+        }
+        let shares = receipt.filled_shares();
+        let usd_notional = receipt.filled_usd();
+        if shares <= 0.0 || usd_notional <= 0.0 {
+            return Err(anyhow!("confirmed receipt contains zero fill"));
+        }
+        let entry_price = usd_notional / shares;
+        if !entry_price.is_finite() || entry_price <= 0.0 {
+            return Err(anyhow!("confirmed receipt cannot form an entry price"));
+        }
+        let (tp_pct, sl_pct) = self.tp_sl_for(market);
+        self.positions.open(OpenPosition {
+            token_id: planned.token_id.clone(),
+            slug: market.slug.clone(),
+            category: market.category.clone(),
+            tags: market.tags.clone(),
+            neg_risk: market.neg_risk,
+            side: planned.side,
+            entry_price,
+            shares,
+            usd_notional,
+            take_profit_pct: tp_pct,
+            stop_loss_pct: sl_pct,
+            opened_at: Utc::now(),
+        });
+        Ok(())
     }
 
     fn tp_sl_for(&self, market: &MarketInfo) -> (f64, f64) {
@@ -311,25 +367,29 @@ fn limit_price_for(trade: &WhaleTrade, cfg: &AppConfig) -> f64 {
     utils::clamp_price(raw)
 }
 
-fn order_type_for(side: Side) -> OrderType {
-    match side {
-        Side::Buy => OrderType::Fok,
-        Side::Sell => OrderType::Gtd,
-    }
-}
-
 fn ci_eq(a: &str, b: &str) -> bool {
-    a.len() == b.len() && a.chars().zip(b.chars()).all(|(x, y)| x.eq_ignore_ascii_case(&y))
+    a.len() == b.len()
+        && a.chars()
+            .zip(b.chars())
+            .all(|(x, y)| x.eq_ignore_ascii_case(&y))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::{Side, VenueId};
+    use crate::service::execution_circuit_breaker::ExecutionCircuitBreaker;
     use crate::service::onchain::RawLog;
+    use crate::service::order_gateway::{
+        OrderErrorCode, OrderGateway, OrderReceipt, OrderStage, OrderSubmitError,
+    };
     use crate::service::parse::{decode_whale_trade, order_filled_topic};
     use crate::service::position_store::PositionStore;
     use crate::service::risk_guard::RiskGuard;
+    use async_trait::async_trait;
+    use chrono::Utc;
+    use parking_lot::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -403,13 +463,9 @@ mod tests {
         let risk = RiskGuard::new(cfg.risk.clone());
         let markets = MarketCache::new(reqwest::Client::new(), cfg.site.gamma_api_base.clone());
         let positions = PositionStore::new();
-        let executor = OrderExecutor::new(
-            cfg,
-            risk,
-            markets,
-            Arc::clone(&positions),
-        )
-        .unwrap();
+        let executor = OrderExecutor::new(cfg, risk, markets, Arc::clone(&positions))
+            .await
+            .unwrap();
 
         let outcome = executor.execute(&trade).await.unwrap();
         server.await.unwrap();
@@ -429,5 +485,193 @@ mod tests {
         assert!((position.usd_notional - 20.0).abs() < 1e-9);
         assert!((position.entry_price - 0.505).abs() < 1e-9);
         assert_eq!(position.shares, 39.0);
+    }
+
+    #[tokio::test]
+    async fn strict_dry_run_skips_live_components_and_records_planned_position() {
+        let (cfg, markets, server) = fixture_runtime(false).await;
+        let positions = PositionStore::new();
+        let executor = OrderExecutor::new(
+            cfg,
+            RiskGuard::new(test_cfg()),
+            markets,
+            Arc::clone(&positions),
+        )
+        .await
+        .unwrap();
+
+        assert!(executor.live_order_components().is_none());
+        assert!(matches!(
+            executor.execute(&fixture_trade()).await.unwrap(),
+            ExecutionOutcome::DryRunPlanned(_)
+        ));
+        server.await.unwrap();
+        assert!(positions.get("12345").is_some());
+    }
+
+    #[tokio::test]
+    async fn matched_live_receipt_records_actual_filled_amounts() {
+        let (mut cfg, markets, server) = fixture_runtime(true).await;
+        let halt_dir = tempfile::tempdir().unwrap();
+        cfg.trading.execution_halt_path = halt_dir.path().join("execution-halt.json");
+        let positions = PositionStore::new();
+        let gateway = Arc::new(FakeGateway::returning(Ok(OrderReceipt {
+            order_id: "order-public-fixture".into(),
+            filled_shares_micros: 39_000_000,
+            filled_usd_micros: 19_500_000,
+        })));
+        let breaker =
+            ExecutionCircuitBreaker::new_live(cfg.trading.execution_halt_path.clone()).unwrap();
+        let executor = OrderExecutor::new_with_live_components(
+            cfg,
+            RiskGuard::new(test_cfg()),
+            markets,
+            Arc::clone(&positions),
+            Some(gateway.clone()),
+            Some(breaker),
+        );
+
+        assert!(matches!(
+            executor.execute(&fixture_trade()).await.unwrap(),
+            ExecutionOutcome::Filled(_)
+        ));
+        server.await.unwrap();
+        let position = positions.get("12345").unwrap();
+        assert_eq!(position.shares, 39.0);
+        assert_eq!(position.usd_notional, 19.5);
+        assert_eq!(position.entry_price, 0.5);
+        assert_eq!(gateway.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn preflight_and_rejected_entries_are_not_submitted_or_recorded() {
+        for result in [
+            Err(OrderSubmitError::Preflight {
+                stage: OrderStage::Build,
+                code: OrderErrorCode::InvalidPrice,
+            }),
+            Err(OrderSubmitError::Rejected {
+                http_status: Some(409),
+                code: OrderErrorCode::HttpRejected,
+            }),
+        ] {
+            let (mut cfg, markets, server) = fixture_runtime(true).await;
+            let halt_dir = tempfile::tempdir().unwrap();
+            cfg.trading.execution_halt_path = halt_dir.path().join("execution-halt.json");
+            let positions = PositionStore::new();
+            let gateway = Arc::new(FakeGateway::returning(result));
+            let breaker =
+                ExecutionCircuitBreaker::new_live(cfg.trading.execution_halt_path.clone()).unwrap();
+            let executor = OrderExecutor::new_with_live_components(
+                cfg,
+                RiskGuard::new(test_cfg()),
+                markets,
+                Arc::clone(&positions),
+                Some(gateway),
+                Some(breaker),
+            );
+
+            assert!(matches!(
+                executor.execute(&fixture_trade()).await.unwrap(),
+                ExecutionOutcome::NotSubmitted(_)
+            ));
+            server.await.unwrap();
+            assert!(positions.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn uncertain_entry_halts_persists_and_never_retries() {
+        let (mut cfg, markets, server) = fixture_runtime(true).await;
+        let halt_dir = tempfile::tempdir().unwrap();
+        cfg.trading.execution_halt_path = halt_dir.path().join("execution-halt.json");
+        let marker = cfg.trading.execution_halt_path.clone();
+        let positions = PositionStore::new();
+        let gateway = Arc::new(FakeGateway::returning(Err(OrderSubmitError::Uncertain {
+            code: OrderErrorCode::PostTimeout,
+        })));
+        let breaker = ExecutionCircuitBreaker::new_live(marker.clone()).unwrap();
+        let executor = OrderExecutor::new_with_live_components(
+            cfg,
+            RiskGuard::new(test_cfg()),
+            markets,
+            Arc::clone(&positions),
+            Some(gateway.clone()),
+            Some(breaker),
+        );
+
+        assert!(executor.execute(&fixture_trade()).await.is_err());
+        server.await.unwrap();
+        assert!(positions.is_empty());
+        assert!(marker.is_file());
+        assert_eq!(gateway.calls(), 1);
+        assert!(executor.execute(&fixture_trade()).await.is_err());
+        assert_eq!(gateway.calls(), 1);
+    }
+
+    fn test_cfg() -> crate::config::RiskConfig {
+        serde_json::from_str::<AppConfig>(include_str!("../../config.json"))
+            .unwrap()
+            .risk
+    }
+
+    fn fixture_trade() -> WhaleTrade {
+        WhaleTrade {
+            venue: VenueId::Polymarket,
+            maker: MAKER.into(),
+            side: Side::Buy,
+            token_id: "12345".into(),
+            shares: 200.0,
+            price: 0.5,
+            usd_notional: 100.0,
+            tx_hash: Some("fixture-trade".into()),
+            block_number: Some(1),
+            observed_at: Utc::now(),
+        }
+    }
+
+    async fn fixture_runtime(
+        live: bool,
+    ) -> (AppConfig, Arc<MarketCache>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut cfg: AppConfig = serde_json::from_str(include_str!("../../config.json")).unwrap();
+        cfg.site.gamma_api_base = format!("http://{}", listener.local_addr().unwrap());
+        cfg.site.clob_api_base = "http://127.0.0.1:9".into();
+        cfg.bot.enable_trading = live;
+        cfg.bot.mock_trading = !live;
+        let markets = MarketCache::new(reqwest::Client::new(), cfg.site.gamma_api_base.clone());
+        (cfg, markets, tokio::spawn(serve_fixture_market(listener)))
+    }
+
+    struct FakeGateway {
+        result: Result<OrderReceipt, OrderSubmitError>,
+        calls: AtomicUsize,
+        plans: Mutex<Vec<PlannedOrder>>,
+    }
+
+    impl FakeGateway {
+        fn returning(result: Result<OrderReceipt, OrderSubmitError>) -> Self {
+            Self {
+                result,
+                calls: AtomicUsize::new(0),
+                plans: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl OrderGateway for FakeGateway {
+        async fn submit_fok(
+            &self,
+            planned: &PlannedOrder,
+        ) -> Result<OrderReceipt, OrderSubmitError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.plans.lock().push(planned.clone());
+            self.result.clone()
+        }
     }
 }

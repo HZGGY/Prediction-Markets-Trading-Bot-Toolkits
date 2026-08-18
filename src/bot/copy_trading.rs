@@ -16,21 +16,22 @@
 //!    ([`service::risk_guard`]).
 //! 7. **Execute**: build EIP-712 signed CTF order, post via L2 auth
 //!    ([`service::clob`], [`service::order_executor`]).
-//! 8. **TP/SL**: background monitor polls midprice for every open position
-//!    and submits an exit FAK when P&L crosses the configured thresholds
-//!    ([`service::position_monitor`]).
+//! 8. **TP/SL**: live-only background monitor polls midprice for every open
+//!    position and submits a guarded FOK exit when P&L crosses the configured
+//!    thresholds ([`service::position_monitor`]).
 //!
 //! Safety: `enable_trading=false` OR `mock_trading=true` keeps the executor
-//! in dry-run mode — the full pipeline runs but signed orders are logged,
-//! not submitted. Dry-run also records positions locally so the TP/SL
-//! monitor exercises against real midprices.
+//! in dry-run mode — the full pipeline runs but plans are recorded without
+//! SDK initialization, signing, CLOB requests, or TP/SL midpoint polling.
 
 use crate::config::AppConfig;
 use crate::service::{
+    execution_circuit_breaker::ExecutionCircuitBreaker,
     market_cache::MarketCache,
     midprice::{ClobMidpriceSource, MidpriceSource},
     onchain::{spawn_subscription, LogFilter, RawLog},
     order_executor::{ExecutionOutcome, OrderExecutor},
+    order_gateway::{OrderGateway, OrderReceipt, OrderSubmitError},
     parse::{decode_whale_trade, order_filled_topic},
     position_monitor,
     position_store::PositionStore,
@@ -73,35 +74,28 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
         Arc::clone(&risk),
         Arc::clone(&markets),
         Arc::clone(&positions),
-    )?;
+    )
+    .await?;
 
-    // TP/SL monitor — only spawn if we have a CLOB client (cfg permitted it).
-    if cfg.tp_sl.enabled {
-        if let Some(clob) = executor.clob() {
-            let midprice: Arc<dyn MidpriceSource> = Arc::new(ClobMidpriceSource::new(
-                http.clone(),
-                cfg.site.clob_api_base.clone(),
-            ));
-            let live = cfg.live_trading_allowed();
-            position_monitor::spawn(
-                cfg.tp_sl.clone(),
-                Arc::clone(&positions),
-                clob,
-                midprice,
-                live,
-                cfg.trading.price_buffer,
-                cfg.trading.order_expiration_secs,
-            );
-            info!(
-                poll_interval_secs = cfg.tp_sl.poll_interval_secs,
-                "TP/SL monitor spawned"
-            );
-        } else {
-            warn!(
-                "TP/SL enabled but no CLOB client (missing credentials?) — \
-                 entries will still record positions, but exits won't fire"
-            );
-        }
+    if let Some((gateway, breaker)) = live_tp_sl_components(&cfg, &executor) {
+        let midprice: Arc<dyn MidpriceSource> = Arc::new(ClobMidpriceSource::new(
+            http.clone(),
+            cfg.site.clob_api_base.clone(),
+        ));
+        position_monitor::spawn(
+            cfg.tp_sl.clone(),
+            Arc::clone(&positions),
+            gateway,
+            breaker,
+            midprice,
+            cfg.trading.price_buffer,
+        );
+        info!(
+            poll_interval_secs = cfg.tp_sl.poll_interval_secs,
+            "TP/SL monitor spawned"
+        );
+    } else if cfg.tp_sl.enabled {
+        info!("TP/SL CLOB monitoring inactive in strict dry-run");
     }
 
     let filter = build_filter(&cfg, &whale)?;
@@ -122,8 +116,18 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
                     warn!("on-chain subscription channel closed");
                     return Ok(());
                 };
-                if let Err(e) = handle_log(&executor, &whale, &log).await {
-                    error!(error = ?e, tx = %log.tx_hash, "handle_log failed");
+                if let Err(error) = handle_log(&executor, &whale, &log).await {
+                    let fatal = error
+                        .downcast_ref::<OrderSubmitError>()
+                        .is_some_and(|order_error| matches!(
+                            order_error,
+                            OrderSubmitError::Uncertain { .. } | OrderSubmitError::Halted { .. }
+                        ));
+                    if fatal {
+                        error!(tx = %log.tx_hash, "copy execution halted; bot stopping");
+                        return Err(error);
+                    }
+                    error!(tx = %log.tx_hash, "handle_log failed before uncertain submission");
                 }
             }
         }
@@ -151,15 +155,8 @@ async fn handle_log(executor: &OrderExecutor, whale: &str, log: &RawLog) -> Resu
             price = planned.limit_price,
             "dry-run order planned (not signed or submitted)"
         ),
-        ExecutionOutcome::DryRun(signed) => info!(
-            token = %signed.token_id,
-            shares = %signed.taker_amount,
-            "dry-run order signed (not submitted)"
-        ),
-        ExecutionOutcome::Submitted { order_id, .. } => info!(
-            order_id = ?order_id,
-            "order submitted to Polymarket CLOB"
-        ),
+        ExecutionOutcome::NotSubmitted(error) => log_not_submitted(&error),
+        ExecutionOutcome::Filled(receipt) => log_filled(&receipt),
     }
     Ok(())
 }
@@ -173,11 +170,7 @@ fn build_filter(cfg: &AppConfig, whale: &str) -> Result<LogFilter> {
     let whale_topic = pad_address_to_topic(whale)?;
     Ok(LogFilter {
         address: exchanges,
-        topics: vec![
-            Some(vec![topic0]),
-            None,
-            Some(vec![whale_topic]),
-        ],
+        topics: vec![Some(vec![topic0]), None, Some(vec![whale_topic])],
     })
 }
 
@@ -187,4 +180,68 @@ fn pad_address_to_topic(addr: &str) -> Result<String> {
         return Err(anyhow!("address must be 20 bytes / 40 hex chars"));
     }
     Ok(format!("0x{}{}", "0".repeat(24), trimmed))
+}
+
+fn live_tp_sl_components(
+    cfg: &AppConfig,
+    executor: &OrderExecutor,
+) -> Option<(Arc<dyn OrderGateway>, Arc<ExecutionCircuitBreaker>)> {
+    if !cfg.tp_sl.enabled || !cfg.live_trading_allowed() {
+        return None;
+    }
+    executor.live_order_components()
+}
+
+fn log_not_submitted(error: &OrderSubmitError) {
+    match error {
+        OrderSubmitError::Preflight { code, .. } => {
+            info!(code = ?code, "order not submitted during preflight");
+        }
+        OrderSubmitError::Rejected { http_status, code } => {
+            info!(code = ?code, http_status = ?http_status, "order rejected by CLOB");
+        }
+        OrderSubmitError::Uncertain { .. } | OrderSubmitError::Halted { .. } => {}
+    }
+}
+
+fn log_filled(receipt: &OrderReceipt) {
+    info!(
+        order_id_hint = %redact_order_id(&receipt.order_id),
+        shares = receipt.filled_shares(),
+        usd = receipt.filled_usd(),
+        "order fully matched"
+    );
+}
+
+fn redact_order_id(order_id: &str) -> String {
+    const VISIBLE: usize = 4;
+    if order_id.len() <= VISIBLE * 2 {
+        return "[redacted]".into();
+    }
+    format!(
+        "{}…{}",
+        &order_id[..VISIBLE],
+        &order_id[order_id.len() - VISIBLE..]
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn strict_dry_run_never_exposes_tp_sl_live_components() {
+        let mut cfg: AppConfig = serde_json::from_str(include_str!("../../config.json")).unwrap();
+        cfg.tp_sl.enabled = true;
+        cfg.bot.enable_trading = false;
+        cfg.bot.mock_trading = true;
+        cfg.site.clob_api_base = "http://127.0.0.1:9".into();
+        let risk = RiskGuard::new(cfg.risk.clone());
+        let markets = MarketCache::new(Client::new(), cfg.site.gamma_api_base.clone());
+        let executor = OrderExecutor::new(cfg.clone(), risk, markets, PositionStore::new())
+            .await
+            .unwrap();
+
+        assert!(live_tp_sl_components(&cfg, &executor).is_none());
+    }
 }

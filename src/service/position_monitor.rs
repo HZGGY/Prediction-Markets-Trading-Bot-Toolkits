@@ -1,25 +1,32 @@
 //! Take-profit / stop-loss monitor.
 //!
-//! Periodically polls the midprice of every open position. When the P&L
-//! relative to the recorded entry crosses the take-profit or stop-loss
-//! threshold, the monitor synthesises an exit `PlannedOrder` and posts it
-//! through the existing executor — same signing path, same risk gates.
+//! The live-only monitor polls open positions and sends guarded FOK exits.
+
+use std::sync::Arc;
+
+use anyhow::Result;
+use tokio::time::{interval, Duration};
+use tracing::{debug, error, info, warn};
 
 use crate::config::TpSlConfig;
 use crate::models::{OrderType, PlannedOrder, Side, VenueId};
-use crate::service::clob::ClobClient;
+use crate::service::execution_circuit_breaker::ExecutionCircuitBreaker;
 use crate::service::midprice::MidpriceSource;
+use crate::service::order_gateway::{OrderGateway, OrderReceipt, OrderSubmitError};
 use crate::service::position_store::{OpenPosition, PositionStore};
 use crate::utils;
-use anyhow::Result;
-use std::sync::Arc;
-use tokio::time::{interval, Duration};
-use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitReason {
     TakeProfit,
     StopLoss,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExitOutcome {
+    NoTrigger,
+    Rejected(OrderSubmitError),
+    Filled(OrderReceipt),
 }
 
 pub fn check_exit(pos: &OpenPosition, midprice: f64) -> Option<ExitReason> {
@@ -33,16 +40,15 @@ pub fn check_exit(pos: &OpenPosition, midprice: f64) -> Option<ExitReason> {
     }
 }
 
-/// Spawns the monitor task. The handle lets the caller observe shutdown
-/// independently of the main bot loop.
+/// Spawns the live monitor. Any uncertain or halted execution terminates the
+/// task so that no further exit evaluation can submit an order.
 pub fn spawn(
     cfg: TpSlConfig,
     positions: Arc<PositionStore>,
-    clob: Arc<ClobClient>,
+    gateway: Arc<dyn OrderGateway>,
+    breaker: Arc<ExecutionCircuitBreaker>,
     midprice: Arc<dyn MidpriceSource>,
-    live_trading: bool,
     price_buffer: f64,
-    order_expiration_secs: u64,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if !cfg.enabled {
@@ -53,24 +59,32 @@ pub fn spawn(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-            let snapshot = positions.snapshot();
-            for pos in snapshot {
-                if let Err(e) = monitor_once(
+            for pos in positions.snapshot() {
+                if let Err(error) = monitor_once(
                     &pos,
                     &positions,
-                    clob.as_ref(),
+                    gateway.as_ref(),
+                    breaker.as_ref(),
                     midprice.as_ref(),
-                    live_trading,
                     price_buffer,
-                    order_expiration_secs,
                 )
                 .await
                 {
-                    error!(
-                        token = %pos.token_id,
-                        error = ?e,
-                        "tp/sl tick failed for position"
-                    );
+                    let fatal =
+                        error
+                            .downcast_ref::<OrderSubmitError>()
+                            .is_some_and(|order_error| {
+                                matches!(
+                                    order_error,
+                                    OrderSubmitError::Uncertain { .. }
+                                        | OrderSubmitError::Halted { .. }
+                                )
+                            });
+                    if fatal {
+                        error!(token = %pos.token_id, "TP/SL execution halted; monitor stopping");
+                        return;
+                    }
+                    warn!(token = %pos.token_id, "TP/SL tick failed before order submission");
                 }
             }
         }
@@ -80,89 +94,78 @@ pub fn spawn(
 async fn monitor_once(
     pos: &OpenPosition,
     positions: &PositionStore,
-    clob: &ClobClient,
+    gateway: &dyn OrderGateway,
+    breaker: &ExecutionCircuitBreaker,
     midprice: &dyn MidpriceSource,
-    live_trading: bool,
     price_buffer: f64,
-    order_expiration_secs: u64,
-) -> Result<()> {
-    let mp = midprice.midprice(&pos.token_id).await?;
-    let pnl = pos.pnl_pct(mp);
+) -> Result<ExitOutcome> {
+    let mid = midprice.midprice(&pos.token_id).await?;
+    let pnl = pos.pnl_pct(mid);
     debug!(
         token = %pos.token_id,
-        mid = mp,
+        mid,
         entry = pos.entry_price,
         pnl_pct = pnl,
         "tp/sl tick"
     );
 
-    let Some(reason) = check_exit(pos, mp) else {
-        return Ok(());
+    let Some(reason) = check_exit(pos, mid) else {
+        return Ok(ExitOutcome::NoTrigger);
     };
-
     info!(
         token = %pos.token_id,
         slug = %pos.slug,
         ?reason,
         pnl_pct = pnl,
-        midprice = mp,
-        "TP/SL triggered — submitting exit"
+        midprice = mid,
+        "TP/SL triggered — submitting FOK exit"
     );
 
-    let exit_side = pos.side.flip();
-    let limit_price = match exit_side {
-        // Selling out — accept a buffer below the mid to make sure we fill.
-        Side::Sell => utils::clamp_price(mp - price_buffer),
-        // Buying to cover — pay up by the buffer.
-        Side::Buy => utils::clamp_price(mp + price_buffer),
-    };
+    let planned = exit_plan(pos, mid, price_buffer);
+    match breaker.submit_fok(gateway, &planned).await {
+        Ok(receipt) => {
+            positions.close(&pos.token_id);
+            Ok(ExitOutcome::Filled(receipt))
+        }
+        Err(error @ (OrderSubmitError::Preflight { .. } | OrderSubmitError::Rejected { .. })) => {
+            Ok(ExitOutcome::Rejected(error))
+        }
+        Err(error) => Err(anyhow::Error::new(error)),
+    }
+}
 
-    let planned = PlannedOrder {
+fn exit_plan(pos: &OpenPosition, midprice: f64, price_buffer: f64) -> PlannedOrder {
+    let side = pos.side.flip();
+    let limit_price = match side {
+        Side::Sell => utils::clamp_price(midprice - price_buffer),
+        Side::Buy => utils::clamp_price(midprice + price_buffer),
+    };
+    PlannedOrder {
         venue: VenueId::Polymarket,
         token_id: pos.token_id.clone(),
         neg_risk: pos.neg_risk,
-        side: exit_side,
+        side,
         shares: pos.shares,
         limit_price,
         usd_notional: pos.shares * limit_price,
         order_type: OrderType::Fok,
         source_trade_hash: None,
-    };
-
-    let signed = clob
-        .build_signed_order(&planned, OrderType::Fok, order_expiration_secs)
-        .await?;
-
-    if live_trading {
-        match clob.post_order(signed.clone(), OrderType::Fok).await {
-            Ok(resp) => {
-                info!(
-                    order_id = ?resp.order_id,
-                    token = %pos.token_id,
-                    "exit order submitted"
-                );
-                positions.close(&pos.token_id);
-            }
-            Err(e) => {
-                warn!(error = ?e, token = %pos.token_id, "exit POST failed; will retry next tick");
-            }
-        }
-    } else {
-        info!(
-            token = %pos.token_id,
-            shares = planned.shares,
-            limit = planned.limit_price,
-            "dry-run exit signed (not submitted) — closing position locally"
-        );
-        positions.close(&pos.token_id);
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
     use chrono::Utc;
+    use parking_lot::Mutex;
+
+    use super::*;
+    use crate::service::execution_circuit_breaker::ExecutionCircuitBreaker;
+    use crate::service::order_gateway::{
+        OrderErrorCode, OrderGateway, OrderReceipt, OrderSubmitError,
+    };
 
     fn pos(entry: f64, tp: f64, sl: f64, side: Side) -> OpenPosition {
         OpenPosition {
@@ -202,9 +205,142 @@ mod tests {
     #[test]
     fn sell_inverted_pnl_logic() {
         let p = pos(0.50, 30.0, 20.0, Side::Sell);
-        // Price went DOWN — short position is in profit.
         assert_eq!(check_exit(&p, 0.30), Some(ExitReason::TakeProfit));
-        // Price went UP — short position hit stop.
         assert_eq!(check_exit(&p, 0.65), Some(ExitReason::StopLoss));
+    }
+
+    #[tokio::test]
+    async fn matched_sell_exit_closes_position_with_fok_for_open_shares() {
+        let positions = PositionStore::new();
+        let position = pos(0.50, 30.0, 20.0, Side::Buy);
+        positions.open(position.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let breaker =
+            ExecutionCircuitBreaker::new_live(dir.path().join("execution-halt.json")).unwrap();
+        let gateway = Arc::new(FakeGateway::returning(Ok(OrderReceipt {
+            order_id: "order-public-fixture".into(),
+            filled_shares_micros: 100_000_000,
+            filled_usd_micros: 70_000_000,
+        })));
+
+        let outcome = monitor_once(
+            &position,
+            &positions,
+            gateway.as_ref(),
+            breaker.as_ref(),
+            &FixedMidprice(0.70),
+            0.005,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, ExitOutcome::Filled(_)));
+        assert!(positions.get("t").is_none());
+        let planned = gateway.plans.lock().pop().unwrap();
+        assert_eq!(planned.side, Side::Sell);
+        assert_eq!(planned.order_type, OrderType::Fok);
+        assert_eq!(planned.shares, position.shares);
+    }
+
+    #[tokio::test]
+    async fn rejected_exit_keeps_position_and_breaker_open() {
+        let positions = PositionStore::new();
+        let position = pos(0.50, 30.0, 20.0, Side::Buy);
+        positions.open(position.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let breaker =
+            ExecutionCircuitBreaker::new_live(dir.path().join("execution-halt.json")).unwrap();
+        let gateway = Arc::new(FakeGateway::returning(Err(OrderSubmitError::Rejected {
+            http_status: Some(409),
+            code: OrderErrorCode::HttpRejected,
+        })));
+
+        let outcome = monitor_once(
+            &position,
+            &positions,
+            gateway.as_ref(),
+            breaker.as_ref(),
+            &FixedMidprice(0.70),
+            0.005,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, ExitOutcome::Rejected(_)));
+        assert!(positions.get("t").is_some());
+        assert!(!breaker.is_halted());
+    }
+
+    #[tokio::test]
+    async fn uncertain_exit_keeps_position_persists_halt_and_blocks_later_entry() {
+        let positions = PositionStore::new();
+        let position = pos(0.50, 30.0, 20.0, Side::Buy);
+        positions.open(position.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let breaker =
+            ExecutionCircuitBreaker::new_live(dir.path().join("execution-halt.json")).unwrap();
+        let gateway = Arc::new(FakeGateway::returning(Err(OrderSubmitError::Uncertain {
+            code: OrderErrorCode::PostTransport,
+        })));
+
+        let result = monitor_once(
+            &position,
+            &positions,
+            gateway.as_ref(),
+            breaker.as_ref(),
+            &FixedMidprice(0.70),
+            0.005,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(positions.get("t").is_some());
+        assert!(breaker.is_halted());
+        assert!(breaker
+            .submit_fok(gateway.as_ref(), &exit_plan(&position, 0.70, 0.005))
+            .await
+            .is_err());
+        assert_eq!(gateway.calls(), 1);
+    }
+
+    struct FixedMidprice(f64);
+
+    #[async_trait]
+    impl MidpriceSource for FixedMidprice {
+        async fn midprice(&self, _token_id: &str) -> Result<f64> {
+            Ok(self.0)
+        }
+    }
+
+    struct FakeGateway {
+        result: Result<OrderReceipt, OrderSubmitError>,
+        calls: AtomicUsize,
+        plans: Mutex<Vec<PlannedOrder>>,
+    }
+
+    impl FakeGateway {
+        fn returning(result: Result<OrderReceipt, OrderSubmitError>) -> Self {
+            Self {
+                result,
+                calls: AtomicUsize::new(0),
+                plans: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl OrderGateway for FakeGateway {
+        async fn submit_fok(
+            &self,
+            planned: &PlannedOrder,
+        ) -> Result<OrderReceipt, OrderSubmitError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.plans.lock().push(planned.clone());
+            self.result.clone()
+        }
     }
 }
