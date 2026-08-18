@@ -29,7 +29,8 @@
     "poll_interval_secs": 5,
     "price_buffer": 0.005,
     "fee_rate_bps": 0,
-    "order_expiration_secs": 60
+    "order_expiration_secs": 60,
+    "execution_halt_path": "execution-halt.json"
   },
   "risk": {
     "large_trade_shares": 1500.0,

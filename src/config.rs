@@ -8,7 +8,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const OFFICIAL_CLOB_V2_HOST: &str = "https://clob-v2.polymarket.com";
 
@@ -96,6 +96,8 @@ pub struct TradingConfig {
 
     pub fee_rate_bps: u32,
     pub order_expiration_secs: u64,
+    #[serde(default = "default_execution_halt_path")]
+    pub execution_halt_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -388,6 +390,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_execution_halt_path() -> PathBuf {
+    PathBuf::from("execution-halt.json")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,6 +411,37 @@ mod tests {
             assert!(cfg.credentials.api_key.is_none());
             assert!(cfg.credentials.api_secret.is_none());
             assert!(cfg.credentials.api_passphrase.is_none());
+        }
+    }
+
+    #[test]
+    fn execution_halt_path_defaults_when_omitted() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(include_str!("../config.json")).unwrap();
+        value["trading"]
+            .as_object_mut()
+            .unwrap()
+            .remove("execution_halt_path");
+        let cfg: AppConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            cfg.trading.execution_halt_path,
+            PathBuf::from("execution-halt.json")
+        );
+    }
+
+    #[test]
+    fn committed_configs_pin_safe_halt_path_and_trading_flags() {
+        for raw in [
+            include_str!("../config.json"),
+            include_str!("../config.dryrun-public.json"),
+        ] {
+            let cfg: AppConfig = serde_json::from_str(raw).unwrap();
+            assert_eq!(
+                cfg.trading.execution_halt_path,
+                PathBuf::from("execution-halt.json")
+            );
+            assert!(!cfg.bot.enable_trading);
+            assert!(cfg.bot.mock_trading);
         }
     }
 
