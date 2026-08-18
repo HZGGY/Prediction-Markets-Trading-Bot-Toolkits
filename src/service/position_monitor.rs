@@ -13,7 +13,7 @@ use crate::models::{OrderType, PlannedOrder, Side, VenueId};
 use crate::service::execution_circuit_breaker::ExecutionCircuitBreaker;
 use crate::service::execution_ledger::{IntentId, OrderId, OrderSide, PositionClose, Venue};
 use crate::service::midprice::MidpriceSource;
-use crate::service::order_gateway::{OrderGateway, OrderReceipt, OrderSubmitError};
+use crate::service::order_gateway::{OrderErrorCode, OrderGateway, OrderReceipt, OrderSubmitError};
 use crate::service::position_store::{OpenPosition, PositionStore};
 use crate::utils;
 
@@ -26,6 +26,7 @@ pub enum ExitReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExitOutcome {
     NoTrigger,
+    InvalidMidpoint,
     Rejected(OrderSubmitError),
     Filled(OrderReceipt),
 }
@@ -109,6 +110,9 @@ async fn monitor_once(
 ) -> Result<ExitOutcome> {
     let token_id = pos.token_id.to_string();
     let mid = midprice.midprice(&token_id).await?;
+    if !mid.is_finite() || mid <= 0.0 || mid >= 1.0 {
+        return Ok(ExitOutcome::InvalidMidpoint);
+    }
     let pnl = pos.pnl_pct(mid);
     debug!(
         token = %pos.token_id,
@@ -133,28 +137,9 @@ async fn monitor_once(
     let planned = exit_plan(pos, mid, price_buffer);
     match breaker.submit_fok(gateway, &planned).await {
         Ok(receipt) => {
-            if receipt.filled_shares_micros != pos.shares_micros || receipt.filled_usd_micros == 0 {
-                return Err(anyhow::anyhow!(
-                    "confirmed exit receipt has conflicting amounts"
-                ));
+            if apply_filled_close(pos, positions, &receipt).is_err() {
+                return Err(halt_after_filled_position_failure(breaker, &planned));
             }
-            let order_id = OrderId::from_hex(receipt.order_id.clone())
-                .ok_or_else(|| anyhow::anyhow!("confirmed exit receipt has invalid order id"))?;
-            let closing_intent_id = if positions.is_paper() {
-                IntentId(uuid::Uuid::new_v4())
-            } else {
-                positions
-                    .pending_exit_intent(&order_id, pos.position_id)
-                    .ok_or_else(|| anyhow::anyhow!("confirmed exit has no journaled intent"))?
-            };
-            positions.apply_close(PositionClose {
-                position_id: pos.position_id,
-                closing_intent_id,
-                closing_order_id: order_id,
-                shares_micros: receipt.filled_shares_micros,
-                usd_micros: receipt.filled_usd_micros,
-                closed_at: chrono::Utc::now(),
-            })?;
             Ok(ExitOutcome::Filled(receipt))
         }
         Err(error @ (OrderSubmitError::Preflight { .. } | OrderSubmitError::Rejected { .. })) => {
@@ -162,6 +147,49 @@ async fn monitor_once(
         }
         Err(error) => Err(anyhow::Error::new(error)),
     }
+}
+
+fn apply_filled_close(
+    pos: &OpenPosition,
+    positions: &PositionStore,
+    receipt: &OrderReceipt,
+) -> Result<()> {
+    if receipt.filled_shares_micros != pos.shares_micros || receipt.filled_usd_micros == 0 {
+        return Err(anyhow::anyhow!(
+            "confirmed exit receipt has conflicting amounts"
+        ));
+    }
+    let order_id = OrderId::from_hex(receipt.order_id.clone())
+        .ok_or_else(|| anyhow::anyhow!("confirmed exit receipt has invalid order id"))?;
+    let closing_intent_id = if positions.is_paper() {
+        IntentId(uuid::Uuid::new_v4())
+    } else {
+        positions
+            .pending_exit_intent(&order_id, pos.position_id)
+            .ok_or_else(|| anyhow::anyhow!("confirmed exit has no journaled intent"))?
+    };
+    positions.apply_close(PositionClose {
+        position_id: pos.position_id,
+        closing_intent_id,
+        closing_order_id: order_id,
+        shares_micros: receipt.filled_shares_micros,
+        usd_micros: receipt.filled_usd_micros,
+        closed_at: chrono::Utc::now(),
+    })?;
+    Ok(())
+}
+
+fn halt_after_filled_position_failure(
+    breaker: &ExecutionCircuitBreaker,
+    planned: &PlannedOrder,
+) -> anyhow::Error {
+    let error = breaker
+        .halt_uncertain(planned, OrderErrorCode::ExecutionHalted)
+        .err()
+        .unwrap_or(OrderSubmitError::Halted {
+            code: OrderErrorCode::ExecutionHalted,
+        });
+    anyhow::Error::new(error)
 }
 
 fn exit_plan(pos: &OpenPosition, midprice: f64, price_buffer: f64) -> PlannedOrder {
@@ -368,6 +396,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accepted_exit_fill_position_apply_failure_stops_monitor_before_second_gateway_call() {
+        let positions = PositionStore::new_paper();
+        let position = pos(0.50, 30.0, 20.0, Side::Buy);
+        positions.apply_open(position.clone()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("execution-halt.json");
+        let breaker = test_breaker(marker.clone());
+        let order_id = OrderId::from_hex(format!("0x{}", "32".repeat(32))).unwrap();
+        let gateway = Arc::new(ApplyCloseBeforeReceiptGateway {
+            positions: Arc::clone(&positions),
+            close: PositionClose {
+                position_id: position.position_id,
+                closing_intent_id: IntentId(uuid::Uuid::from_u128(32)),
+                closing_order_id: order_id.clone(),
+                shares_micros: position.shares_micros,
+                usd_micros: 70_000_000,
+                closed_at: Utc::now() - chrono::Duration::days(1),
+            },
+            receipt: OrderReceipt {
+                order_id: order_id.as_str().to_owned(),
+                filled_shares_micros: position.shares_micros,
+                filled_usd_micros: 70_000_000,
+            },
+            calls: AtomicUsize::new(0),
+            plans: Mutex::new(Vec::new()),
+        });
+        let gateway_trait: Arc<dyn OrderGateway> = gateway.clone();
+        let mut cfg: AppConfig = serde_json::from_str(include_str!("../../config.json")).unwrap();
+        cfg.tp_sl.enabled = true;
+        cfg.tp_sl.poll_interval_secs = 1;
+
+        let mut handle = spawn(
+            cfg.tp_sl,
+            Arc::clone(&positions),
+            gateway_trait,
+            Arc::clone(&breaker),
+            Arc::new(FixedMidprice(0.70)),
+            0.005,
+        );
+        let completion =
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut handle).await;
+        if completion.is_err() {
+            handle.abort();
+        }
+        let error = completion
+            .expect("post-fill position failure must stop the monitor")
+            .expect("monitor task must join")
+            .unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<OrderSubmitError>(),
+            Some(OrderSubmitError::Halted {
+                code: OrderErrorCode::ExecutionHalted
+            })
+        ));
+        assert!(breaker.is_halted());
+        assert!(marker.is_file());
+        assert_eq!(gateway.calls(), 1);
+
+        let planned = gateway.plans.lock()[0].clone();
+        assert!(matches!(
+            breaker.submit_fok(gateway.as_ref(), &planned).await,
+            Err(OrderSubmitError::Halted { .. })
+        ));
+        assert_eq!(gateway.calls(), 1);
+    }
+
+    #[tokio::test]
     async fn rejected_exit_keeps_position_and_breaker_open() {
         let positions = PositionStore::new_paper();
         let position = pos(0.50, 30.0, 20.0, Side::Buy);
@@ -392,6 +488,47 @@ mod tests {
 
         assert!(matches!(outcome, ExitOutcome::Rejected(_)));
         assert!(positions.get_by_token(&position.token_id).is_some());
+        assert!(!breaker.is_halted());
+    }
+
+    #[tokio::test]
+    async fn invalid_midpoints_are_typed_no_submit_outcomes() {
+        let positions = PositionStore::new_paper();
+        let position = pos(0.50, 30.0, 20.0, Side::Buy);
+        positions.apply_open(position.clone()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let breaker = test_breaker(dir.path().join("execution-halt.json"));
+        let gateway = Arc::new(FakeGateway::returning(Ok(OrderReceipt {
+            order_id: format!("0x{}", "33".repeat(32)),
+            filled_shares_micros: position.shares_micros,
+            filled_usd_micros: 70_000_000,
+        })));
+
+        for invalid in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -0.01,
+            0.0,
+            1.0,
+            1.01,
+        ] {
+            let outcome = monitor_once(
+                &position,
+                &positions,
+                gateway.as_ref(),
+                breaker.as_ref(),
+                &FixedMidprice(invalid),
+                0.005,
+            )
+            .await
+            .unwrap();
+
+            assert!(matches!(outcome, ExitOutcome::InvalidMidpoint));
+        }
+
+        assert_eq!(gateway.calls(), 0);
+        assert!(positions.get_by_id(&position.position_id).is_some());
         assert!(!breaker.is_halted());
     }
 
@@ -528,6 +665,33 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.plans.lock().push(planned.clone());
             self.result.clone()
+        }
+    }
+
+    struct ApplyCloseBeforeReceiptGateway {
+        positions: Arc<PositionStore>,
+        close: PositionClose,
+        receipt: OrderReceipt,
+        calls: AtomicUsize,
+        plans: Mutex<Vec<PlannedOrder>>,
+    }
+
+    impl ApplyCloseBeforeReceiptGateway {
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl OrderGateway for ApplyCloseBeforeReceiptGateway {
+        async fn submit_fok(
+            &self,
+            planned: &PlannedOrder,
+        ) -> Result<OrderReceipt, OrderSubmitError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.plans.lock().push(planned.clone());
+            self.positions.apply_close(self.close.clone()).unwrap();
+            Ok(self.receipt.clone())
         }
     }
 }

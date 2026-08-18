@@ -16,7 +16,7 @@ use crate::service::execution_ledger::{
     ExecutionLedger, IntentId, OrderId, OrderSide, PositionId, TokenId, Venue,
 };
 use crate::service::market_cache::{MarketCache, MarketInfo};
-use crate::service::order_gateway::{OrderGateway, OrderReceipt, OrderSubmitError};
+use crate::service::order_gateway::{OrderErrorCode, OrderGateway, OrderReceipt, OrderSubmitError};
 use crate::service::position_store::{OpenPosition, PositionStore};
 use crate::service::risk_guard::{BlockReason, RiskCheck, RiskGuard};
 use crate::service::strategy;
@@ -235,7 +235,12 @@ impl OrderExecutor {
             .ok_or_else(|| anyhow!("live breaker unavailable"))?;
         match breaker.submit_fok(gateway.as_ref(), &planned).await {
             Ok(receipt) => {
-                self.record_open_from_receipt(&market, &planned, &receipt)?;
+                if self
+                    .record_open_from_receipt(&market, &planned, &receipt)
+                    .is_err()
+                {
+                    return Err(halt_after_filled_position_failure(breaker, &planned));
+                }
                 Ok(ExecutionOutcome::Filled(receipt))
             }
             Err(
@@ -382,6 +387,19 @@ impl OrderExecutor {
     }
 }
 
+fn halt_after_filled_position_failure(
+    breaker: &ExecutionCircuitBreaker,
+    planned: &PlannedOrder,
+) -> anyhow::Error {
+    let error = breaker
+        .halt_uncertain(planned, OrderErrorCode::ExecutionHalted)
+        .err()
+        .unwrap_or(OrderSubmitError::Halted {
+            code: OrderErrorCode::ExecutionHalted,
+        });
+    anyhow::Error::new(error)
+}
+
 fn ledger_venue(venue: crate::models::VenueId) -> Result<Venue> {
     match venue {
         crate::models::VenueId::Polymarket => Ok(Venue::PolymarketClob),
@@ -399,12 +417,14 @@ fn ledger_side(side: Side) -> OrderSide {
 }
 
 fn micros_from_f64(value: f64) -> Result<u128> {
+    const U128_EXCLUSIVE_UPPER_BOUND: f64 = f64::from_bits(0x47f0_0000_0000_0000);
+
     let scaled = value * 1_000_000.0;
     let rounded = scaled.round();
     if !scaled.is_finite()
         || scaled <= 0.0
         || (scaled - rounded).abs() > 1e-6
-        || rounded > u128::MAX as f64
+        || rounded >= U128_EXCLUSIVE_UPPER_BOUND
     {
         return Err(anyhow!(
             "value cannot be represented in integer micro-units"
@@ -641,6 +661,21 @@ mod tests {
         assert!(!format!("{outcome:?}").contains(order_id));
     }
 
+    #[test]
+    fn micros_conversion_rejects_the_u128_saturation_boundary() {
+        let exclusive_upper_bound = 2.0_f64.powi(128);
+        let saturation_input = exclusive_upper_bound / 1_000_000.0;
+        assert_eq!(saturation_input * 1_000_000.0, exclusive_upper_bound);
+
+        assert!(micros_from_f64(saturation_input).is_err());
+
+        let representable_below_bound =
+            f64::from_bits(exclusive_upper_bound.to_bits() - 8) / 1_000_000.0;
+        let converted = micros_from_f64(representable_below_bound).unwrap();
+        assert!(converted > 0);
+        assert!(converted < u128::MAX);
+    }
+
     #[tokio::test]
     async fn matched_live_receipt_records_actual_filled_amounts() {
         let (mut cfg, markets, server) = fixture_runtime(true).await;
@@ -675,6 +710,73 @@ mod tests {
         assert_eq!(position.shares_micros, 39_000_000);
         assert_eq!(position.usd_notional_micros, 19_500_000);
         assert_eq!(position.entry_price(), 0.5);
+        assert_eq!(gateway.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn accepted_entry_fill_position_apply_failure_halts_before_second_gateway_call() {
+        let (mut cfg, markets, server) = fixture_runtime(true).await;
+        let halt_dir = tempfile::tempdir().unwrap();
+        let marker = halt_dir.path().join("execution-halt.json");
+        cfg.trading.execution_halt_path = marker.clone();
+        let (ledger, positions, breaker) = test_live_components(marker.clone());
+        let order_id = OrderId::from_hex(format!("0x{}", "bc".repeat(32))).unwrap();
+        prepare_matched_entry(&ledger, order_id.clone());
+        let conflicting_record = OpenPosition {
+            position_id: PositionId(uuid::Uuid::from_u128(500)),
+            opening_intent_id: IntentId(uuid::Uuid::from_u128(500)),
+            opening_order_id: order_id.clone(),
+            venue: Venue::PolymarketClob,
+            token_id: TokenId::from_decimal("12345").unwrap(),
+            slug: "fixture-market".into(),
+            category: "Politics".into(),
+            tags: vec!["election".into()],
+            neg_risk: false,
+            side: OrderSide::Buy,
+            shares_micros: 39_000_000,
+            usd_notional_micros: 19_500_000,
+            take_profit_bps: 4_000,
+            stop_loss_bps: 2_500,
+            opened_at: Utc::now() - chrono::Duration::days(1),
+        };
+        let gateway = Arc::new(ApplyOpenBeforeReceiptGateway {
+            positions: Arc::clone(&positions),
+            position: conflicting_record,
+            receipt: OrderReceipt {
+                order_id: order_id.as_str().to_owned(),
+                filled_shares_micros: 39_000_000,
+                filled_usd_micros: 19_500_000,
+            },
+            calls: AtomicUsize::new(0),
+            plans: Mutex::new(Vec::new()),
+        });
+        let executor = OrderExecutor::new_with_live_components(
+            cfg,
+            RiskGuard::new(test_cfg()),
+            markets,
+            Arc::clone(&positions),
+            Some(gateway.clone()),
+            Some(Arc::clone(&breaker)),
+        );
+
+        let error = executor.execute(&fixture_trade()).await.unwrap_err();
+        server.await.unwrap();
+
+        assert!(matches!(
+            error.downcast_ref::<OrderSubmitError>(),
+            Some(OrderSubmitError::Halted {
+                code: OrderErrorCode::ExecutionHalted
+            })
+        ));
+        assert!(breaker.is_halted());
+        assert!(marker.is_file());
+        assert_eq!(gateway.calls(), 1);
+
+        let planned = gateway.plans.lock()[0].clone();
+        assert!(matches!(
+            breaker.submit_fok(gateway.as_ref(), &planned).await,
+            Err(OrderSubmitError::Halted { .. })
+        ));
         assert_eq!(gateway.calls(), 1);
     }
 
@@ -870,6 +972,33 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.plans.lock().push(planned.clone());
             self.result.clone()
+        }
+    }
+
+    struct ApplyOpenBeforeReceiptGateway {
+        positions: Arc<PositionStore>,
+        position: OpenPosition,
+        receipt: OrderReceipt,
+        calls: AtomicUsize,
+        plans: Mutex<Vec<PlannedOrder>>,
+    }
+
+    impl ApplyOpenBeforeReceiptGateway {
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl OrderGateway for ApplyOpenBeforeReceiptGateway {
+        async fn submit_fok(
+            &self,
+            planned: &PlannedOrder,
+        ) -> Result<OrderReceipt, OrderSubmitError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.plans.lock().push(planned.clone());
+            self.positions.apply_open(self.position.clone()).unwrap();
+            Ok(self.receipt.clone())
         }
     }
 }
