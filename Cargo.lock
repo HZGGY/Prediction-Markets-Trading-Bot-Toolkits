@@ -3354,6 +3354,7 @@ dependencies = [
  "alloy-signer",
  "alloy-signer-local",
  "alloy-sol-types 0.8.26",
+ "alloy-sol-types 1.6.1",
  "anyhow",
  "async-trait",
  "base64",

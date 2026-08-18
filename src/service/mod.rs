@@ -14,6 +14,7 @@
 
 pub mod clob;
 pub mod clob_auth;
+pub mod clob_sdk_orders;
 pub mod eligibility;
 pub mod execution_circuit_breaker;
 pub mod market_cache;
