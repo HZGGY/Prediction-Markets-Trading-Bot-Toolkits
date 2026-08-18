@@ -523,7 +523,8 @@ impl LedgerProjection {
     ) -> Result<(), LedgerError> {
         let active = self.active_mut(intent_id)?;
         if active.state != ActiveIntentState::ReconciliationStarted
-            || active.position_event_id.is_some()
+            || (active.position_event_id.is_some()
+                && classification != ActiveIntentState::ReconciledUncertain)
         {
             return Err(LedgerError::new(LedgerErrorCode::IllegalTransition));
         }
@@ -1448,5 +1449,112 @@ mod tests {
 
         assert!(fixtures.projection.active.is_none());
         assert_eq!(fixtures.projection.positions.len(), 1);
+    }
+
+    #[test]
+    fn durable_entry_position_allows_only_uncertain_non_mutating_classification() {
+        let mut fixtures = Fixtures::new();
+        let intent = intent_id(1);
+        let position_id = PositionId(intent.0);
+        let position_event_id = fixtures.apply_entry_until(intent, EntryTerminal::PositionRecorded);
+        let durable_position = fixtures.projection.positions[&position_id].clone();
+        fixtures.apply(intent, LedgerPayload::ReconciliationStarted);
+
+        for illegal in [
+            LedgerPayload::ReconciledNoFill {
+                status: TerminalNoFillStatus::Canceled,
+            },
+            LedgerPayload::ReconciledLive,
+            LedgerPayload::ReconciledPending,
+        ] {
+            let event = fixtures.event(intent, illegal);
+            assert_eq!(
+                fixtures.projection.apply(&event).unwrap_err().code(),
+                LedgerErrorCode::IllegalTransition
+            );
+            assert_eq!(
+                fixtures.projection.positions[&position_id],
+                durable_position
+            );
+        }
+
+        fixtures.apply(
+            intent,
+            LedgerPayload::ReconciledUncertain {
+                code: ReconcileUncertainCode::Timeout,
+            },
+        );
+
+        let active = fixtures.projection.active.as_ref().unwrap();
+        assert_eq!(active.state, ActiveIntentState::ReconciledUncertain);
+        assert_eq!(active.position_event_id, Some(position_event_id));
+        assert_eq!(
+            active.evidence,
+            ActiveEvidence::ReconciledUncertain(ReconcileUncertainCode::Timeout)
+        );
+        assert_eq!(
+            fixtures.projection.positions[&position_id],
+            durable_position
+        );
+    }
+
+    #[test]
+    fn durable_exit_position_allows_only_uncertain_non_mutating_classification() {
+        let mut fixtures = Fixtures::new();
+        let opening_intent = intent_id(1);
+        let exit_intent_id = intent_id(2);
+        let position_id = PositionId(opening_intent.0);
+        fixtures.apply_entry_until(opening_intent, EntryTerminal::Committed);
+        fixtures.apply(
+            exit_intent_id,
+            LedgerPayload::IntentPrepared(exit_intent(position_id, 0x22)),
+        );
+        fixtures.apply(exit_intent_id, LedgerPayload::SubmitStarted);
+        fixtures.apply(exit_intent_id, LedgerPayload::RemoteMatched(sell_match()));
+        let position_event = fixtures.event(
+            exit_intent_id,
+            LedgerPayload::PositionClosed(close(position_id, exit_intent_id, 0x22)),
+        );
+        let position_event_id = position_event.event_id;
+        fixtures.projection.apply(&position_event).unwrap();
+        let durable_position = fixtures.projection.positions[&position_id].clone();
+        fixtures.apply(exit_intent_id, LedgerPayload::ReconciliationStarted);
+
+        for illegal in [
+            LedgerPayload::ReconciledNoFill {
+                status: TerminalNoFillStatus::Rejected,
+            },
+            LedgerPayload::ReconciledLive,
+            LedgerPayload::ReconciledPending,
+        ] {
+            let event = fixtures.event(exit_intent_id, illegal);
+            assert_eq!(
+                fixtures.projection.apply(&event).unwrap_err().code(),
+                LedgerErrorCode::IllegalTransition
+            );
+            assert_eq!(
+                fixtures.projection.positions[&position_id],
+                durable_position
+            );
+        }
+
+        fixtures.apply(
+            exit_intent_id,
+            LedgerPayload::ReconciledUncertain {
+                code: ReconcileUncertainCode::Transport,
+            },
+        );
+
+        let active = fixtures.projection.active.as_ref().unwrap();
+        assert_eq!(active.state, ActiveIntentState::ReconciledUncertain);
+        assert_eq!(active.position_event_id, Some(position_event_id));
+        assert_eq!(
+            active.evidence,
+            ActiveEvidence::ReconciledUncertain(ReconcileUncertainCode::Transport)
+        );
+        assert_eq!(
+            fixtures.projection.positions[&position_id],
+            durable_position
+        );
     }
 }

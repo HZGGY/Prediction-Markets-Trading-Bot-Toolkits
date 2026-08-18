@@ -1,8 +1,12 @@
-use std::{error::Error, fmt, str::FromStr};
+use std::{collections::HashSet, error::Error, fmt, str::FromStr};
 
 use alloy_primitives::U256;
 use chrono::{DateTime, Utc};
-use serde::{de, ser::SerializeStruct, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{
+    de::{self, MapAccess, SeqAccess, Visitor},
+    ser::SerializeStruct,
+    Deserialize, Deserializer, Serialize, Serializer,
+};
 use uuid::Uuid;
 
 pub const LEDGER_SCHEMA_VERSION: u32 = 1;
@@ -586,6 +590,99 @@ impl LedgerPayload {
     }
 }
 
+struct UniqueJsonValue(serde_json::Value);
+
+struct UniqueJsonValueVisitor;
+
+impl<'de> Visitor<'de> for UniqueJsonValueVisitor {
+    type Value = UniqueJsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("JSON without duplicate object fields")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Number(value.into())))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Number(value.into())))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .map(UniqueJsonValue)
+            .ok_or_else(|| de::Error::custom("invalid JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::String(value.to_owned())))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::String(value)))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Null))
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        UniqueJsonValue::deserialize(deserializer)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element::<UniqueJsonValue>()? {
+            values.push(value.0);
+        }
+        Ok(UniqueJsonValue(serde_json::Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut fields = serde_json::Map::new();
+        let mut seen = HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !seen.insert(key.clone()) {
+                return Err(de::Error::custom("duplicate JSON field"));
+            }
+            let value = map.next_value::<UniqueJsonValue>()?;
+            fields.insert(key, value.0);
+        }
+        Ok(UniqueJsonValue(serde_json::Value::Object(fields)))
+    }
+}
+
+impl<'de> Deserialize<'de> for UniqueJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueJsonValueVisitor)
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RemoteRejectedPayload {
@@ -650,11 +747,11 @@ impl<'de> Deserialize<'de> for LedgerPayload {
         #[serde(deny_unknown_fields)]
         struct Wire {
             kind: String,
-            payload: serde_json::Value,
+            payload: UniqueJsonValue,
         }
 
         let wire = Wire::deserialize(deserializer)?;
-        Self::from_parts(&wire.kind, wire.payload).map_err(de::Error::custom)
+        Self::from_parts(&wire.kind, wire.payload.0).map_err(de::Error::custom)
     }
 }
 
@@ -707,14 +804,14 @@ impl<'de> Deserialize<'de> for LedgerEvent {
             intent_id: IntentId,
             recorded_at: DateTime<Utc>,
             kind: String,
-            payload: serde_json::Value,
+            payload: UniqueJsonValue,
             previous_hash: EventHash,
             event_hash: EventHash,
         }
 
         let wire = Wire::deserialize(deserializer)?;
         let payload =
-            LedgerPayload::from_parts(&wire.kind, wire.payload).map_err(de::Error::custom)?;
+            LedgerPayload::from_parts(&wire.kind, wire.payload.0).map_err(de::Error::custom)?;
         Ok(Self {
             schema_version: wire.schema_version,
             sequence: wire.sequence,
@@ -1067,6 +1164,97 @@ mod tests {
         let mut nested = serde_json::to_value(event).unwrap();
         nested["payload"]["purpose"]["unexpected_nested"] = json!(true);
         assert!(serde_json::from_value::<LedgerEvent>(nested).is_err());
+    }
+
+    #[test]
+    fn raw_ledger_payload_rejects_duplicate_variant_payload_fields() {
+        let raw = r#"{"kind":"remote_rejected","payload":{"code":"http_rejected","code":"server_rejected"}}"#;
+
+        assert!(serde_json::from_str::<LedgerPayload>(raw).is_err());
+    }
+
+    #[test]
+    fn raw_ledger_payload_rejects_duplicate_nested_payload_fields() {
+        let raw = r#"{
+            "kind":"intent_prepared",
+            "payload":{
+                "order_id":"0x1111111111111111111111111111111111111111111111111111111111111111",
+                "protocol_version":2,
+                "venue":"polymarket_clob",
+                "token_id":"123",
+                "neg_risk":false,
+                "side":"buy",
+                "order_type":"fok",
+                "expected_maker_micros":"5",
+                "expected_taker_micros":"10",
+                "source_hash":null,
+                "purpose":{
+                    "purpose":"entry",
+                    "slug":"first",
+                    "slug":"second",
+                    "category":"testing",
+                    "tags":[],
+                    "take_profit_bps":1250,
+                    "stop_loss_bps":750
+                }
+            }
+        }"#;
+
+        assert!(serde_json::from_str::<LedgerPayload>(raw).is_err());
+    }
+
+    #[test]
+    fn raw_ledger_event_rejects_duplicate_variant_payload_fields() {
+        let raw = r#"{
+            "schema_version":1,
+            "sequence":1,
+            "event_id":"00000000-0000-0000-0000-00000000000a",
+            "intent_id":"00000000-0000-0000-0000-000000000001",
+            "recorded_at":"2026-08-18T12:34:56Z",
+            "kind":"remote_rejected",
+            "payload":{"code":"http_rejected","code":"server_rejected"},
+            "previous_hash":"0000000000000000000000000000000000000000000000000000000000000000",
+            "event_hash":"4444444444444444444444444444444444444444444444444444444444444444"
+        }"#;
+
+        assert!(serde_json::from_str::<LedgerEvent>(raw).is_err());
+    }
+
+    #[test]
+    fn raw_ledger_event_rejects_duplicate_nested_payload_fields() {
+        let raw = r#"{
+            "schema_version":1,
+            "sequence":1,
+            "event_id":"00000000-0000-0000-0000-00000000000a",
+            "intent_id":"00000000-0000-0000-0000-000000000001",
+            "recorded_at":"2026-08-18T12:34:56Z",
+            "kind":"intent_prepared",
+            "payload":{
+                "order_id":"0x1111111111111111111111111111111111111111111111111111111111111111",
+                "protocol_version":2,
+                "venue":"polymarket_clob",
+                "token_id":"123",
+                "neg_risk":false,
+                "side":"buy",
+                "order_type":"fok",
+                "expected_maker_micros":"5",
+                "expected_taker_micros":"10",
+                "source_hash":null,
+                "purpose":{
+                    "purpose":"entry",
+                    "slug":"first",
+                    "slug":"second",
+                    "category":"testing",
+                    "tags":[],
+                    "take_profit_bps":1250,
+                    "stop_loss_bps":750
+                }
+            },
+            "previous_hash":"0000000000000000000000000000000000000000000000000000000000000000",
+            "event_hash":"4444444444444444444444444444444444444444444444444444444444444444"
+        }"#;
+
+        assert!(serde_json::from_str::<LedgerEvent>(raw).is_err());
     }
 
     #[test]
