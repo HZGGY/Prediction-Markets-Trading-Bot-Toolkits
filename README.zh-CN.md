@@ -79,7 +79,45 @@ cargo run --release -- run copy-trading
 
 这两个命令只允许连接 `https://clob-v2.polymarket.com`。Create 和 Derive 严格分离，不会静默 fallback。如果设置了 `PM_PRIVATE_KEY` 或 `PM_FUNDER_ADDRESS`，其生效账户必须与目标 YAML 中已有账户一致，否则命令会在签名和联网前停止。成功后只会原子更新既有 YAML 中的三个 API 凭据字段；终端和日志只显示脱敏后的 API Key 摘要。HTTP 失败仅暴露安全的状态码、方法和端点信息；Create 冲突会明确提示手动运行 `derive-api-key`。获取凭据不会自动开启交易，也不会关闭 mock 模式；已测试的 SDK 依赖图由纳入版本控制的 `Cargo.lock` 固定。第二阶段仅通过本地回环测试验证，未对真实 CLOB 执行任何一个命令。
 
-**第二阶段执行边界：** 严格纸面模式既不签名，也不会调用任何 CLOB 端点（包括 midpoint）。只有 SDK 返回精确的完全成交响应时才更新本地仓位。任何不确定结果都会写入持久化的 `execution-halt.json` 标记，阻止之后所有入场和出场，且绝不重试；在完成外部对账前不得删除该标记。第二阶段不授权实盘交易。余额与授权检查、对账、撤单、在途订单日志以及受控的真实端点验证均留待第三阶段。
+**第二阶段执行边界：** 严格纸面模式既不签名，也不会调用任何 CLOB 端点（包括 midpoint）。只有 SDK 返回精确的完全成交响应时才更新本地仓位。任何不确定结果都会写入持久化的 `execution-halt.json` 标记，阻止之后所有入场和出场，且绝不重试。第二阶段不授权实盘交易。
+
+#### Phase 3A 持久恢复操作边界——仅限离线/回环验收
+
+Phase 3A 增加了失效即关闭（fail-closed）的本地恢复账本；它**不授权实盘交易、真实资金、真实凭据或面向公网端点的恢复操作**。其实现和验收只使用离线测试与回环夹具。不得把下列恢复命令连到生产主机，也不得以真实凭据作为 Phase 3A 的验收步骤。
+
+权威账本路径是 `trading.execution_ledger_path`（默认值：`execution-ledger.jsonl`）。同级活动快照和锁文件分别派生为 `<ledger>.active.json` 与 `<ledger>.lock`，不能单独配置。绝不可删除、截断、编辑、替换或“修复”JSONL 账本或活动快照。绝不可通过删除或编辑 `execution-halt.json` 来恢复运行：删除标记无法解除活动账本意图，人工修改会使进程继续安全地保持停止状态。
+
+全局选项必须写在 `recovery` 之前；`--credentials` 如出现同样是全局选项，也必须位于 `recovery` 之前。只使用占位符。
+
+```powershell
+# 仅本地：只读取公开配置和带锁账本；凭据即使提供也会被忽略且不会加载。
+.\target\release\polymarket-toolkits.exe --config <public-config.json> recovery inspect [--intent <intent-id>] [--show-order-id]
+.\target\release\polymarket-toolkits.exe --config <public-config.json> recovery apply --intent <intent-id> --confirm <challenge>
+.\target\release\polymarket-toolkits.exe --config <public-config.json> recovery acknowledge --intent <intent-id> --confirm <challenge>
+
+# 仅对一个具名精确操作授予显式网络权限：必须提供凭据。
+.\target\release\polymarket-toolkits.exe --config <public-config.json> --credentials <credentials.yaml> recovery reconcile --intent <intent-id>
+.\target\release\polymarket-toolkits.exe --config <public-config.json> --credentials <credentials.yaml> recovery prepare-cancel --intent <intent-id>
+.\target\release\polymarket-toolkits.exe --config <public-config.json> --credentials <credentials.yaml> recovery cancel --intent <intent-id> --confirm <challenge>
+```
+
+`inspect`、`apply` 和 `acknowledge` 只加载公开配置与本地持久状态；它们忽略凭据来源，且无法构造恢复 SDK gateway。`reconcile`、`prepare-cancel` 和 `cancel` 必须加载凭据，但只授权本次调用中的那个具名精确操作。默认 inspect 只显示订单 ID 提示；只有显式执行本地 `inspect --show-order-id` 才显示完整 ID。不存在 `--force`、`--yes`、重试、自动 reconcile/apply/acknowledge、重启后重新 POST 或自动清理标记。
+
+必须按状态走流程，不能假定存在通用的“成功路径”：
+
+```text
+inspect -> reconcile -> [prepare-cancel -> cancel -> reconcile]
+                    \-> apply -> acknowledge
+```
+
+- 从 `inspect` 开始。经本地证明为 `NotSent` 的意图可以取得新的 acknowledge 挑战；经证明精确的零成交终态（`ReconciledNoFill`）也可以用其新的挑战进行 acknowledge。
+- 精确、正数、完全成交的 FOK 匹配（`ReconciledMatched`）本身不会改变仓位。必须先执行新的 `apply`，再使用新生成的挑战执行 `acknowledge`。
+- 只有新鲜的精确 **Live** 结果才可能启用 `prepare-cancel`。一次撤单仅指一个账本所属的精确订单、一次 DELETE，以及强制的精确重新查询；DELETE 响应本身绝不是终态证据。`Pending` 不会获得撤单挑战，仍保持停止状态。
+- 404/未找到歧义、部分成交、字段或交易缺失/不匹配、畸形或不可用证据、未知状态、不确定撤单或撤单后的不匹配都会继续停止，且不能 acknowledge。
+
+启动时为零网络且不进行自动修复。`active_unresolved` 要求在重启前完成人工恢复/对账。`cleanup_pending` 仅表示继续有限的 acknowledge 清理；不得重新对账或直接删除标记。`orphan_marker` 表示必须保留并检查标记；不得删除。若账本被锁定、出现完整性冲突、账本损坏/截断或快照不一致，请停止并遵循静态诊断：保留文件、在适用时识别锁持有者，且不要编辑、覆盖、修复或重试启动。
+
+Phase 3B 仍是账户能力门禁（pUSD/可用购买力、标准/neg-risk 与条件代币授权、账户/funder/signature-type 一致性及未完成订单预留）。Phase 3C 需要单独的明确授权，才可进行受控的真实端点验收，包括无资金认证和只读检查。Phase 3D 还需要单独设计和明确授权，才可在隔离 EOA 上进行微额评估，并设置硬限额、逐订单人工确认、监控和回滚。所有适用的后续门禁独立完成之前，本仓库**尚未具备实盘就绪条件**。
 
 </td>
 <td width="50%" valign="top">

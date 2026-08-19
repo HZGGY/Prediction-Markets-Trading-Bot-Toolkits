@@ -1118,7 +1118,7 @@ git commit -m "feat: wire fail closed durable runtime"
 **Interfaces:**
 - Documents: ledger path, exact manual sequence, marker prohibition, local/network privilege split, Phase 3A non-live boundary, and remaining Phase 3B–3D gates.
 
-- [ ] **Step 1: Add matching English and Chinese recovery sections**
+- [x] **Step 1: Add matching English and Chinese recovery sections**
 
 Document the exact flow:
 
@@ -1129,14 +1129,14 @@ inspect -> reconcile -> [prepare-cancel -> cancel -> reconcile]
 
 State explicitly: never delete `execution-halt.json` to resume; a recovered match requires `apply` then `acknowledge`; 404/partial/unknown cannot be acknowledged; Phase 3A used only offline and loopback acceptance and does not authorize live use.
 
-- [ ] **Step 2: Run focused and full offline tests**
+- [x] **Step 2: Run focused and full offline tests**
 
 ```powershell
 cargo test --offline --locked service::execution_ledger
 cargo test --offline --locked service::clob_sdk_orders
 cargo test --offline --locked service::clob_sdk_recovery
 cargo test --offline --locked service::recovery_service
-cargo test --offline --locked --test execution_crash_matrix
+cargo test --offline --locked execution_crash_matrix -- --test-threads=1
 cargo test --all-targets --offline --locked
 ```
 
@@ -1153,7 +1153,7 @@ git diff --check
 
 If repository-wide `cargo fmt -- --check` reports known unrelated baseline differences, run `rustfmt` only on changed Rust files with the repository toolchain and record the unchanged baseline separately; do not reformat unrelated files.
 
-- [ ] **Step 4: Run safety scans**
+- [x] **Step 4: Run safety scans**
 
 ```powershell
 rg -n "PRIVATE KEY|BEGIN PRIVATE|api_secret|api_passphrase|POLY_SIGNATURE|POLY_PASSPHRASE" . --glob "!target/**" --glob "!config.yaml" --glob "!*.example"
@@ -1165,7 +1165,7 @@ rg -n "https://clob-v2.polymarket.com|wss://|gamma-api" tests src --glob "*test*
 
 Expected: only intentional sanitized fields, SDK adapter references, negative tests, docs, and production host guards appear. No broad-cancel call is reachable from application recovery code; no committed live config exists.
 
-- [ ] **Step 5: Perform independent specification and code review**
+- [x] **Step 5: Perform independent specification and code review**
 
 Use `superpowers:requesting-code-review`. Review specifically:
 
@@ -1185,7 +1185,7 @@ Address every High/Critical issue, rerun affected gates, and preserve the review
 
 Record architecture, implementation commit IDs, verified test counts, review outcome, and remaining Phase 3B–3D boundary. Do not store ledger contents, complete order IDs, credentials, signatures, bodies, or raw terminal output.
 
-- [ ] **Step 7: Commit Task 14**
+- [x] **Step 7: Commit Task 14**
 
 ```powershell
 git add -- README.md README.zh-CN.md docs/superpowers/plans/2026-08-18-phase-3a-durable-recovery.md
@@ -1196,15 +1196,15 @@ git commit -m "docs: complete phase 3a recovery guidance"
 
 ## Completion Checklist
 
-- [ ] Official contract algorithm and independent fixed vector prove the exact V2 order ID.
-- [ ] Exact ID and synchronized `SubmitStarted` exist before POST bytes may leave.
-- [ ] No normal, restart, or recovery path retries or reposts an uncertain order.
-- [ ] JSONL replay, hash chain, lock, active snapshot, and failure injection all fail closed.
-- [ ] Live positions rebuild exactly from integer ledger events; paper positions remain isolated.
-- [ ] Only exact full FOK evidence can create a position event.
-- [ ] Recovery apply and acknowledge are separate, fresh-challenge human actions.
-- [ ] Cancellation is one exact order, one DELETE, and mandatory exact re-query.
-- [ ] Local commands do not load credentials; network commands have narrow explicit authority.
-- [ ] Marker deletion cannot bypass an active ledger intent.
-- [ ] All acceptance tests are offline or loopback and use no real credentials.
+- [x] Official contract algorithm and independent fixed vector prove the exact V2 order ID.
+- [x] Exact ID and synchronized `SubmitStarted` exist before POST bytes may leave.
+- [x] No normal, restart, or recovery path retries or reposts an uncertain order.
+- [x] JSONL replay, hash chain, lock, active snapshot, and failure injection all fail closed.
+- [x] Live positions rebuild exactly from integer ledger events; paper positions remain isolated.
+- [x] Only exact full FOK evidence can create a position event.
+- [x] Recovery apply and acknowledge are separate, fresh-challenge human actions.
+- [x] Cancellation is one exact order, one DELETE, and mandatory exact re-query.
+- [x] Local commands do not load credentials; network commands have narrow explicit authority.
+- [x] Marker deletion cannot bypass an active ledger intent.
+- [x] All acceptance tests are offline or loopback and use no real credentials.
 - [ ] English/Chinese docs and safe Obsidian project memory state that Phase 3A is not live authorization.

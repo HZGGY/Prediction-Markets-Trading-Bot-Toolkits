@@ -79,7 +79,45 @@ After copying `config.yaml.example` to an existing `config.yaml` and filling the
 
 These commands contact only `https://clob-v2.polymarket.com`. Create and derive are explicit and never silently fall back to each other. If `PM_PRIVATE_KEY` or `PM_FUNDER_ADDRESS` is set, its effective account must match the account already stored in the target YAML; otherwise the command stops before signing or networking. On success, only the three API credential fields in the existing YAML are atomically updated; terminal/log output shows only a redacted API-key summary. HTTP failures expose only safe status/method/path details, and a create conflict tells you to run `derive-api-key` explicitly. Obtaining credentials does not enable trading or disable mock mode. The tested SDK dependency graph is fixed by the tracked `Cargo.lock`. Phase 2 validated the flow with local loopback tests only and did not execute either command against the real CLOB.
 
-**Phase-2 execution boundary:** strict paper mode neither signs nor calls any CLOB endpoint, including midpoint. Only an exact fully matched SDK response updates local positions. Any uncertain result writes the persistent `execution-halt.json` marker, blocks every later entry and exit, and is never retried; do not delete that marker before external reconciliation. Phase 2 does not authorize live trading. Balance and allowance checks, reconciliation, cancellation, in-flight journaling, and controlled real-endpoint validation remain phase 3 work.
+**Phase-2 execution boundary:** strict paper mode neither signs nor calls any CLOB endpoint, including midpoint. Only an exact fully matched SDK response updates local positions. Any uncertain result writes the persistent `execution-halt.json` marker, blocks every later entry and exit, and is never retried. Phase 2 did not authorize live trading.
+
+#### Phase 3A durable recovery operator boundary — offline/loopback acceptance only
+
+Phase 3A adds a fail-closed local recovery ledger; it **does not authorize live trading, real-funds use, real credentials, or public-endpoint recovery**. Its implementation and acceptance use offline tests and loopback fixtures only. Do not run the recovery commands below against a production host or with real credentials as a Phase 3A acceptance step.
+
+The authoritative ledger path is `trading.execution_ledger_path` (default: `execution-ledger.jsonl`). Its sibling active snapshot and lock are derived as `<ledger>.active.json` and `<ledger>.lock`; they are not independently configurable. Never delete, truncate, edit, replace, or “repair” the JSONL ledger or active snapshot. Never delete or edit `execution-halt.json` to resume: marker removal cannot resolve an active ledger intent, and manual changes can leave the process safely halted.
+
+Global options are parsed before `recovery`. Use placeholders only; `--credentials`, when present, is also global and must precede `recovery`.
+
+```powershell
+# Local only: public configuration and the lock-bearing ledger; credentials are ignored and not loaded.
+.\target\release\polymarket-toolkits.exe --config <public-config.json> recovery inspect [--intent <intent-id>] [--show-order-id]
+.\target\release\polymarket-toolkits.exe --config <public-config.json> recovery apply --intent <intent-id> --confirm <challenge>
+.\target\release\polymarket-toolkits.exe --config <public-config.json> recovery acknowledge --intent <intent-id> --confirm <challenge>
+
+# Explicit network authority for one named exact operation only: credentials are required.
+.\target\release\polymarket-toolkits.exe --config <public-config.json> --credentials <credentials.yaml> recovery reconcile --intent <intent-id>
+.\target\release\polymarket-toolkits.exe --config <public-config.json> --credentials <credentials.yaml> recovery prepare-cancel --intent <intent-id>
+.\target\release\polymarket-toolkits.exe --config <public-config.json> --credentials <credentials.yaml> recovery cancel --intent <intent-id> --confirm <challenge>
+```
+
+`inspect`, `apply`, and `acknowledge` load only public configuration and local durable state; they ignore credential sources and cannot construct the recovery SDK gateway. `reconcile`, `prepare-cancel`, and `cancel` require credentials and authorize only the named exact operation for that invocation. Default inspection prints an order-ID hint; a complete ID is shown only after explicit local `inspect --show-order-id`. There is no `--force`, `--yes`, retry, automatic reconcile/apply/acknowledge, restart repost, or automatic marker cleanup.
+
+Use the state-dependent flow, never a universal happy path:
+
+```text
+inspect -> reconcile -> [prepare-cancel -> cancel -> reconcile]
+                    \-> apply -> acknowledge
+```
+
+- Start with `inspect`. A locally proven `NotSent` intent may receive a fresh acknowledgement challenge. A proven exact zero-fill terminal result (`ReconciledNoFill`) may also be acknowledged with its fresh challenge.
+- An exact positive, full FOK match (`ReconciledMatched`) does not change positions by itself. Run fresh `apply`, then use the new fresh challenge for `acknowledge`.
+- Only a fresh exact **Live** result may enable `prepare-cancel`. One cancellation means one ledger-owned exact order, one DELETE, then mandatory exact re-query; the DELETE response is never sufficient evidence. A `Pending` result receives no cancellation challenge and remains halted.
+- A 404/not-found ambiguity, partial fill, missing or mismatched fields/trades, malformed or unavailable evidence, unknown status, uncertain cancellation, or a post-cancel mismatch remains halted and cannot be acknowledged.
+
+Startup is zero-network and non-healing. `active_unresolved` requires manual recovery/reconciliation before restart. `cleanup_pending` means resume the bounded acknowledgement cleanup only—do not re-reconcile or delete the marker. `orphan_marker` means preserve and inspect the marker; do not delete it. For a locked ledger, integrity conflict, corrupt/truncated ledger, or inconsistent snapshot, stop and follow the static diagnostic: preserve the files, identify the lock owner where applicable, and do not edit, overwrite, heal, or retry startup.
+
+Phase 3B remains the account-capability gate (pUSD/buying power, standard/neg-risk and conditional-token allowances, account/funder/signature-type consistency, and open-order reservations). Phase 3C requires separate explicit authorization for controlled real-endpoint acceptance, including no-funds authentication and read-only checks. Phase 3D requires a separate design and explicit authorization for an isolated EOA micro-value evaluation with hard limits, per-order human confirmation, monitoring, and rollback. Until all applicable later gates are independently complete, this repository is **not live-ready**.
 
 </td>
 <td width="50%" valign="top">
