@@ -16,12 +16,15 @@ use crate::{
     models::{OrderType, PlannedOrder, Side, VenueId},
     service::{
         execution_ledger::{
-            ExecutionLedger, IntentId, IntentPurpose, LedgerCrashPoint, LedgerEvent, LedgerPayload,
-            OrderId, OrderSide, OrderType as LedgerOrderType, PositionClose, PositionSeed,
-            PreparedIntent, SnapshotDurability, TokenId, Venue, ORDER_PROTOCOL_VERSION,
+            ActiveEvidence, ActiveIntentState, ExecutionLedger, IntentId, IntentPurpose,
+            LedgerCrashPoint, LedgerEvent, LedgerPayload, OrderId, OrderSide,
+            OrderType as LedgerOrderType, PositionClose, PositionSeed, PreparedIntent,
+            RemoteRejectCode, SnapshotDurability, TokenId, UncertainCode, Venue,
+            ORDER_PROTOCOL_VERSION,
         },
         order_gateway::{
-            OrderGateway, OrderReceipt, OrderSubmitError, PrePostJournal, PreparedOrderIdentity,
+            OrderErrorCode, OrderGateway, OrderReceipt, OrderSubmitError, PrePostJournal,
+            PreparedOrderIdentity,
         },
         position_store::{OpenPosition, PositionStore},
     },
@@ -232,6 +235,186 @@ async fn uncertain_submission_records_active_halt_and_reopens_without_gateway_ca
             code: crate::service::order_gateway::OrderErrorCode::ExecutionHalted,
         })
     ));
+}
+
+#[tokio::test]
+async fn remote_outcome_codes_survive_submit_json_and_reopen() {
+    for (input, durable, json_code) in [
+        (OrderErrorCode::PostTimeout, UncertainCode::Timeout, "timeout"),
+        (
+            OrderErrorCode::PostTransport,
+            UncertainCode::Transport,
+            "transport",
+        ),
+        (
+            OrderErrorCode::MalformedResponse,
+            UncertainCode::MalformedResponse,
+            "malformed_response",
+        ),
+        (
+            OrderErrorCode::NonFinalStatus,
+            UncertainCode::NonFinalStatus,
+            "non_final_status",
+        ),
+        (
+            OrderErrorCode::AmountMismatch,
+            UncertainCode::AmountMismatch,
+            "amount_mismatch",
+        ),
+        (
+            OrderErrorCode::ResponseOrderIdMismatch,
+            UncertainCode::ResponseOrderIdMismatch,
+            "response_order_id_mismatch",
+        ),
+        (
+            OrderErrorCode::EmptyOrderId,
+            UncertainCode::EmptyOrderId,
+            "empty_order_id",
+        ),
+        (
+            OrderErrorCode::AmountConversion,
+            UncertainCode::AmountConversion,
+            "amount_conversion",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("execution-ledger.jsonl");
+        let marker_path = dir.path().join("execution-halt.json");
+        let ledger = Arc::new(ExecutionLedger::open_live(&ledger_path).unwrap());
+        let breaker =
+            ExecutionCircuitBreaker::new_live(Arc::clone(&ledger), marker_path.clone()).unwrap();
+        let gateway = ClassifiedOutcomeGateway::uncertain(input);
+
+        let error = breaker
+            .submit_fok(&gateway, &planned_entry(), entry_purpose(), |_| Ok(()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), input);
+        assert_eq!(gateway.calls.load(Ordering::SeqCst), 1);
+
+        let events = read_events(&ledger_path);
+        assert_eq!(
+            events[2].payload,
+            LedgerPayload::RemoteUncertain { code: durable }
+        );
+        let raw: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(&ledger_path)
+                .unwrap()
+                .lines()
+                .nth(2)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(raw["payload"]["code"], json_code);
+
+        drop(breaker);
+        drop(ledger);
+        let reopened = Arc::new(ExecutionLedger::open_live(&ledger_path).unwrap());
+        assert_eq!(
+            reopened.projection().active.unwrap().evidence,
+            ActiveEvidence::RemoteUncertain(durable)
+        );
+        assert_eq!(gateway.calls.load(Ordering::SeqCst), 1);
+        assert!(marker_path.is_file());
+    }
+
+    for (input, durable, json_code) in [
+        (
+            OrderErrorCode::HttpRejected,
+            RemoteRejectCode::HttpRejected,
+            "http_rejected",
+        ),
+        (
+            OrderErrorCode::ServerRejected,
+            RemoteRejectCode::ServerRejected,
+            "server_rejected",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("execution-ledger.jsonl");
+        let marker_path = dir.path().join("execution-halt.json");
+        let ledger = Arc::new(ExecutionLedger::open_live(&ledger_path).unwrap());
+        let breaker =
+            ExecutionCircuitBreaker::new_live(Arc::clone(&ledger), marker_path.clone()).unwrap();
+        let gateway = ClassifiedOutcomeGateway::rejected(input);
+
+        let error = breaker
+            .submit_fok(&gateway, &planned_entry(), entry_purpose(), |_| Ok(()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), input);
+        assert_eq!(gateway.calls.load(Ordering::SeqCst), 1);
+
+        let events = read_events(&ledger_path);
+        assert_eq!(
+            events[2].payload,
+            LedgerPayload::RemoteRejected { code: durable }
+        );
+        let raw: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(&ledger_path)
+                .unwrap()
+                .lines()
+                .nth(2)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(raw["payload"]["code"], json_code);
+
+        drop(breaker);
+        drop(ledger);
+        let reopened = Arc::new(ExecutionLedger::open_live(&ledger_path).unwrap());
+        assert!(reopened.projection().active.is_none());
+        assert_eq!(gateway.calls.load(Ordering::SeqCst), 1);
+        assert!(!marker_path.exists());
+    }
+}
+
+#[tokio::test]
+async fn impossible_post_result_codes_halt_without_durable_relabeling() {
+    for gateway in [
+        ClassifiedOutcomeGateway::uncertain(OrderErrorCode::InvalidHost),
+        ClassifiedOutcomeGateway::rejected(OrderErrorCode::InvalidHost),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("execution-ledger.jsonl");
+        let marker_path = dir.path().join("execution-halt.json");
+        let ledger = Arc::new(ExecutionLedger::open_live(&ledger_path).unwrap());
+        let breaker =
+            ExecutionCircuitBreaker::new_live(Arc::clone(&ledger), marker_path.clone()).unwrap();
+
+        let error = breaker
+            .submit_fok(&gateway, &planned_entry(), entry_purpose(), |_| Ok(()))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            OrderSubmitError::Halted {
+                code: OrderErrorCode::ExecutionHalted,
+            }
+        );
+        assert!(breaker.is_halted());
+        assert_eq!(gateway.calls.load(Ordering::SeqCst), 1);
+        assert!(marker_path.is_file());
+        assert_eq!(
+            read_events(&ledger_path)
+                .iter()
+                .map(|event| event.payload.kind())
+                .collect::<Vec<_>>(),
+            ["intent_prepared", "submit_started"]
+        );
+        drop(breaker);
+        drop(ledger);
+
+        let reopened = Arc::new(ExecutionLedger::open_live(&ledger_path).unwrap());
+        assert!(reopened.projection().active.is_some());
+        assert!(matches!(
+            ExecutionCircuitBreaker::new_live(reopened, marker_path),
+            Err(OrderSubmitError::Halted {
+                code: OrderErrorCode::ExecutionHalted,
+            })
+        ));
+        assert_eq!(gateway.calls.load(Ordering::SeqCst), 1);
+    }
 }
 
 #[tokio::test]
@@ -693,6 +876,76 @@ fn snapshot_replace_crashes_reopen_safely_without_gateway_or_repost() {
 }
 
 #[tokio::test]
+async fn coordinator_snapshot_replace_crashes_before_post_and_never_reposts() {
+    for point in [
+        LedgerCrashPoint::BeforeSnapshotReplace,
+        LedgerCrashPoint::AfterSnapshotReplace,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("execution-ledger.jsonl");
+        let marker_path = dir.path().join("execution-halt.json");
+        let ledger = Arc::new(ExecutionLedger::open_live(&ledger_path).unwrap());
+        ledger.install_crash_hook(Arc::new(move |observed| {
+            if observed == point {
+                panic!("injected coordinator snapshot replace crash");
+            }
+        }));
+        let breaker =
+            ExecutionCircuitBreaker::new_live(Arc::clone(&ledger), marker_path.clone()).unwrap();
+        let gateway = Arc::new(AcceptedGateway::new());
+        let task_breaker = Arc::clone(&breaker);
+        let task_gateway = Arc::clone(&gateway);
+        let task = tokio::spawn(async move {
+            task_breaker
+                .submit_fok(
+                    task_gateway.as_ref(),
+                    &planned_entry(),
+                    entry_purpose(),
+                    |_| Ok(()),
+                )
+                .await
+        });
+
+        assert!(task.await.unwrap_err().is_panic());
+        assert_eq!(gateway.calls.load(Ordering::SeqCst), 0);
+        assert!(!marker_path.exists());
+        assert_eq!(
+            read_events(&ledger_path)
+                .iter()
+                .map(|event| event.payload.kind())
+                .collect::<Vec<_>>(),
+            ["intent_prepared"]
+        );
+        drop(breaker);
+        drop(ledger);
+
+        let calls_before_reopen = gateway.calls.load(Ordering::SeqCst);
+        match point {
+            LedgerCrashPoint::BeforeSnapshotReplace => {
+                assert!(ExecutionLedger::open_live(&ledger_path).is_err());
+                assert_eq!(gateway.calls.load(Ordering::SeqCst), calls_before_reopen);
+                assert!(!marker_path.exists());
+            }
+            LedgerCrashPoint::AfterSnapshotReplace => {
+                let reopened = Arc::new(ExecutionLedger::open_live(&ledger_path).unwrap());
+                let active = reopened.projection().active.unwrap();
+                assert_eq!(active.state, ActiveIntentState::NotSent);
+                assert_eq!(active.evidence, ActiveEvidence::None);
+                assert_eq!(gateway.calls.load(Ordering::SeqCst), calls_before_reopen);
+                assert!(matches!(
+                    ExecutionCircuitBreaker::new_live(reopened, marker_path.clone()),
+                    Err(OrderSubmitError::Halted {
+                        code: OrderErrorCode::ExecutionHalted,
+                    })
+                ));
+                assert_eq!(gateway.calls.load(Ordering::SeqCst), calls_before_reopen);
+                assert!(!marker_path.exists());
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn remote_evidence_persistence_failure_halts_before_a_second_gateway_call() {
     let dir = tempfile::tempdir().unwrap();
     let ledger_path = dir.path().join("execution-ledger.jsonl");
@@ -828,6 +1081,52 @@ impl OrderGateway for UncertainGateway {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ClassifiedOutcome {
+    Rejected(OrderErrorCode),
+    Uncertain(OrderErrorCode),
+}
+
+struct ClassifiedOutcomeGateway {
+    outcome: ClassifiedOutcome,
+    calls: AtomicUsize,
+}
+
+impl ClassifiedOutcomeGateway {
+    fn rejected(code: OrderErrorCode) -> Self {
+        Self {
+            outcome: ClassifiedOutcome::Rejected(code),
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn uncertain(code: OrderErrorCode) -> Self {
+        Self {
+            outcome: ClassifiedOutcome::Uncertain(code),
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl OrderGateway for ClassifiedOutcomeGateway {
+    async fn submit_fok(
+        &self,
+        _planned: &PlannedOrder,
+        journal: &dyn PrePostJournal,
+    ) -> Result<OrderReceipt, OrderSubmitError> {
+        journal.before_post(&prepared_identity())?;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        match self.outcome {
+            ClassifiedOutcome::Rejected(code) => Err(OrderSubmitError::Rejected {
+                http_status: Some(400),
+                code,
+            }),
+            ClassifiedOutcome::Uncertain(code) => Err(OrderSubmitError::Uncertain { code }),
+        }
+    }
+}
+
 struct AcceptedExitGateway {
     receipt: OrderReceipt,
     calls: AtomicUsize,
@@ -954,6 +1253,14 @@ impl crate::service::execution_ledger::DurabilityOps for FailThirdAppend {
     fn sync_directory(&self, _path: &Path) -> io::Result<()> {
         Ok(())
     }
+}
+
+fn read_events(path: &Path) -> Vec<LedgerEvent> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
 }
 
 fn order_id(byte: u8) -> OrderId {
