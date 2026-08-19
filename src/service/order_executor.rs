@@ -75,9 +75,12 @@ pub(crate) enum LiveStartupCode {
     LedgerTruncated,
     SnapshotInconsistent,
     LedgerUnavailable,
+    LedgerIdempotencyConflict,
+    LedgerPositionConflict,
     PositionRebuildInvalid,
     ActiveUnresolved,
-    HaltMarkerPresent,
+    CleanupPending,
+    OrphanMarker,
     HaltMarkerUnavailable,
 }
 
@@ -90,9 +93,12 @@ impl LiveStartupCode {
             Self::LedgerTruncated => "ledger_truncated",
             Self::SnapshotInconsistent => "snapshot_inconsistent",
             Self::LedgerUnavailable => "ledger_unavailable",
+            Self::LedgerIdempotencyConflict => "ledger_idempotency_conflict",
+            Self::LedgerPositionConflict => "ledger_position_conflict",
             Self::PositionRebuildInvalid => "position_rebuild_invalid",
             Self::ActiveUnresolved => "active_unresolved",
-            Self::HaltMarkerPresent => "halt_marker_present",
+            Self::CleanupPending => "cleanup_pending",
+            Self::OrphanMarker => "orphan_marker",
             Self::HaltMarkerUnavailable => "halt_marker_unavailable",
         }
     }
@@ -111,11 +117,23 @@ impl LiveStartupCode {
             Self::LedgerUnavailable => {
                 "inspect durable ledger availability before any manual recovery"
             }
+            Self::LedgerIdempotencyConflict => {
+                "preserve and inspect the ledger idempotency conflict; do not edit it or retry startup"
+            }
+            Self::LedgerPositionConflict => {
+                "preserve and inspect the ledger position conflict; do not edit it or retry startup"
+            }
             Self::PositionRebuildInvalid => {
                 "inspect durable position events; do not overwrite or heal them"
             }
-            Self::ActiveUnresolved | Self::HaltMarkerPresent => {
+            Self::ActiveUnresolved => {
                 "manual recovery and reconciliation are required before restart"
+            }
+            Self::CleanupPending => {
+                "resume the bounded halt-marker cleanup acknowledgement; do not re-reconcile or delete the marker directly"
+            }
+            Self::OrphanMarker => {
+                "preserve and inspect the orphan or incompatible halt marker; do not delete it"
             }
             Self::HaltMarkerUnavailable => {
                 "inspect the halt-marker storage before any manual recovery"
@@ -224,11 +242,13 @@ impl OrderExecutor {
         );
         let positions = PositionStore::from_ledger(Arc::clone(&ledger))
             .map_err(map_position_startup_failure)?;
+        let projection = ledger.projection();
+        let marker_present = cfg.trading.execution_halt_path.exists();
         let breaker = ExecutionCircuitBreaker::new_live(
             Arc::clone(&ledger),
             cfg.trading.execution_halt_path.clone(),
         )
-        .map_err(map_breaker_startup_failure)?;
+        .map_err(|error| map_breaker_startup_failure(error, &projection, marker_present))?;
         let gateway = gateway_factory.build(&cfg).await?;
         Ok(Self {
             cfg,
@@ -696,12 +716,13 @@ fn map_ledger_startup_failure(error: LedgerError) -> LiveStartupFailure {
     let code = match error.code() {
         Code::Locked => LiveStartupCode::LedgerLocked,
         Code::TruncatedTail => LiveStartupCode::LedgerTruncated,
-        Code::UnsupportedEventKind | Code::UnsupportedSchema | Code::UnsupportedSnapshotSchema => {
-            LiveStartupCode::LedgerUnsupported
-        }
-        Code::SnapshotMissing | Code::InvalidSnapshot | Code::SnapshotMismatch => {
-            LiveStartupCode::SnapshotInconsistent
-        }
+        Code::UnsupportedEventKind | Code::UnsupportedSchema => LiveStartupCode::LedgerUnsupported,
+        Code::SnapshotMissing
+        | Code::InvalidSnapshot
+        | Code::UnsupportedSnapshotSchema
+        | Code::SnapshotMismatch => LiveStartupCode::SnapshotInconsistent,
+        Code::IdempotencyConflict => LiveStartupCode::LedgerIdempotencyConflict,
+        Code::PositionConflict => LiveStartupCode::LedgerPositionConflict,
         Code::InvalidJson
         | Code::EventHashMismatch
         | Code::SequenceMismatch
@@ -728,13 +749,24 @@ fn map_position_startup_code(code: PositionStoreErrorCode) -> LiveStartupFailure
     }
 }
 
-fn map_breaker_startup_failure(error: OrderSubmitError) -> LiveStartupFailure {
+fn map_breaker_startup_failure(
+    error: OrderSubmitError,
+    projection: &crate::service::execution_ledger::LedgerProjectionSnapshot,
+    marker_present: bool,
+) -> LiveStartupFailure {
     let code = match error.code() {
-        crate::service::order_gateway::OrderErrorCode::ExecutionHalted => {
+        crate::service::order_gateway::OrderErrorCode::ExecutionHalted
+            if projection.active.is_some() =>
+        {
             LiveStartupCode::ActiveUnresolved
         }
-        crate::service::order_gateway::OrderErrorCode::HaltMarkerPresent => {
-            LiveStartupCode::HaltMarkerPresent
+        crate::service::order_gateway::OrderErrorCode::ExecutionHalted
+            if projection.cleanup_pending.is_some() =>
+        {
+            LiveStartupCode::CleanupPending
+        }
+        crate::service::order_gateway::OrderErrorCode::HaltMarkerPresent if marker_present => {
+            LiveStartupCode::OrphanMarker
         }
         _ => LiveStartupCode::HaltMarkerUnavailable,
     };
@@ -801,8 +833,8 @@ mod tests {
     use crate::models::{Side, VenueId};
     use crate::service::execution_circuit_breaker::ExecutionCircuitBreaker;
     use crate::service::execution_ledger::{
-        IntentPurpose, LedgerPayload, MatchedAmounts, OrderType as LedgerOrderType, PositionSeed,
-        PreparedIntent, ORDER_PROTOCOL_VERSION,
+        AcknowledgeReason, IntentPurpose, LedgerPayload, MatchedAmounts,
+        OrderType as LedgerOrderType, PositionSeed, PreparedIntent, ORDER_PROTOCOL_VERSION,
     };
     use crate::service::onchain::RawLog;
     use crate::service::order_gateway::{
@@ -1105,6 +1137,135 @@ mod tests {
         assert_eq!(durable_state_bytes(dir.path()), before);
         assert!(!cfg.trading.execution_halt_path.exists());
         assert_eq!(factory.constructions(), 0);
+    }
+
+    #[tokio::test]
+    async fn orphan_marker_startup_requires_preservation_not_reconciliation() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = valid_live_config(dir.path());
+        drop(ExecutionLedger::open_live(&cfg.trading.execution_ledger_path).unwrap());
+        std::fs::write(&cfg.trading.execution_halt_path, b"fixture orphan marker").unwrap();
+        let before = durable_state_bytes(dir.path());
+        let factory = CountingGatewayFactory::default();
+
+        let error = match OrderExecutor::new_with_test_gateway_factory(
+            cfg,
+            RiskGuard::new(test_cfg()),
+            &factory,
+        )
+        .await
+        {
+            Ok(_) => panic!("orphan marker must block live startup"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            format!("{error}"),
+            "live startup blocked (code=orphan_marker): preserve and inspect the orphan or incompatible halt marker; do not delete it"
+        );
+        assert_eq!(factory.constructions(), 0);
+        assert_eq!(durable_state_bytes(dir.path()), before);
+    }
+
+    #[tokio::test]
+    async fn cleanup_pending_startup_requires_bounded_acknowledgement_not_reconciliation() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = valid_live_config(dir.path());
+        let intent_id = IntentId(uuid::Uuid::from_u128(600));
+        {
+            let ledger = ExecutionLedger::open_live(&cfg.trading.execution_ledger_path).unwrap();
+            ledger
+                .append(
+                    intent_id,
+                    prepared_entry(OrderId::from_hex(format!("0x{}", "60".repeat(32))).unwrap()),
+                )
+                .unwrap();
+            ledger
+                .append(
+                    intent_id,
+                    LedgerPayload::Acknowledged {
+                        reason: AcknowledgeReason::NotSent,
+                    },
+                )
+                .unwrap();
+        }
+        std::fs::write(&cfg.trading.execution_halt_path, b"fixture cleanup marker").unwrap();
+        let before = durable_state_bytes(dir.path());
+        let factory = CountingGatewayFactory::default();
+
+        let error = match OrderExecutor::new_with_test_gateway_factory(
+            cfg,
+            RiskGuard::new(test_cfg()),
+            &factory,
+        )
+        .await
+        {
+            Ok(_) => panic!("cleanup-pending ledger must block live startup"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            format!("{error}"),
+            "live startup blocked (code=cleanup_pending): resume the bounded halt-marker cleanup acknowledgement; do not re-reconcile or delete the marker directly"
+        );
+        assert_eq!(factory.constructions(), 0);
+        assert_eq!(durable_state_bytes(dir.path()), before);
+    }
+
+    #[tokio::test]
+    async fn unsupported_snapshot_schema_is_snapshot_inconsistent_without_construction() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = valid_live_config(dir.path());
+        std::fs::write(&cfg.trading.execution_ledger_path, b"").unwrap();
+        std::fs::write(
+            cfg.trading.execution_ledger_path.with_extension("jsonl.active.json"),
+            br#"{"schema_version":2,"sequence":0,"head_hash":"0000000000000000000000000000000000000000000000000000000000000000","active_intent":null}"#,
+        )
+        .unwrap();
+        let before = durable_state_bytes(dir.path());
+        let factory = CountingGatewayFactory::default();
+
+        let error = match OrderExecutor::new_with_test_gateway_factory(
+            cfg,
+            RiskGuard::new(test_cfg()),
+            &factory,
+        )
+        .await
+        {
+            Ok(_) => panic!("unsupported snapshot schema must block live startup"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            format!("{error}"),
+            "live startup blocked (code=snapshot_inconsistent): inspect the snapshot and ledger; do not overwrite either file"
+        );
+        assert_eq!(factory.constructions(), 0);
+        assert_eq!(durable_state_bytes(dir.path()), before);
+    }
+
+    #[test]
+    fn replay_integrity_conflicts_have_exact_non_availability_categories() {
+        let cases = [
+            (
+                LedgerErrorCode::IdempotencyConflict,
+                "live startup blocked (code=ledger_idempotency_conflict): preserve and inspect the ledger idempotency conflict; do not edit it or retry startup",
+            ),
+            (
+                LedgerErrorCode::PositionConflict,
+                "live startup blocked (code=ledger_position_conflict): preserve and inspect the ledger position conflict; do not edit it or retry startup",
+            ),
+        ];
+
+        for (ledger_code, expected) in cases {
+            assert_eq!(
+                format!(
+                    "{}",
+                    map_ledger_startup_failure(LedgerError::new(ledger_code))
+                ),
+                expected
+            );
+        }
     }
 
     #[tokio::test]
@@ -1513,30 +1674,7 @@ mod tests {
 
     fn prepare_matched_entry(ledger: &ExecutionLedger, order_id: OrderId) {
         let intent_id = IntentId(uuid::Uuid::from_u128(500));
-        ledger
-            .append(
-                intent_id,
-                LedgerPayload::IntentPrepared(PreparedIntent {
-                    order_id,
-                    protocol_version: ORDER_PROTOCOL_VERSION,
-                    venue: Venue::PolymarketClob,
-                    token_id: TokenId::from_decimal("12345").unwrap(),
-                    neg_risk: false,
-                    side: OrderSide::Buy,
-                    order_type: LedgerOrderType::Fok,
-                    expected_maker_micros: 19_500_000,
-                    expected_taker_micros: 39_000_000,
-                    source_hash: None,
-                    purpose: IntentPurpose::Entry(PositionSeed {
-                        slug: "fixture-market".into(),
-                        category: "Politics".into(),
-                        tags: vec!["election".into()],
-                        take_profit_bps: 4_000,
-                        stop_loss_bps: 2_500,
-                    }),
-                }),
-            )
-            .unwrap();
+        ledger.append(intent_id, prepared_entry(order_id)).unwrap();
         ledger
             .append(intent_id, LedgerPayload::SubmitStarted)
             .unwrap();
@@ -1549,6 +1687,28 @@ mod tests {
                 }),
             )
             .unwrap();
+    }
+
+    fn prepared_entry(order_id: OrderId) -> LedgerPayload {
+        LedgerPayload::IntentPrepared(PreparedIntent {
+            order_id,
+            protocol_version: ORDER_PROTOCOL_VERSION,
+            venue: Venue::PolymarketClob,
+            token_id: TokenId::from_decimal("12345").unwrap(),
+            neg_risk: false,
+            side: OrderSide::Buy,
+            order_type: LedgerOrderType::Fok,
+            expected_maker_micros: 19_500_000,
+            expected_taker_micros: 39_000_000,
+            source_hash: None,
+            purpose: IntentPurpose::Entry(PositionSeed {
+                slug: "fixture-market".into(),
+                category: "Politics".into(),
+                tags: vec!["election".into()],
+                take_profit_bps: 4_000,
+                stop_loss_bps: 2_500,
+            }),
+        })
     }
 
     struct FakeGateway {

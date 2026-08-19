@@ -341,7 +341,9 @@ mod tests {
     use super::*;
     use crate::models::{OrderType, PlannedOrder, Side, VenueId};
     use crate::service::execution_ledger::{
-        ExecutionLedger, IntentId, IntentPurpose, OrderId, OrderSide, PositionId, TokenId, Venue,
+        AcknowledgeReason, ExecutionLedger, IntentId, IntentPurpose, LedgerPayload, OrderId,
+        OrderSide, OrderType as LedgerOrderType, PositionId, PositionSeed, PreparedIntent, TokenId,
+        Venue, ORDER_PROTOCOL_VERSION,
     };
     use crate::service::order_executor::LiveGatewayFactory;
     use crate::service::position_store::{OpenPosition, PositionStore};
@@ -438,7 +440,11 @@ mod tests {
         let mut cfg = live_cfg(dir.path());
         cfg.credentials.api_secret = Some("not URL-safe base64".to_owned());
 
-        assert_failed_initialization_has_zero_component_construction(cfg).await;
+        assert_failed_initialization_has_zero_component_construction(
+            cfg,
+            "order preflight failed at Initialization (MissingCredentials)",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -446,7 +452,11 @@ mod tests {
         let ledger_dir = tempfile::tempdir().unwrap();
         let ledger_cfg = live_cfg(ledger_dir.path());
         std::fs::write(&ledger_cfg.trading.execution_ledger_path, b"{\n").unwrap();
-        assert_failed_initialization_has_zero_component_construction(ledger_cfg).await;
+        assert_failed_initialization_has_zero_component_construction(
+            ledger_cfg,
+            "live startup blocked (code=ledger_corrupt): preserve and inspect the ledger; do not edit it or retry startup",
+        )
+        .await;
 
         let snapshot_dir = tempfile::tempdir().unwrap();
         let snapshot_cfg = live_cfg(snapshot_dir.path());
@@ -459,12 +469,82 @@ mod tests {
             br#"{"schema_version":1,"sequence":1,"head_hash":"0000000000000000000000000000000000000000000000000000000000000000","active_intent":null}"#,
         )
         .unwrap();
-        assert_failed_initialization_has_zero_component_construction(snapshot_cfg).await;
+        assert_failed_initialization_has_zero_component_construction(
+            snapshot_cfg,
+            "live startup blocked (code=snapshot_inconsistent): inspect the snapshot and ledger; do not overwrite either file",
+        )
+        .await;
 
         let marker_dir = tempfile::tempdir().unwrap();
         let marker_cfg = live_cfg(marker_dir.path());
+        drop(ExecutionLedger::open_live(&marker_cfg.trading.execution_ledger_path).unwrap());
         std::fs::write(&marker_cfg.trading.execution_halt_path, b"fixture marker").unwrap();
-        assert_failed_initialization_has_zero_component_construction(marker_cfg).await;
+        assert_failed_initialization_has_zero_component_construction(
+            marker_cfg,
+            "live startup blocked (code=orphan_marker): preserve and inspect the orphan or incompatible halt marker; do not delete it",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn active_and_cleanup_startup_states_have_exact_zero_component_diagnostics() {
+        let active_dir = tempfile::tempdir().unwrap();
+        let active_cfg = live_cfg(active_dir.path());
+        {
+            let ledger =
+                ExecutionLedger::open_live(&active_cfg.trading.execution_ledger_path).unwrap();
+            append_prepared_entry(&ledger, IntentId(uuid::Uuid::from_u128(801)));
+        }
+        assert_failed_initialization_has_zero_component_construction(
+            active_cfg,
+            "live startup blocked (code=active_unresolved): manual recovery and reconciliation are required before restart",
+        )
+        .await;
+
+        let cleanup_dir = tempfile::tempdir().unwrap();
+        let cleanup_cfg = live_cfg(cleanup_dir.path());
+        let cleanup_intent = IntentId(uuid::Uuid::from_u128(802));
+        {
+            let ledger =
+                ExecutionLedger::open_live(&cleanup_cfg.trading.execution_ledger_path).unwrap();
+            append_prepared_entry(&ledger, cleanup_intent);
+            ledger
+                .append(
+                    cleanup_intent,
+                    LedgerPayload::Acknowledged {
+                        reason: AcknowledgeReason::NotSent,
+                    },
+                )
+                .unwrap();
+        }
+        std::fs::write(
+            &cleanup_cfg.trading.execution_halt_path,
+            b"fixture cleanup marker",
+        )
+        .unwrap();
+        assert_failed_initialization_has_zero_component_construction(
+            cleanup_cfg,
+            "live startup blocked (code=cleanup_pending): resume the bounded halt-marker cleanup acknowledgement; do not re-reconcile or delete the marker directly",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn unsupported_snapshot_schema_has_exact_zero_component_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = live_cfg(dir.path());
+        std::fs::write(&cfg.trading.execution_ledger_path, b"").unwrap();
+        std::fs::write(
+            cfg.trading.execution_ledger_path.with_extension("jsonl.active.json"),
+            br#"{"schema_version":2,"sequence":0,"head_hash":"0000000000000000000000000000000000000000000000000000000000000000","active_intent":null}"#,
+        )
+        .unwrap();
+
+        assert_failed_initialization_has_zero_component_construction(
+            cfg,
+            "live startup blocked (code=snapshot_inconsistent): inspect the snapshot and ledger; do not overwrite either file",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -623,7 +703,10 @@ mod tests {
         }
     }
 
-    async fn assert_failed_initialization_has_zero_component_construction(cfg: AppConfig) {
+    async fn assert_failed_initialization_has_zero_component_construction(
+        cfg: AppConfig,
+        expected: &str,
+    ) {
         let factory = InertRuntimeFactory::default();
         let result = initialize_runtime(
             &cfg,
@@ -633,8 +716,39 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err());
+        let error = match result {
+            Ok(_) => panic!("fixture must block live initialization"),
+            Err(error) => error,
+        };
+        assert_eq!(format!("{error}"), expected);
         assert_eq!(factory.counts(), ComponentCounts::new(0, 0, 0, 0, 0));
+    }
+
+    fn append_prepared_entry(ledger: &ExecutionLedger, intent_id: IntentId) {
+        ledger
+            .append(
+                intent_id,
+                LedgerPayload::IntentPrepared(PreparedIntent {
+                    order_id: OrderId::from_hex(format!("0x{}", "80".repeat(32))).unwrap(),
+                    protocol_version: ORDER_PROTOCOL_VERSION,
+                    venue: Venue::PolymarketClob,
+                    token_id: TokenId::from_decimal("12345").unwrap(),
+                    neg_risk: false,
+                    side: OrderSide::Buy,
+                    order_type: LedgerOrderType::Fok,
+                    expected_maker_micros: 19_500_000,
+                    expected_taker_micros: 39_000_000,
+                    source_hash: None,
+                    purpose: IntentPurpose::Entry(PositionSeed {
+                        slug: "fixture-market".into(),
+                        category: "Politics".into(),
+                        tags: vec!["election".into()],
+                        take_profit_bps: 4_000,
+                        stop_loss_bps: 2_500,
+                    }),
+                }),
+            )
+            .unwrap();
     }
 
     fn live_cfg(dir: &std::path::Path) -> AppConfig {
