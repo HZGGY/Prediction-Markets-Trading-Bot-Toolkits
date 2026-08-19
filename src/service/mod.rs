@@ -112,5 +112,6 @@ pub mod parse;
 pub mod position_monitor;
 pub mod position_store;
 pub(crate) mod recovery_gateway;
+pub(crate) mod recovery_service;
 pub mod risk_guard;
 pub mod strategy;

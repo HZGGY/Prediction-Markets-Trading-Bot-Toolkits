@@ -109,6 +109,7 @@ pub struct LedgerProjectionSnapshot {
     pub head_hash: EventHash,
     pub active: Option<ActiveIntent>,
     pub positions: HashMap<PositionId, DurablePosition>,
+    pub(crate) intent_orders: HashMap<IntentId, OrderId>,
     pub event_count: usize,
 }
 
@@ -160,6 +161,7 @@ impl LedgerProjection {
             head_hash: self.head_hash.clone(),
             active: self.active.clone(),
             positions: self.positions.clone(),
+            intent_orders: self.intent_orders.clone(),
             event_count: self.event_ids.len(),
         }
     }
