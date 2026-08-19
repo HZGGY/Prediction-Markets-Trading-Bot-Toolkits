@@ -8,6 +8,7 @@
 pub mod bot;
 pub mod config;
 pub mod models;
+pub mod recovery_cli;
 pub mod service;
 pub mod ui;
 pub mod utils;

@@ -7,6 +7,7 @@ use polymarket_toolkits::{
         ensure_credentials_file_account_matches, persist_api_credentials, ApiCredentialUpdate,
         AppConfig,
     },
+    recovery_cli::{self, RecoveryCommand},
     service::clob_auth::{obtain_api_credentials, ApiKeyAction, AuthRequest},
     ui,
 };
@@ -44,6 +45,11 @@ enum Command {
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
+    },
+    /// Inspect and explicitly recover one durable execution intent.
+    Recovery {
+        #[command(subcommand)]
+        command: RecoveryCommand,
     },
 }
 
@@ -148,12 +154,18 @@ async fn run_auth(
 
 fn load_config_for_command(cli: &Cli) -> Result<AppConfig> {
     let mut cfg = AppConfig::load_public(&cli.config)?;
-    let credentials_required =
-        matches!(&cli.command, Some(Command::Auth { .. })) || cfg.live_trading_allowed();
-    if credentials_required {
+    if command_needs_credentials(&cli.command, &cfg) {
         cfg.load_credentials(&cli.credentials)?;
     }
     Ok(cfg)
+}
+
+fn command_needs_credentials(command: &Option<Command>, cfg: &AppConfig) -> bool {
+    match command {
+        Some(Command::Auth { .. }) => true,
+        Some(Command::Recovery { command }) => recovery_cli::command_needs_credentials(command),
+        Some(Command::Run { .. }) | Some(Command::Tui) | None => cfg.live_trading_allowed(),
+    }
 }
 
 #[tokio::main]
@@ -180,6 +192,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(Command::Run { bot: kind }) => bot::run(kind.into(), cfg).await,
         Some(Command::Auth { command }) => run_auth(&cfg, &credentials_path, command).await,
+        Some(Command::Recovery { command }) => recovery_cli::run(&cfg, command).await,
         Some(Command::Tui) | None => ui::run(cfg).await,
     }
 }
@@ -245,6 +258,175 @@ mod tests {
                 command: AuthCommand::DeriveApiKey { nonce: None }
             })
         ));
+    }
+
+    #[test]
+    fn parses_recovery_inspect_with_explicit_local_order_id_display() {
+        let cli = Cli::try_parse_from([
+            "polymarket-toolkits",
+            "recovery",
+            "inspect",
+            "--intent",
+            "123e4567-e89b-12d3-a456-426614174000",
+            "--show-order-id",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Some(Command::Recovery {
+                command: RecoveryCommand::Inspect {
+                    intent: Some(_),
+                    show_order_id: true,
+                }
+            })
+        ));
+    }
+
+    #[test]
+    fn recovery_parser_exposes_only_the_six_explicit_operations() {
+        let intent = "123e4567-e89b-12d3-a456-426614174000";
+        for command in [
+            vec!["recovery", "inspect"],
+            vec!["recovery", "reconcile", "--intent", intent],
+            vec!["recovery", "prepare-cancel", "--intent", intent],
+            vec![
+                "recovery",
+                "cancel",
+                "--intent",
+                intent,
+                "--confirm",
+                "challenge",
+            ],
+            vec![
+                "recovery",
+                "apply",
+                "--intent",
+                intent,
+                "--confirm",
+                "challenge",
+            ],
+            vec![
+                "recovery",
+                "acknowledge",
+                "--intent",
+                intent,
+                "--confirm",
+                "challenge",
+            ],
+        ] {
+            let mut args = vec!["polymarket-toolkits"];
+            args.extend(command);
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
+
+        for rejected in [
+            vec!["recovery", "inspect", "--force"],
+            vec!["recovery", "cancel", "--yes"],
+            vec!["recovery", "cancel-all"],
+            vec!["recovery", "cancel", "--market", "market-id"],
+            vec!["recovery", "retry", "--intent", intent],
+        ] {
+            let mut args = vec!["polymarket-toolkits"];
+            args.extend(rejected);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
+    fn local_recovery_commands_ignore_malformed_credentials_and_secret_environment_overrides() {
+        let _env_lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _private_key = EnvVarGuard::set("PM_PRIVATE_KEY", "RECOVERY_PRIVATE_KEY_SENTINEL");
+        let _funder = EnvVarGuard::set(
+            "PM_FUNDER_ADDRESS",
+            "0x9999999999999999999999999999999999999999",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("public.json");
+        let credentials_path = dir.path().join("malformed-credentials.yaml");
+        std::fs::write(&config_path, include_str!("../config.json")).unwrap();
+        std::fs::write(&credentials_path, "bot: [malformed").unwrap();
+
+        for command in [
+            vec!["recovery", "inspect"],
+            vec![
+                "recovery",
+                "apply",
+                "--intent",
+                "123e4567-e89b-12d3-a456-426614174000",
+                "--confirm",
+                "challenge",
+            ],
+            vec![
+                "recovery",
+                "acknowledge",
+                "--intent",
+                "123e4567-e89b-12d3-a456-426614174000",
+                "--confirm",
+                "challenge",
+            ],
+        ] {
+            let mut args = vec![
+                "polymarket-toolkits".to_owned(),
+                "--config".to_owned(),
+                config_path.to_string_lossy().into_owned(),
+                "--credentials".to_owned(),
+                credentials_path.to_string_lossy().into_owned(),
+            ];
+            args.extend(command.into_iter().map(str::to_owned));
+            let cli = Cli::try_parse_from(args).unwrap();
+            let cfg = load_config_at_main_seam(&cli)
+                .unwrap_or_else(|_| panic!("local recovery must not read credentials"));
+            assert!(!command_needs_credentials(&cli.command, &cfg));
+            assert!(cfg.credentials.private_key.is_empty());
+            assert!(cfg.credentials.funder_address.is_empty());
+            assert_eq!(cfg.credentials.api_key, None);
+            assert_eq!(cfg.credentials.api_secret, None);
+            assert_eq!(cfg.credentials.api_passphrase, None);
+        }
+    }
+
+    #[test]
+    fn network_recovery_commands_require_the_credential_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("public.json");
+        let credentials_path = dir.path().join("malformed-credentials.yaml");
+        std::fs::write(&config_path, include_str!("../config.json")).unwrap();
+        std::fs::write(&credentials_path, "bot: [malformed").unwrap();
+
+        for command in [
+            vec![
+                "recovery",
+                "reconcile",
+                "--intent",
+                "123e4567-e89b-12d3-a456-426614174000",
+            ],
+            vec![
+                "recovery",
+                "prepare-cancel",
+                "--intent",
+                "123e4567-e89b-12d3-a456-426614174000",
+            ],
+            vec![
+                "recovery",
+                "cancel",
+                "--intent",
+                "123e4567-e89b-12d3-a456-426614174000",
+                "--confirm",
+                "challenge",
+            ],
+        ] {
+            let mut args = vec![
+                "polymarket-toolkits".to_owned(),
+                "--config".to_owned(),
+                config_path.to_string_lossy().into_owned(),
+                "--credentials".to_owned(),
+                credentials_path.to_string_lossy().into_owned(),
+            ];
+            args.extend(command.into_iter().map(str::to_owned));
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(load_config_at_main_seam(&cli).is_err());
+        }
     }
 
     #[test]
