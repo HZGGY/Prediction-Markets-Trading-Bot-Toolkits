@@ -373,6 +373,9 @@ pub enum UncertainCode {
     MalformedResponse,
     NonFinalStatus,
     AmountMismatch,
+    ResponseOrderIdMismatch,
+    EmptyOrderId,
+    AmountConversion,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1052,7 +1055,7 @@ mod tests {
             (
                 "remote_uncertain",
                 LedgerPayload::RemoteUncertain {
-                    code: UncertainCode::Transport,
+                    code: UncertainCode::ResponseOrderIdMismatch,
                 },
             ),
             ("submission_committed", LedgerPayload::SubmissionCommitted),
@@ -1139,7 +1142,7 @@ mod tests {
           {"schema_version":1,"sequence":1,"event_id":"00000000-0000-0000-0000-00000000000a","intent_id":"00000000-0000-0000-0000-000000000001","recorded_at":"2026-08-18T12:34:56Z","kind":"submit_started","payload":null,"previous_hash":"0000000000000000000000000000000000000000000000000000000000000000","event_hash":"4444444444444444444444444444444444444444444444444444444444444444"},
           {"schema_version":1,"sequence":1,"event_id":"00000000-0000-0000-0000-00000000000a","intent_id":"00000000-0000-0000-0000-000000000001","recorded_at":"2026-08-18T12:34:56Z","kind":"remote_matched","payload":{"shares_micros":"18014398509481987","usd_micros":"9007199254740993"},"previous_hash":"0000000000000000000000000000000000000000000000000000000000000000","event_hash":"4444444444444444444444444444444444444444444444444444444444444444"},
           {"schema_version":1,"sequence":1,"event_id":"00000000-0000-0000-0000-00000000000a","intent_id":"00000000-0000-0000-0000-000000000001","recorded_at":"2026-08-18T12:34:56Z","kind":"remote_rejected","payload":{"code":"server_rejected"},"previous_hash":"0000000000000000000000000000000000000000000000000000000000000000","event_hash":"4444444444444444444444444444444444444444444444444444444444444444"},
-          {"schema_version":1,"sequence":1,"event_id":"00000000-0000-0000-0000-00000000000a","intent_id":"00000000-0000-0000-0000-000000000001","recorded_at":"2026-08-18T12:34:56Z","kind":"remote_uncertain","payload":{"code":"transport"},"previous_hash":"0000000000000000000000000000000000000000000000000000000000000000","event_hash":"4444444444444444444444444444444444444444444444444444444444444444"},
+          {"schema_version":1,"sequence":1,"event_id":"00000000-0000-0000-0000-00000000000a","intent_id":"00000000-0000-0000-0000-000000000001","recorded_at":"2026-08-18T12:34:56Z","kind":"remote_uncertain","payload":{"code":"response_order_id_mismatch"},"previous_hash":"0000000000000000000000000000000000000000000000000000000000000000","event_hash":"4444444444444444444444444444444444444444444444444444444444444444"},
           {"schema_version":1,"sequence":1,"event_id":"00000000-0000-0000-0000-00000000000a","intent_id":"00000000-0000-0000-0000-000000000001","recorded_at":"2026-08-18T12:34:56Z","kind":"submission_committed","payload":null,"previous_hash":"0000000000000000000000000000000000000000000000000000000000000000","event_hash":"4444444444444444444444444444444444444444444444444444444444444444"},
           {"schema_version":1,"sequence":1,"event_id":"00000000-0000-0000-0000-00000000000a","intent_id":"00000000-0000-0000-0000-000000000001","recorded_at":"2026-08-18T12:34:56Z","kind":"submission_committed_no_fill","payload":null,"previous_hash":"0000000000000000000000000000000000000000000000000000000000000000","event_hash":"4444444444444444444444444444444444444444444444444444444444444444"},
           {"schema_version":1,"sequence":1,"event_id":"00000000-0000-0000-0000-00000000000a","intent_id":"00000000-0000-0000-0000-000000000001","recorded_at":"2026-08-18T12:34:56Z","kind":"position_opened","payload":{"position_id":"00000000-0000-0000-0000-000000000001","opening_intent_id":"00000000-0000-0000-0000-000000000001","opening_order_id":"0x1111111111111111111111111111111111111111111111111111111111111111","venue":"polymarket_clob","token_id":"123456789012345678901234567890","slug":"will-example-pass","category":"testing","tags":["offline","durable"],"neg_risk":true,"side":"buy","entry_shares_micros":"18014398509481987","entry_usd_micros":"9007199254740993","take_profit_bps":1250,"stop_loss_bps":750,"opened_at":"2026-08-18T12:34:56Z","closing_intent_id":null,"closing_order_id":null,"closing_shares_micros":null,"closing_usd_micros":null,"closed_at":null},"previous_hash":"0000000000000000000000000000000000000000000000000000000000000000","event_hash":"4444444444444444444444444444444444444444444444444444444444444444"},

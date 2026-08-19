@@ -249,49 +249,34 @@ impl ExecutionCircuitBreaker {
                 Ok(receipt)
             }
             Err(error @ OrderSubmitError::Rejected { code, .. }) if journal.started() => {
+                let Some(code) = remote_reject_code(code) else {
+                    return Err(self.halt_after_post_failure(planned));
+                };
                 let completed = self
                     .ledger
-                    .append(
-                        journal.intent_id,
-                        LedgerPayload::RemoteRejected {
-                            code: remote_reject_code(code),
-                        },
-                    )
+                    .append(journal.intent_id, LedgerPayload::RemoteRejected { code })
                     .is_ok()
                     && self
                         .ledger
                         .append(journal.intent_id, LedgerPayload::SubmissionCommittedNoFill)
                         .is_ok();
                 if !completed {
-                    let error = self
-                        .halt_uncertain(planned, OrderErrorCode::ExecutionHalted)
-                        .err()
-                        .unwrap_or(OrderSubmitError::Halted {
-                            code: OrderErrorCode::ExecutionHalted,
-                        });
-                    return Err(error);
+                    return Err(self.halt_after_post_failure(planned));
                 }
                 Err(error)
             }
             Err(error @ OrderSubmitError::Uncertain { code }) => {
-                if journal.started()
-                    && self
+                if journal.started() {
+                    let Some(code) = remote_uncertain_code(code) else {
+                        return Err(self.halt_after_post_failure(planned));
+                    };
+                    if self
                         .ledger
-                        .append(
-                            journal.intent_id,
-                            LedgerPayload::RemoteUncertain {
-                                code: remote_uncertain_code(code),
-                            },
-                        )
+                        .append(journal.intent_id, LedgerPayload::RemoteUncertain { code })
                         .is_err()
-                {
-                    let error = self
-                        .halt_uncertain(planned, OrderErrorCode::ExecutionHalted)
-                        .err()
-                        .unwrap_or(OrderSubmitError::Halted {
-                            code: OrderErrorCode::ExecutionHalted,
-                        });
-                    return Err(error);
+                    {
+                        return Err(self.halt_after_post_failure(planned));
+                    }
                 }
                 self.halt_uncertain(planned, code)?;
                 Err(error)
@@ -299,22 +284,35 @@ impl ExecutionCircuitBreaker {
             Err(error) => Err(error),
         }
     }
-}
 
-fn remote_reject_code(code: OrderErrorCode) -> RemoteRejectCode {
-    match code {
-        OrderErrorCode::HttpRejected => RemoteRejectCode::HttpRejected,
-        _ => RemoteRejectCode::ServerRejected,
+    fn halt_after_post_failure(&self, planned: &PlannedOrder) -> OrderSubmitError {
+        self.halt_uncertain(planned, OrderErrorCode::ExecutionHalted)
+            .err()
+            .unwrap_or(OrderSubmitError::Halted {
+                code: OrderErrorCode::ExecutionHalted,
+            })
     }
 }
 
-fn remote_uncertain_code(code: OrderErrorCode) -> UncertainCode {
+fn remote_reject_code(code: OrderErrorCode) -> Option<RemoteRejectCode> {
     match code {
-        OrderErrorCode::PostTimeout => UncertainCode::Timeout,
-        OrderErrorCode::MalformedResponse => UncertainCode::MalformedResponse,
-        OrderErrorCode::NonFinalStatus => UncertainCode::NonFinalStatus,
-        OrderErrorCode::AmountMismatch => UncertainCode::AmountMismatch,
-        _ => UncertainCode::Transport,
+        OrderErrorCode::HttpRejected => Some(RemoteRejectCode::HttpRejected),
+        OrderErrorCode::ServerRejected => Some(RemoteRejectCode::ServerRejected),
+        _ => None,
+    }
+}
+
+fn remote_uncertain_code(code: OrderErrorCode) -> Option<UncertainCode> {
+    match code {
+        OrderErrorCode::PostTimeout => Some(UncertainCode::Timeout),
+        OrderErrorCode::PostTransport => Some(UncertainCode::Transport),
+        OrderErrorCode::MalformedResponse => Some(UncertainCode::MalformedResponse),
+        OrderErrorCode::NonFinalStatus => Some(UncertainCode::NonFinalStatus),
+        OrderErrorCode::AmountMismatch => Some(UncertainCode::AmountMismatch),
+        OrderErrorCode::ResponseOrderIdMismatch => Some(UncertainCode::ResponseOrderIdMismatch),
+        OrderErrorCode::EmptyOrderId => Some(UncertainCode::EmptyOrderId),
+        OrderErrorCode::AmountConversion => Some(UncertainCode::AmountConversion),
+        _ => None,
     }
 }
 
