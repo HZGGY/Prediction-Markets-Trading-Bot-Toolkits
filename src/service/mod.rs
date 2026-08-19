@@ -77,6 +77,7 @@
 
 pub mod clob_auth;
 pub mod clob_sdk_orders;
+pub(crate) mod clob_sdk_recovery;
 pub mod eligibility;
 pub mod execution_circuit_breaker;
 pub mod execution_ledger;
@@ -88,5 +89,6 @@ pub mod order_gateway;
 pub mod parse;
 pub mod position_monitor;
 pub mod position_store;
+pub(crate) mod recovery_gateway;
 pub mod risk_guard;
 pub mod strategy;
