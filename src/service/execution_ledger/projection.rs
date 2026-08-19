@@ -75,6 +75,16 @@ pub struct ActiveIntent {
     pub durable_remote_outcome: Option<DurableRemoteOutcome>,
 }
 
+/// The sole durable authorization to finish a compatibility-marker cleanup.
+///
+/// It is bounded to the acknowledgement's exact intent/order identity and is
+/// deliberately independent of the permanent replay identity indexes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CleanupPending {
+    pub(crate) intent_id: IntentId,
+    pub(crate) order_id: OrderId,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApplyOutcome {
     Applied,
@@ -97,6 +107,7 @@ pub struct LedgerProjection {
     pub event_ids: HashMap<EventId, LedgerEvent>,
     pub intent_orders: HashMap<IntentId, OrderId>,
     pub order_intents: HashMap<OrderId, IntentId>,
+    pub(crate) cleanup_pending: Option<CleanupPending>,
 }
 
 /// Owned read state for orchestration that must not retain the ledger mutex.
@@ -109,7 +120,7 @@ pub struct LedgerProjectionSnapshot {
     pub head_hash: EventHash,
     pub active: Option<ActiveIntent>,
     pub positions: HashMap<PositionId, DurablePosition>,
-    pub(crate) intent_orders: HashMap<IntentId, OrderId>,
+    pub(crate) cleanup_pending: Option<CleanupPending>,
     pub event_count: usize,
 }
 
@@ -130,6 +141,14 @@ impl StagedProjection {
             ActiveChange::Clear => None,
         }
     }
+
+    pub(crate) fn snapshot_changed(&self) -> bool {
+        self.active_changed()
+            || !matches!(
+                self.changes.cleanup_pending,
+                CleanupPendingChange::Unchanged
+            )
+    }
 }
 
 #[derive(Default)]
@@ -137,6 +156,7 @@ struct ProjectionChanges {
     active: ActiveChange,
     position: PositionChange,
     identity: Option<(IntentId, OrderId)>,
+    cleanup_pending: CleanupPendingChange,
 }
 
 #[derive(Default)]
@@ -154,6 +174,14 @@ enum PositionChange {
     Upsert(Box<DurablePosition>),
 }
 
+#[derive(Default)]
+enum CleanupPendingChange {
+    #[default]
+    Unchanged,
+    Set(CleanupPending),
+    Clear,
+}
+
 impl LedgerProjection {
     pub(crate) fn snapshot(&self) -> LedgerProjectionSnapshot {
         LedgerProjectionSnapshot {
@@ -161,7 +189,7 @@ impl LedgerProjection {
             head_hash: self.head_hash.clone(),
             active: self.active.clone(),
             positions: self.positions.clone(),
-            intent_orders: self.intent_orders.clone(),
+            cleanup_pending: self.cleanup_pending.clone(),
             event_count: self.event_ids.len(),
         }
     }
@@ -219,6 +247,11 @@ impl LedgerProjection {
             ActiveChange::Unchanged => {}
             ActiveChange::Set(active) => self.active = Some(*active),
             ActiveChange::Clear => self.active = None,
+        }
+        match staged.changes.cleanup_pending {
+            CleanupPendingChange::Unchanged => {}
+            CleanupPendingChange::Set(owner) => self.cleanup_pending = Some(owner),
+            CleanupPendingChange::Clear => self.cleanup_pending = None,
         }
         self.sequence = event.sequence;
         self.head_hash = event.event_hash.clone();
@@ -342,6 +375,9 @@ impl LedgerProjection {
             LedgerPayload::Acknowledged { reason } => {
                 self.stage_acknowledge(event.intent_id, *reason)
             }
+            LedgerPayload::HaltMarkerCleanupCompleted => {
+                self.stage_complete_marker_cleanup(event.intent_id)
+            }
         }
     }
 
@@ -356,6 +392,7 @@ impl LedgerProjection {
             return Err(LedgerError::new(LedgerErrorCode::IdentityConflict));
         }
         if self.active.is_some()
+            || self.cleanup_pending.is_some()
             || prepared.protocol_version != ORDER_PROTOCOL_VERSION
             || prepared.order_type != OrderType::Fok
             || prepared.expected_maker_micros == 0
@@ -446,6 +483,26 @@ impl LedgerProjection {
         }
         Ok(ProjectionChanges {
             active: ActiveChange::Clear,
+            ..ProjectionChanges::default()
+        })
+    }
+
+    fn stage_complete_marker_cleanup(
+        &self,
+        intent_id: IntentId,
+    ) -> Result<ProjectionChanges, LedgerError> {
+        let owner = self
+            .cleanup_pending
+            .as_ref()
+            .ok_or_else(|| LedgerError::new(LedgerErrorCode::IllegalTransition))?;
+        if owner.intent_id != intent_id {
+            return Err(LedgerError::new(LedgerErrorCode::IntentMismatch));
+        }
+        if self.active.is_some() {
+            return Err(LedgerError::new(LedgerErrorCode::IllegalTransition));
+        }
+        Ok(ProjectionChanges {
+            cleanup_pending: CleanupPendingChange::Clear,
             ..ProjectionChanges::default()
         })
     }
@@ -709,6 +766,10 @@ impl LedgerProjection {
         }
         Ok(ProjectionChanges {
             active: ActiveChange::Clear,
+            cleanup_pending: CleanupPendingChange::Set(CleanupPending {
+                intent_id,
+                order_id: active.prepared.order_id.clone(),
+            }),
             ..ProjectionChanges::default()
         })
     }
@@ -1019,6 +1080,71 @@ mod tests {
             },
         );
         assert!(fixtures.projection.active.is_none());
+    }
+
+    #[test]
+    fn acknowledgement_creates_one_exact_cleanup_owner_until_its_completion_event() {
+        let mut fixtures = Fixtures::new();
+        let intent = intent_id(1);
+        fixtures.apply(intent, LedgerPayload::IntentPrepared(entry_intent(0x11)));
+        let acknowledged = fixtures.event(
+            intent,
+            LedgerPayload::Acknowledged {
+                reason: AcknowledgeReason::NotSent,
+            },
+        );
+        fixtures.projection.apply(&acknowledged).unwrap();
+
+        let pending = fixtures.projection.snapshot().cleanup_pending.unwrap();
+        assert_eq!(pending.intent_id, intent);
+        assert_eq!(pending.order_id, order_id(0x11));
+
+        let wrong_owner = fixtures.event(intent_id(2), LedgerPayload::HaltMarkerCleanupCompleted);
+        assert_eq!(
+            fixtures.projection.apply(&wrong_owner).unwrap_err().code(),
+            LedgerErrorCode::IntentMismatch
+        );
+        assert!(fixtures.projection.snapshot().cleanup_pending.is_some());
+
+        fixtures.apply(intent, LedgerPayload::HaltMarkerCleanupCompleted);
+        assert!(fixtures.projection.snapshot().cleanup_pending.is_none());
+    }
+
+    #[test]
+    fn ordinary_snapshot_stays_bounded_after_terminal_history_and_exposes_no_order_index() {
+        let mut fixtures = Fixtures::new();
+        for value in 1..=50 {
+            let intent = intent_id(value);
+            fixtures.apply(
+                intent,
+                LedgerPayload::IntentPrepared(entry_intent(value as u8)),
+            );
+            fixtures.apply(intent, LedgerPayload::SubmitStarted);
+            fixtures.apply(
+                intent,
+                LedgerPayload::RemoteRejected {
+                    code: RemoteRejectCode::ServerRejected,
+                },
+            );
+            fixtures.apply(intent, LedgerPayload::SubmissionCommittedNoFill);
+        }
+
+        let snapshot = fixtures.projection.snapshot();
+        assert!(snapshot.active.is_none());
+        assert!(snapshot.cleanup_pending.is_none());
+        assert!(snapshot.positions.is_empty());
+        assert_eq!(snapshot.event_count, 200);
+        assert!(
+            std::mem::size_of::<LedgerProjectionSnapshot>()
+                <= std::mem::size_of::<(
+                    u64,
+                    EventHash,
+                    Option<ActiveIntent>,
+                    HashMap<PositionId, DurablePosition>,
+                    Option<CleanupPending>,
+                    usize,
+                )>()
+        );
     }
 
     #[test]

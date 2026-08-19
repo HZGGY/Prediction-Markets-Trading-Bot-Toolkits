@@ -230,7 +230,7 @@ impl ExecutionLedger {
             .map_err(|_| LedgerError::new(LedgerErrorCode::SerializationFailed))?;
         bytes.push(b'\n');
         let staged = state.projection.stage_next(&event)?;
-        let pending_snapshot = staged.active_changed().then(|| {
+        let pending_snapshot = staged.snapshot_changed().then(|| {
             ActiveSnapshot::new(
                 event.sequence,
                 event.event_hash.clone(),
@@ -281,6 +281,15 @@ impl ExecutionLedger {
 
     pub fn projection(&self) -> LedgerProjectionSnapshot {
         self.state.lock().projection.snapshot()
+    }
+
+    pub(crate) fn event(&self, event_id: EventId) -> Option<LedgerEvent> {
+        self.state
+            .lock()
+            .projection
+            .event_ids
+            .get(&event_id)
+            .cloned()
     }
 }
 

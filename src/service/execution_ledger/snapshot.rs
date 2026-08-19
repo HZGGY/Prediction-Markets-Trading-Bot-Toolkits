@@ -239,6 +239,7 @@ mod tests {
             LedgerPayload::Acknowledged {
                 reason: AcknowledgeReason::ReconciledNoFill,
             },
+            LedgerPayload::HaltMarkerCleanupCompleted,
         ] {
             append_and_assert_exact_mirror(&ledger, &mirror, uncertain_intent, payload);
         }
@@ -300,6 +301,12 @@ mod tests {
             LedgerPayload::Acknowledged {
                 reason: AcknowledgeReason::RecoveryApplied,
             },
+        );
+        append_and_assert_exact_mirror(
+            &ledger,
+            &mirror,
+            recovery_intent,
+            LedgerPayload::HaltMarkerCleanupCompleted,
         );
         assert!(ledger.projection().active.is_none());
         let final_sequence = ledger.projection().sequence;

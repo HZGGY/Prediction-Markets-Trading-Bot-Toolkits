@@ -126,6 +126,8 @@ pub(crate) struct RecoveryService {
     halt_marker: PathBuf,
     cleanup: Arc<dyn HaltMarkerCleanup>,
     operation: Mutex<()>,
+    #[cfg(test)]
+    fail_cleanup_completion_append: std::sync::atomic::AtomicBool,
 }
 
 trait HaltMarkerCleanup: Send + Sync {
@@ -136,16 +138,43 @@ struct SystemHaltMarkerCleanup;
 
 impl HaltMarkerCleanup for SystemHaltMarkerCleanup {
     fn remove_and_sync(&self, marker: &Path) -> io::Result<()> {
+        #[cfg(unix)]
+        let parent = open_marker_parent(marker)?;
+        #[cfg(not(unix))]
+        validate_marker_parent(marker)?;
         if marker.exists() {
             fs::remove_file(marker)?;
         }
-        sync_marker_parent(marker)
+        #[cfg(unix)]
+        {
+            return sync_marker_parent(parent);
+        }
+        #[cfg(not(unix))]
+        {
+            sync_marker_parent(marker)
+        }
     }
 }
 
+fn open_marker_parent(marker: &Path) -> io::Result<std::fs::File> {
+    let parent = marker.parent().unwrap_or_else(|| Path::new("."));
+    validate_marker_parent(marker)?;
+    std::fs::File::open(parent)
+}
+
+fn validate_marker_parent(marker: &Path) -> io::Result<()> {
+    let parent = marker.parent().unwrap_or_else(|| Path::new("."));
+    parent.is_dir().then_some(()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "halt marker parent is not a directory",
+        )
+    })
+}
+
 #[cfg(unix)]
-fn sync_marker_parent(marker: &Path) -> io::Result<()> {
-    std::fs::File::open(marker.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()
+fn sync_marker_parent(parent: std::fs::File) -> io::Result<()> {
+    parent.sync_all()
 }
 
 #[cfg(not(unix))]
@@ -165,6 +194,8 @@ impl RecoveryService {
             halt_marker,
             cleanup: Arc::new(SystemHaltMarkerCleanup),
             operation: Mutex::new(()),
+            #[cfg(test)]
+            fail_cleanup_completion_append: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -180,6 +211,23 @@ impl RecoveryService {
             halt_marker,
             cleanup: Arc::new(FailOnceCleanup::default()),
             operation: Mutex::new(()),
+            fail_cleanup_completion_append: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    #[cfg(test)]
+    fn local_with_post_remove_sync_failure_for_test(
+        ledger: Arc<ExecutionLedger>,
+        positions: Arc<PositionStore>,
+        halt_marker: PathBuf,
+    ) -> Self {
+        Self {
+            ledger,
+            positions,
+            halt_marker,
+            cleanup: Arc::new(RemoveThenFailOnceCleanup::default()),
+            operation: Mutex::new(()),
+            fail_cleanup_completion_append: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -189,20 +237,35 @@ impl RecoveryService {
         show_order_id: bool,
     ) -> Result<RecoveryInspection, RecoveryServiceError> {
         let projection = self.ledger.projection();
-        let active = projection
+        if let Some(active) = projection
             .active
             .as_ref()
             .filter(|active| active.intent_id == intent_id)
-            .ok_or(RecoveryServiceError::NotApplicable)?;
-        let action = available_action(active);
+        {
+            let action = available_action(active);
+            return Ok(RecoveryInspection {
+                intent_id,
+                action,
+                challenge: action.map(|action| {
+                    challenge(action, active, projection.sequence, &projection.head_hash)
+                }),
+                order_id: show_order_id.then(|| active.prepared.order_id.clone()),
+                order_id_hint: Some(active.prepared.order_id.to_string()),
+            });
+        }
+        let pending = cleanup_for(&projection, intent_id)?;
         Ok(RecoveryInspection {
             intent_id,
-            action,
-            challenge: action.map(|action| {
-                challenge(action, active, projection.sequence, &projection.head_hash)
-            }),
-            order_id: show_order_id.then(|| active.prepared.order_id.clone()),
-            order_id_hint: Some(active.prepared.order_id.to_string()),
+            action: Some(RecoveryAction::Acknowledge),
+            challenge: Some(challenge_for(
+                RecoveryAction::Acknowledge,
+                intent_id,
+                &pending.order_id,
+                projection.sequence,
+                &projection.head_hash,
+            )),
+            order_id: show_order_id.then(|| pending.order_id.clone()),
+            order_id_hint: Some(pending.order_id.to_string()),
         })
     }
 
@@ -232,6 +295,12 @@ impl RecoveryService {
             .append(intent_id, payload)
             .map_err(RecoveryServiceError::ledger)?;
         self.inspect(intent_id, false)
+    }
+
+    #[cfg(test)]
+    fn fail_next_cleanup_completion_append(&self) {
+        self.fail_cleanup_completion_append
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub(crate) fn prepare_apply(
@@ -282,7 +351,10 @@ impl RecoveryService {
             &projection.head_hash,
         )?;
 
-        let position_event_id = if active.state == ActiveIntentState::ReconciledMatched {
+        let position_event_id = if let Some(position_event_id) = active.position_event_id {
+            self.validate_recorded_position(active, position_event_id)?;
+            position_event_id
+        } else if active.state == ActiveIntentState::ReconciledMatched {
             self.apply_position(active)?;
             self.ledger
                 .projection()
@@ -329,15 +401,11 @@ impl RecoveryService {
             }
             Some(_) => Err(RecoveryServiceError::NotApplicable),
             None => {
-                let order_id = projection
-                    .intent_orders
-                    .get(&intent_id)
-                    .cloned()
-                    .ok_or(RecoveryServiceError::NotApplicable)?;
+                let pending = cleanup_for(&projection, intent_id)?;
                 Ok(challenge_for(
                     RecoveryAction::Acknowledge,
                     intent_id,
-                    &order_id,
+                    &pending.order_id,
                     projection.sequence,
                     &projection.head_hash,
                 ))
@@ -369,15 +437,11 @@ impl RecoveryService {
             }
             Some(_) => return Err(RecoveryServiceError::NotApplicable),
             None => {
-                let order_id = projection
-                    .intent_orders
-                    .get(&intent_id)
-                    .cloned()
-                    .ok_or(RecoveryServiceError::NotApplicable)?;
+                let pending = cleanup_for(&projection, intent_id)?;
                 let expected = challenge_for(
                     RecoveryAction::Acknowledge,
                     intent_id,
-                    &order_id,
+                    &pending.order_id,
                     projection.sequence,
                     &projection.head_hash,
                 );
@@ -390,6 +454,16 @@ impl RecoveryService {
         self.cleanup
             .remove_and_sync(&self.halt_marker)
             .map_err(|_| RecoveryServiceError::HaltCleanupIncomplete)?;
+        #[cfg(test)]
+        if self
+            .fail_cleanup_completion_append
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(RecoveryServiceError::Ledger);
+        }
+        self.ledger
+            .append(intent_id, LedgerPayload::HaltMarkerCleanupCompleted)
+            .map_err(RecoveryServiceError::ledger)?;
         Ok(status)
     }
 
@@ -415,6 +489,67 @@ impl RecoveryService {
             }
         }
         Ok(())
+    }
+
+    fn validate_recorded_position(
+        &self,
+        active: &ActiveIntent,
+        position_event_id: crate::service::execution_ledger::EventId,
+    ) -> Result<(), RecoveryServiceError> {
+        let amounts = reconciled_amounts(active)?;
+        let event = self
+            .ledger
+            .event(position_event_id)
+            .ok_or(RecoveryServiceError::Position)?;
+        if event.intent_id != active.intent_id {
+            return Err(RecoveryServiceError::Position);
+        }
+        let projection = self.ledger.projection();
+        match (&active.prepared.purpose, event.payload) {
+            (
+                crate::service::execution_ledger::IntentPurpose::Entry(seed),
+                LedgerPayload::PositionOpened(position),
+            ) => {
+                let exact = position.position_id
+                    == crate::service::execution_ledger::PositionId(active.intent_id.0)
+                    && position.opening_intent_id == active.intent_id
+                    && position.opening_order_id == active.prepared.order_id
+                    && position.venue == active.prepared.venue
+                    && position.token_id == active.prepared.token_id
+                    && position.slug == seed.slug
+                    && position.category == seed.category
+                    && position.tags == seed.tags
+                    && position.neg_risk == active.prepared.neg_risk
+                    && position.side == active.prepared.side
+                    && position.entry_shares_micros == amounts.shares_micros
+                    && position.entry_usd_micros == amounts.usd_micros
+                    && projection.positions.get(&position.position_id) == Some(&position);
+                exact.then_some(()).ok_or(RecoveryServiceError::Position)
+            }
+            (
+                crate::service::execution_ledger::IntentPurpose::Exit { position_id },
+                LedgerPayload::PositionClosed(close),
+            ) => {
+                let exact = close.position_id == *position_id
+                    && close.closing_intent_id == active.intent_id
+                    && close.closing_order_id == active.prepared.order_id
+                    && close.shares_micros == amounts.shares_micros
+                    && close.usd_micros == amounts.usd_micros
+                    && projection
+                        .positions
+                        .get(position_id)
+                        .is_some_and(|position| {
+                            position.closing_intent_id == Some(active.intent_id)
+                                && position.closing_order_id.as_ref()
+                                    == Some(&active.prepared.order_id)
+                                && position.closing_shares_micros == Some(amounts.shares_micros)
+                                && position.closing_usd_micros == Some(amounts.usd_micros)
+                                && position.closed_at == Some(close.closed_at)
+                        });
+                exact.then_some(()).ok_or(RecoveryServiceError::Position)
+            }
+            _ => Err(RecoveryServiceError::Position),
+        }
     }
 
     fn position_for_recovery(
@@ -471,6 +606,17 @@ fn active_for(
     active
         .as_ref()
         .filter(|active| active.intent_id == intent_id)
+        .ok_or(RecoveryServiceError::NotApplicable)
+}
+
+fn cleanup_for(
+    projection: &crate::service::execution_ledger::LedgerProjectionSnapshot,
+    intent_id: IntentId,
+) -> Result<&crate::service::execution_ledger::CleanupPending, RecoveryServiceError> {
+    projection
+        .cleanup_pending
+        .as_ref()
+        .filter(|pending| pending.intent_id == intent_id)
         .ok_or(RecoveryServiceError::NotApplicable)
 }
 
@@ -609,6 +755,24 @@ impl HaltMarkerCleanup for FailOnceCleanup {
     fn remove_and_sync(&self, marker: &Path) -> io::Result<()> {
         if !self.0.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return Err(io::Error::other("injected marker cleanup failure"));
+        }
+        SystemHaltMarkerCleanup.remove_and_sync(marker)
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct RemoveThenFailOnceCleanup(std::sync::atomic::AtomicBool);
+
+#[cfg(test)]
+impl HaltMarkerCleanup for RemoveThenFailOnceCleanup {
+    fn remove_and_sync(&self, marker: &Path) -> io::Result<()> {
+        if !self.0.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            validate_marker_parent(marker)?;
+            if marker.exists() {
+                fs::remove_file(marker)?;
+            }
+            return Err(io::Error::other("injected post-remove parent-sync failure"));
         }
         SystemHaltMarkerCleanup.remove_and_sync(marker)
     }
@@ -815,6 +979,46 @@ mod tests {
         assert!(marker.exists());
     }
 
+    #[test]
+    fn normally_committed_history_cannot_authorize_unrelated_marker_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("execution-halt.json");
+        let ledger = Arc::new(
+            ExecutionLedger::open_live(dir.path().join("execution-ledger.jsonl")).unwrap(),
+        );
+        let intent_id = IntentId(uuid::Uuid::from_u128(91));
+        ledger
+            .append(intent_id, LedgerPayload::IntentPrepared(prepared()))
+            .unwrap();
+        ledger
+            .append(intent_id, LedgerPayload::SubmitStarted)
+            .unwrap();
+        ledger
+            .append(
+                intent_id,
+                LedgerPayload::RemoteRejected {
+                    code: crate::service::execution_ledger::RemoteRejectCode::ServerRejected,
+                },
+            )
+            .unwrap();
+        ledger
+            .append(intent_id, LedgerPayload::SubmissionCommittedNoFill)
+            .unwrap();
+        fs::write(&marker, b"unrelated compatibility marker").unwrap();
+        let positions = PositionStore::from_ledger(Arc::clone(&ledger)).unwrap();
+        let service = RecoveryService::local(ledger, positions, marker.clone());
+
+        assert_eq!(
+            service.prepare_acknowledge(intent_id).unwrap_err(),
+            RecoveryServiceError::NotApplicable
+        );
+        assert_eq!(
+            service.inspect(intent_id, false).unwrap_err(),
+            RecoveryServiceError::NotApplicable
+        );
+        assert!(marker.exists());
+    }
+
     #[tokio::test]
     async fn reconcile_durably_starts_once_calls_exact_gateway_once_and_classifies_every_remote_result(
     ) {
@@ -1018,6 +1222,81 @@ mod tests {
     }
 
     #[test]
+    fn apply_after_normal_entry_position_crash_reuses_the_retained_event_without_regenerating_it() {
+        let (dir, ledger, positions, intent_id) = active_service();
+        ledger
+            .append(
+                intent_id,
+                LedgerPayload::RemoteMatched(crate::service::execution_ledger::MatchedAmounts {
+                    shares_micros: 4_000_000,
+                    usd_micros: 2_000_000,
+                }),
+            )
+            .unwrap();
+        let opened_at = chrono::Utc::now();
+        positions
+            .apply_open(OpenPosition {
+                position_id: crate::service::execution_ledger::PositionId(intent_id.0),
+                opening_intent_id: intent_id,
+                opening_order_id: prepared().order_id,
+                venue: Venue::PolymarketClob,
+                token_id: TokenId::from_decimal("12345").unwrap(),
+                slug: "question".into(),
+                category: "politics".into(),
+                tags: vec!["us".into()],
+                neg_risk: false,
+                side: OrderSide::Buy,
+                shares_micros: 4_000_000,
+                usd_notional_micros: 2_000_000,
+                take_profit_bps: 500,
+                stop_loss_bps: 300,
+                opened_at,
+            })
+            .unwrap();
+        let retained = ledger
+            .projection()
+            .active
+            .unwrap()
+            .position_event_id
+            .unwrap();
+        ledger
+            .append(intent_id, LedgerPayload::ReconciliationStarted)
+            .unwrap();
+        ledger
+            .append(
+                intent_id,
+                LedgerPayload::ReconciledMatched(
+                    crate::service::execution_ledger::MatchedAmounts {
+                        shares_micros: 4_000_000,
+                        usd_micros: 2_000_000,
+                    },
+                ),
+            )
+            .unwrap();
+        let service = RecoveryService::local(
+            Arc::clone(&ledger),
+            positions.clone(),
+            dir.path().join("execution-halt.json"),
+        );
+
+        let confirmation = service.prepare_apply(intent_id).unwrap();
+        service.apply(intent_id, confirmation.as_str()).unwrap();
+
+        assert_eq!(ledger.projection().event_count, 7);
+        assert_eq!(
+            ledger.projection().active.unwrap().position_event_id,
+            Some(retained)
+        );
+        assert_eq!(
+            positions
+                .get_by_id(&crate::service::execution_ledger::PositionId(intent_id.0))
+                .unwrap()
+                .opened_at,
+            opened_at
+        );
+    }
+
+    #[test]
     fn apply_closes_only_the_exact_durable_exit_position() {
         let dir = tempfile::tempdir().unwrap();
         let ledger = Arc::new(
@@ -1089,6 +1368,32 @@ mod tests {
             .append(exit_intent, LedgerPayload::SubmitStarted)
             .unwrap();
         ledger
+            .append(
+                exit_intent,
+                LedgerPayload::RemoteMatched(crate::service::execution_ledger::MatchedAmounts {
+                    shares_micros: open.shares_micros,
+                    usd_micros: open.usd_notional_micros,
+                }),
+            )
+            .unwrap();
+        let closed_at = chrono::Utc::now();
+        positions
+            .apply_close(crate::service::execution_ledger::PositionClose {
+                position_id: open.position_id,
+                closing_intent_id: exit_intent,
+                closing_order_id: order_id(0x21),
+                shares_micros: open.shares_micros,
+                usd_micros: open.usd_notional_micros,
+                closed_at,
+            })
+            .unwrap();
+        let retained = ledger
+            .projection()
+            .active
+            .unwrap()
+            .position_event_id
+            .unwrap();
+        ledger
             .append(exit_intent, LedgerPayload::ReconciliationStarted)
             .unwrap();
         ledger
@@ -1116,6 +1421,11 @@ mod tests {
             ledger.projection().active.unwrap().state,
             ActiveIntentState::RecoveryApplied
         );
+        assert_eq!(
+            ledger.projection().active.unwrap().position_event_id,
+            Some(retained)
+        );
+        assert_eq!(ledger.projection().event_count, 12);
     }
 
     #[test]
@@ -1164,7 +1474,7 @@ mod tests {
     }
 
     #[test]
-    fn acknowledge_publishes_the_clear_before_marker_cleanup_and_retries_cleanup_idempotently() {
+    fn acknowledge_publishes_the_clear_before_marker_cleanup_and_retries_only_while_pending() {
         let dir = tempfile::tempdir().unwrap();
         let ledger = Arc::new(
             ExecutionLedger::open_live(dir.path().join("execution-ledger.jsonl")).unwrap(),
@@ -1206,8 +1516,99 @@ mod tests {
         assert!(ledger.projection().active.is_none());
         assert!(!marker.exists());
 
-        let repeat = service.prepare_acknowledge(intent_id).unwrap();
-        service.acknowledge(intent_id, repeat.as_str()).unwrap();
+        assert_eq!(
+            service.prepare_acknowledge(intent_id).unwrap_err(),
+            RecoveryServiceError::NotApplicable
+        );
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn post_remove_parent_sync_failure_replays_as_cleanup_pending_and_retries_locally() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("execution-ledger.jsonl");
+        let marker = dir.path().join("execution-halt.json");
+        let intent_id = IntentId(uuid::Uuid::from_u128(70));
+        let ledger = Arc::new(ExecutionLedger::open_live(&ledger_path).unwrap());
+        ledger
+            .append(intent_id, LedgerPayload::IntentPrepared(prepared()))
+            .unwrap();
+        let positions = PositionStore::from_ledger(Arc::clone(&ledger)).unwrap();
+        fs::write(&marker, b"legacy halt").unwrap();
+        let service = RecoveryService::local_with_post_remove_sync_failure_for_test(
+            Arc::clone(&ledger),
+            Arc::clone(&positions),
+            marker.clone(),
+        );
+        let confirmation = service.prepare_acknowledge(intent_id).unwrap();
+
+        assert_eq!(
+            service
+                .acknowledge(intent_id, confirmation.as_str())
+                .unwrap_err(),
+            RecoveryServiceError::HaltCleanupIncomplete
+        );
+        assert!(ledger.projection().active.is_none());
+        assert!(ledger.projection().cleanup_pending.is_some());
+        assert!(!marker.exists());
+        assert!(matches!(
+            crate::service::execution_circuit_breaker::ExecutionCircuitBreaker::new_live(
+                Arc::clone(&ledger),
+                marker.clone(),
+            ),
+            Err(crate::service::order_gateway::OrderSubmitError::Halted { .. })
+        ));
+
+        drop(service);
+        drop(positions);
+        drop(ledger);
+        let restarted = Arc::new(ExecutionLedger::open_live(&ledger_path).unwrap());
+        assert!(restarted.projection().cleanup_pending.is_some());
+        let restarted_positions = PositionStore::from_ledger(Arc::clone(&restarted)).unwrap();
+        let retry =
+            RecoveryService::local(Arc::clone(&restarted), restarted_positions, marker.clone());
+        let confirmation = retry.prepare_acknowledge(intent_id).unwrap();
+        retry.acknowledge(intent_id, confirmation.as_str()).unwrap();
+        assert!(restarted.projection().cleanup_pending.is_none());
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn final_cleanup_completion_append_failure_leaves_the_durable_owner_halted_for_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("execution-halt.json");
+        let ledger = Arc::new(
+            ExecutionLedger::open_live(dir.path().join("execution-ledger.jsonl")).unwrap(),
+        );
+        let intent_id = IntentId(uuid::Uuid::from_u128(71));
+        ledger
+            .append(intent_id, LedgerPayload::IntentPrepared(prepared()))
+            .unwrap();
+        let positions = PositionStore::from_ledger(Arc::clone(&ledger)).unwrap();
+        fs::write(&marker, b"legacy halt").unwrap();
+        let service = RecoveryService::local(Arc::clone(&ledger), positions, marker.clone());
+        let confirmation = service.prepare_acknowledge(intent_id).unwrap();
+        service.fail_next_cleanup_completion_append();
+
+        assert_eq!(
+            service
+                .acknowledge(intent_id, confirmation.as_str())
+                .unwrap_err(),
+            RecoveryServiceError::Ledger
+        );
+        assert!(ledger.projection().active.is_none());
+        assert!(ledger.projection().cleanup_pending.is_some());
+        assert!(!marker.exists());
+        assert!(matches!(
+            crate::service::execution_circuit_breaker::ExecutionCircuitBreaker::new_live(
+                Arc::clone(&ledger),
+                marker.clone(),
+            ),
+            Err(crate::service::order_gateway::OrderSubmitError::Halted { .. })
+        ));
+
+        let retry = service.prepare_acknowledge(intent_id).unwrap();
+        service.acknowledge(intent_id, retry.as_str()).unwrap();
+        assert!(ledger.projection().cleanup_pending.is_none());
     }
 }

@@ -67,7 +67,8 @@ impl ExecutionCircuitBreaker {
         ledger: Arc<ExecutionLedger>,
         path: PathBuf,
     ) -> Result<Arc<Self>, OrderSubmitError> {
-        if ledger.projection().active.is_some() {
+        let projection = ledger.projection();
+        if projection.active.is_some() || projection.cleanup_pending.is_some() {
             return Err(OrderSubmitError::Halted {
                 code: OrderErrorCode::ExecutionHalted,
             });
@@ -107,7 +108,8 @@ impl ExecutionCircuitBreaker {
     }
 
     pub fn check(&self) -> Result<(), OrderSubmitError> {
-        if self.is_halted() {
+        let projection = self.ledger.projection();
+        if self.is_halted() || projection.cleanup_pending.is_some() {
             Err(OrderSubmitError::Halted {
                 code: OrderErrorCode::ExecutionHalted,
             })
@@ -458,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn leftover_marker_with_no_active_ledger_remains_a_compatibility_halt() {
+    fn acknowledged_cleanup_pending_remains_halted_even_when_the_marker_is_present() {
         let dir = tempfile::tempdir().unwrap();
         let ledger = Arc::new(
             ExecutionLedger::open_live(dir.path().join("execution-ledger.jsonl")).unwrap(),
@@ -480,10 +482,47 @@ mod tests {
         assert!(matches!(
             ExecutionCircuitBreaker::new_live(ledger, marker.clone()),
             Err(OrderSubmitError::Halted {
-                code: OrderErrorCode::HaltMarkerPresent
+                code: OrderErrorCode::ExecutionHalted
             })
         ));
         assert!(marker.is_file());
+    }
+
+    #[test]
+    fn bounded_cleanup_pending_blocks_startup_and_runtime_check_without_a_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("execution-halt.json");
+        let ledger = Arc::new(
+            ExecutionLedger::open_live(dir.path().join("execution-ledger.jsonl")).unwrap(),
+        );
+        let breaker =
+            ExecutionCircuitBreaker::new_live(Arc::clone(&ledger), marker.clone()).unwrap();
+        let intent = IntentId(uuid::Uuid::from_u128(88));
+        ledger.append(intent, prepared_payload()).unwrap();
+        ledger
+            .append(
+                intent,
+                LedgerPayload::Acknowledged {
+                    reason: AcknowledgeReason::NotSent,
+                },
+            )
+            .unwrap();
+
+        assert!(ledger.projection().active.is_none());
+        assert!(!marker.exists());
+        assert!(matches!(
+            breaker.check(),
+            Err(OrderSubmitError::Halted {
+                code: OrderErrorCode::ExecutionHalted
+            })
+        ));
+        drop(breaker);
+        assert!(matches!(
+            ExecutionCircuitBreaker::new_live(ledger, marker),
+            Err(OrderSubmitError::Halted {
+                code: OrderErrorCode::ExecutionHalted
+            })
+        ));
     }
 
     #[tokio::test]

@@ -434,6 +434,7 @@ pub enum LedgerPayload {
     CancelResponseObserved { result: CancelResponseClass },
     RecoveryApplied { position_event_id: EventId },
     Acknowledged { reason: AcknowledgeReason },
+    HaltMarkerCleanupCompleted,
 }
 
 impl LedgerPayload {
@@ -458,6 +459,7 @@ impl LedgerPayload {
             Self::CancelResponseObserved { .. } => "cancel_response_observed",
             Self::RecoveryApplied { .. } => "recovery_applied",
             Self::Acknowledged { .. } => "acknowledged",
+            Self::HaltMarkerCleanupCompleted => "halt_marker_cleanup_completed",
         }
     }
 
@@ -472,7 +474,8 @@ impl LedgerPayload {
             | Self::ReconciliationStarted
             | Self::ReconciledLive
             | Self::ReconciledPending
-            | Self::CancelStarted => Ok(Value::Null),
+            | Self::CancelStarted
+            | Self::HaltMarkerCleanupCompleted => Ok(Value::Null),
             Self::RemoteMatched(value) | Self::ReconciledMatched(value) => {
                 serde_json::to_value(value)
             }
@@ -587,6 +590,10 @@ impl LedgerPayload {
                 Self::Acknowledged {
                     reason: value.reason,
                 }
+            }
+            "halt_marker_cleanup_completed" => {
+                unit(payload)?;
+                Self::HaltMarkerCleanupCompleted
             }
             _ => return Err("unknown ledger event kind"),
         })
@@ -1119,6 +1126,10 @@ mod tests {
                     reason: AcknowledgeReason::RecoveryApplied,
                 },
             ),
+            (
+                "halt_marker_cleanup_completed",
+                LedgerPayload::HaltMarkerCleanupCompleted,
+            ),
         ]
     }
 
@@ -1136,7 +1147,7 @@ mod tests {
     }
 
     #[test]
-    fn all_nineteen_event_variants_match_complete_literal_json_goldens() {
+    fn all_twenty_event_variants_match_complete_literal_json_goldens() {
         const GOLDENS: &str = r#"[
           {"schema_version":1,"sequence":1,"event_id":"00000000-0000-0000-0000-00000000000a","intent_id":"00000000-0000-0000-0000-000000000001","recorded_at":"2026-08-18T12:34:56Z","kind":"intent_prepared","payload":{"order_id":"0x1111111111111111111111111111111111111111111111111111111111111111","protocol_version":2,"venue":"polymarket_clob","token_id":"123456789012345678901234567890","neg_risk":true,"side":"buy","order_type":"fok","expected_maker_micros":"9007199254740993","expected_taker_micros":"18014398509481987","source_hash":"2222222222222222222222222222222222222222222222222222222222222222","purpose":{"purpose":"entry","slug":"will-example-pass","category":"testing","tags":["offline","durable"],"take_profit_bps":1250,"stop_loss_bps":750}},"previous_hash":"0000000000000000000000000000000000000000000000000000000000000000","event_hash":"4444444444444444444444444444444444444444444444444444444444444444"},
           {"schema_version":1,"sequence":1,"event_id":"00000000-0000-0000-0000-00000000000a","intent_id":"00000000-0000-0000-0000-000000000001","recorded_at":"2026-08-18T12:34:56Z","kind":"submit_started","payload":null,"previous_hash":"0000000000000000000000000000000000000000000000000000000000000000","event_hash":"4444444444444444444444444444444444444444444444444444444444444444"},
@@ -1156,7 +1167,8 @@ mod tests {
           {"schema_version":1,"sequence":1,"event_id":"00000000-0000-0000-0000-00000000000a","intent_id":"00000000-0000-0000-0000-000000000001","recorded_at":"2026-08-18T12:34:56Z","kind":"cancel_started","payload":null,"previous_hash":"0000000000000000000000000000000000000000000000000000000000000000","event_hash":"4444444444444444444444444444444444444444444444444444444444444444"},
           {"schema_version":1,"sequence":1,"event_id":"00000000-0000-0000-0000-00000000000a","intent_id":"00000000-0000-0000-0000-000000000001","recorded_at":"2026-08-18T12:34:56Z","kind":"cancel_response_observed","payload":{"result":"canceled"},"previous_hash":"0000000000000000000000000000000000000000000000000000000000000000","event_hash":"4444444444444444444444444444444444444444444444444444444444444444"},
           {"schema_version":1,"sequence":1,"event_id":"00000000-0000-0000-0000-00000000000a","intent_id":"00000000-0000-0000-0000-000000000001","recorded_at":"2026-08-18T12:34:56Z","kind":"recovery_applied","payload":{"position_event_id":"00000000-0000-0000-0000-000000000009"},"previous_hash":"0000000000000000000000000000000000000000000000000000000000000000","event_hash":"4444444444444444444444444444444444444444444444444444444444444444"},
-          {"schema_version":1,"sequence":1,"event_id":"00000000-0000-0000-0000-00000000000a","intent_id":"00000000-0000-0000-0000-000000000001","recorded_at":"2026-08-18T12:34:56Z","kind":"acknowledged","payload":{"reason":"recovery_applied"},"previous_hash":"0000000000000000000000000000000000000000000000000000000000000000","event_hash":"4444444444444444444444444444444444444444444444444444444444444444"}
+          {"schema_version":1,"sequence":1,"event_id":"00000000-0000-0000-0000-00000000000a","intent_id":"00000000-0000-0000-0000-000000000001","recorded_at":"2026-08-18T12:34:56Z","kind":"acknowledged","payload":{"reason":"recovery_applied"},"previous_hash":"0000000000000000000000000000000000000000000000000000000000000000","event_hash":"4444444444444444444444444444444444444444444444444444444444444444"},
+          {"schema_version":1,"sequence":1,"event_id":"00000000-0000-0000-0000-00000000000a","intent_id":"00000000-0000-0000-0000-000000000001","recorded_at":"2026-08-18T12:34:56Z","kind":"halt_marker_cleanup_completed","payload":null,"previous_hash":"0000000000000000000000000000000000000000000000000000000000000000","event_hash":"4444444444444444444444444444444444444444444444444444444444444444"}
         ]"#;
 
         let expected: Value = serde_json::from_str(GOLDENS).unwrap();
