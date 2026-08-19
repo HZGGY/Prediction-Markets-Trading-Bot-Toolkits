@@ -12,7 +12,6 @@ use std::{
 use chrono::Utc;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
 
 use crate::service::{
     execution_ledger::{
@@ -126,7 +125,6 @@ pub(crate) struct RecoveryService {
     positions: Arc<PositionStore>,
     halt_marker: PathBuf,
     cleanup: Arc<dyn HaltMarkerCleanup>,
-    operation: Mutex<()>,
     #[cfg(test)]
     fail_cleanup_completion_append: std::sync::atomic::AtomicBool,
 }
@@ -194,7 +192,6 @@ impl RecoveryService {
             positions,
             halt_marker,
             cleanup: Arc::new(SystemHaltMarkerCleanup),
-            operation: Mutex::new(()),
             #[cfg(test)]
             fail_cleanup_completion_append: std::sync::atomic::AtomicBool::new(false),
         }
@@ -211,7 +208,6 @@ impl RecoveryService {
             positions,
             halt_marker,
             cleanup: Arc::new(FailOnceCleanup::default()),
-            operation: Mutex::new(()),
             fail_cleanup_completion_append: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -227,7 +223,6 @@ impl RecoveryService {
             positions,
             halt_marker,
             cleanup: Arc::new(RemoveThenFailOnceCleanup::default()),
-            operation: Mutex::new(()),
             fail_cleanup_completion_append: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -275,27 +270,8 @@ impl RecoveryService {
         gateway: &dyn RecoveryGateway,
         intent_id: IntentId,
     ) -> Result<RecoveryInspection, RecoveryServiceError> {
-        let expected = {
-            let projection = self.ledger.projection();
-            let active = projection
-                .active
-                .as_ref()
-                .filter(|active| active.intent_id == intent_id)
-                .ok_or(RecoveryServiceError::NotApplicable)?;
-            prepared_identity(&active.prepared)
-        };
-        self.ledger
-            .append(intent_id, LedgerPayload::ReconciliationStarted)
-            .map_err(RecoveryServiceError::ledger)?;
-        let evidence = gateway
-            .reconcile_exact(&expected)
-            .await
-            .map_err(|_| RecoveryServiceError::GatewayFailed)?;
-        let payload = reconcile_payload(evidence, &expected);
-        self.ledger
-            .append(intent_id, payload)
-            .map_err(RecoveryServiceError::ledger)?;
-        self.inspect(intent_id, false)
+        let _operation = self.ledger.lock_recovery_operation().await;
+        self.reconcile_locked(gateway, intent_id, false).await
     }
 
     pub(crate) async fn prepare_cancel(
@@ -303,21 +279,8 @@ impl RecoveryService {
         gateway: &dyn RecoveryGateway,
         intent_id: IntentId,
     ) -> Result<ConfirmationChallenge, RecoveryServiceError> {
-        let _operation = self.operation.lock().await;
-        let expected = {
-            let projection = self.ledger.projection();
-            prepared_identity(&active_for(&projection.active, intent_id)?.prepared)
-        };
-        self.ledger
-            .append(intent_id, LedgerPayload::ReconciliationStarted)
-            .map_err(RecoveryServiceError::ledger)?;
-        let evidence = gateway
-            .reconcile_exact(&expected)
-            .await
-            .map_err(|_| RecoveryServiceError::GatewayFailed)?;
-        self.ledger
-            .append(intent_id, reconcile_payload(evidence, &expected))
-            .map_err(RecoveryServiceError::ledger)?;
+        let _operation = self.ledger.lock_recovery_operation().await;
+        self.reconcile_locked(gateway, intent_id, false).await?;
         let projection = self.ledger.projection();
         let active = active_for(&projection.active, intent_id)?;
         if active.state != ActiveIntentState::ReconciledLive {
@@ -337,7 +300,7 @@ impl RecoveryService {
         intent_id: IntentId,
         confirmation: &str,
     ) -> Result<RecoveryInspection, RecoveryServiceError> {
-        let _operation = self.operation.lock().await;
+        let _operation = self.ledger.lock_recovery_operation().await;
         let projection = self.ledger.projection();
         let active = active_for(&projection.active, intent_id)?;
         if active.state != ActiveIntentState::ReconciledLive {
@@ -350,7 +313,6 @@ impl RecoveryService {
             projection.sequence,
             &projection.head_hash,
         )?;
-        let expected = prepared_identity(&active.prepared);
         let order_id = active.prepared.order_id.clone();
         self.ledger
             .append(intent_id, LedgerPayload::CancelStarted)
@@ -379,19 +341,7 @@ impl RecoveryService {
                 },
             )
             .map_err(RecoveryServiceError::ledger)?;
-        self.ledger
-            .append(intent_id, LedgerPayload::ReconciliationStarted)
-            .map_err(RecoveryServiceError::ledger)?;
-        let evidence = match gateway.reconcile_exact(&expected).await {
-            Ok(evidence) => evidence,
-            Err(_) => RemoteOrderEvidence::Uncertain {
-                code: crate::service::execution_ledger::ReconcileUncertainCode::Transport,
-            },
-        };
-        self.ledger
-            .append(intent_id, reconcile_payload(evidence, &expected))
-            .map_err(RecoveryServiceError::ledger)?;
-        self.inspect(intent_id, false)
+        self.reconcile_locked(gateway, intent_id, true).await
     }
 
     #[cfg(test)]
@@ -426,9 +376,9 @@ impl RecoveryService {
         confirmation: &str,
     ) -> Result<RecoveryApplyResult, RecoveryServiceError> {
         let _operation = self
-            .operation
-            .try_lock()
-            .map_err(|_| RecoveryServiceError::OperationBusy)?;
+            .ledger
+            .try_lock_recovery_operation()
+            .ok_or(RecoveryServiceError::OperationBusy)?;
         let projection = self.ledger.projection();
         let active = active_for(&projection.active, intent_id)?;
         if active.state == ActiveIntentState::RecoveryApplied {
@@ -519,9 +469,9 @@ impl RecoveryService {
         confirmation: &str,
     ) -> Result<RecoveryAcknowledgeStatus, RecoveryServiceError> {
         let _operation = self
-            .operation
-            .try_lock()
-            .map_err(|_| RecoveryServiceError::OperationBusy)?;
+            .ledger
+            .try_lock_recovery_operation()
+            .ok_or(RecoveryServiceError::OperationBusy)?;
         let projection = self.ledger.projection();
         let status = match projection.active.as_ref() {
             Some(active) if active.intent_id == intent_id => {
@@ -568,6 +518,36 @@ impl RecoveryService {
             .append(intent_id, LedgerPayload::HaltMarkerCleanupCompleted)
             .map_err(RecoveryServiceError::ledger)?;
         Ok(status)
+    }
+
+    async fn reconcile_locked(
+        &self,
+        gateway: &dyn RecoveryGateway,
+        intent_id: IntentId,
+        classify_gateway_failure_as_uncertain: bool,
+    ) -> Result<RecoveryInspection, RecoveryServiceError> {
+        let expected = {
+            let projection = self.ledger.projection();
+            let active = active_for(&projection.active, intent_id)?;
+            let expected = prepared_identity(&active.prepared);
+            if active.state != ActiveIntentState::ReconciliationStarted {
+                self.ledger
+                    .append(intent_id, LedgerPayload::ReconciliationStarted)
+                    .map_err(RecoveryServiceError::ledger)?;
+            }
+            expected
+        };
+        let evidence = match gateway.reconcile_exact(&expected).await {
+            Ok(evidence) => evidence,
+            Err(_) if classify_gateway_failure_as_uncertain => RemoteOrderEvidence::Uncertain {
+                code: crate::service::execution_ledger::ReconcileUncertainCode::Transport,
+            },
+            Err(_) => return Err(RecoveryServiceError::GatewayFailed),
+        };
+        self.ledger
+            .append(intent_id, reconcile_payload(evidence, &expected))
+            .map_err(RecoveryServiceError::ledger)?;
+        self.inspect(intent_id, false)
     }
 
     fn apply_position(&self, active: &ActiveIntent) -> Result<(), RecoveryServiceError> {
@@ -895,9 +875,10 @@ mod tests {
 
     use crate::service::{
         execution_ledger::{
-            ActiveEvidence, ActiveIntentState, EventHash, ExecutionLedger, IntentId, IntentPurpose,
-            LedgerPayload, OrderId, OrderSide, OrderType, PositionSeed, PreparedIntent,
-            ReconcileUncertainCode, TerminalNoFillStatus, TokenId, Venue, ORDER_PROTOCOL_VERSION,
+            ActiveEvidence, ActiveIntentState, CancelResponseClass, EventHash, ExecutionLedger,
+            IntentId, IntentPurpose, LedgerPayload, OrderId, OrderSide, OrderType, PositionSeed,
+            PreparedIntent, ReconcileUncertainCode, TerminalNoFillStatus, TokenId, Venue,
+            ORDER_PROTOCOL_VERSION,
         },
         order_gateway::PreparedOrderIdentity,
         position_store::{OpenPosition, PositionStore},
@@ -907,6 +888,10 @@ mod tests {
         },
     };
     use async_trait::async_trait;
+    use tokio::{
+        sync::Notify,
+        time::{timeout, Duration},
+    };
 
     use super::{
         challenge, challenge_for, prepared_identity, ConfirmationChallenge, RecoveryAction,
@@ -979,10 +964,22 @@ mod tests {
             reconcile_results: Vec<RemoteOrderEvidence>,
             cancel_result: CancelAttemptEvidence,
         ) -> Self {
+            Self::with_results(
+                ledger,
+                reconcile_results.into_iter().map(Ok).collect(),
+                vec![Ok(cancel_result)],
+            )
+        }
+
+        fn with_results(
+            ledger: Arc<ExecutionLedger>,
+            reconcile_results: Vec<Result<RemoteOrderEvidence, RecoveryError>>,
+            cancel_results: Vec<Result<CancelAttemptEvidence, RecoveryError>>,
+        ) -> Self {
             Self {
                 ledger,
-                reconcile_results: Mutex::new(reconcile_results.into_iter().map(Ok).collect()),
-                cancel_results: Mutex::new(vec![Ok(cancel_result)]),
+                reconcile_results: Mutex::new(reconcile_results),
+                cancel_results: Mutex::new(cancel_results),
                 reconcile_calls: AtomicUsize::new(0),
                 cancel_calls: AtomicUsize::new(0),
                 cancel_saw_started: AtomicUsize::new(0),
@@ -1013,6 +1010,42 @@ mod tests {
                 self.cancel_saw_started.store(1, Ordering::SeqCst);
             }
             self.cancel_results.lock().unwrap().remove(0)
+        }
+    }
+
+    struct PausingCancelGateway {
+        ledger: Arc<ExecutionLedger>,
+        reconcile_results: Mutex<Vec<RemoteOrderEvidence>>,
+        reconcile_calls: AtomicUsize,
+        cancel_calls: AtomicUsize,
+        delete_entered: Arc<Notify>,
+        release_delete: Arc<Notify>,
+        reconcile_entered: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl RecoveryGateway for PausingCancelGateway {
+        async fn reconcile_exact(
+            &self,
+            _expected: &PreparedOrderIdentity,
+        ) -> Result<RemoteOrderEvidence, RecoveryError> {
+            self.reconcile_calls.fetch_add(1, Ordering::SeqCst);
+            self.reconcile_entered.notify_waiters();
+            Ok(self.reconcile_results.lock().unwrap().remove(0))
+        }
+
+        async fn cancel_exact(
+            &self,
+            _order_id: &OrderId,
+        ) -> Result<CancelAttemptEvidence, RecoveryError> {
+            self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(
+                self.ledger.projection().active.unwrap().state,
+                ActiveIntentState::CancelStarted
+            );
+            self.delete_entered.notify_waiters();
+            self.release_delete.notified().await;
+            Ok(CancelAttemptEvidence::Canceled)
         }
     }
 
@@ -1265,6 +1298,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconcile_resumes_cancel_crash_states_with_one_exact_query_and_no_delete() {
+        let crash_states = [
+            ("cancel_started", false, false),
+            ("cancel_response_observed", true, false),
+            ("post_cancel_reconciliation_started", true, true),
+        ];
+
+        for (label, response_observed, reconciliation_started) in crash_states {
+            let dir = tempfile::tempdir().unwrap();
+            let ledger_path = dir.path().join("execution-ledger.jsonl");
+            let intent_id = IntentId(uuid::Uuid::from_u128(601));
+            let ledger = Arc::new(ExecutionLedger::open_live(&ledger_path).unwrap());
+            ledger
+                .append(intent_id, LedgerPayload::IntentPrepared(prepared()))
+                .unwrap();
+            ledger
+                .append(intent_id, LedgerPayload::SubmitStarted)
+                .unwrap();
+            ledger
+                .append(intent_id, LedgerPayload::ReconciliationStarted)
+                .unwrap();
+            ledger
+                .append(intent_id, LedgerPayload::ReconciledLive)
+                .unwrap();
+            ledger
+                .append(intent_id, LedgerPayload::CancelStarted)
+                .unwrap();
+            if response_observed {
+                ledger
+                    .append(
+                        intent_id,
+                        LedgerPayload::CancelResponseObserved {
+                            result: CancelResponseClass::Canceled,
+                        },
+                    )
+                    .unwrap();
+            }
+            if reconciliation_started {
+                ledger
+                    .append(intent_id, LedgerPayload::ReconciliationStarted)
+                    .unwrap();
+            }
+            let before = ledger.projection().sequence;
+            drop(ledger);
+
+            let ledger = Arc::new(ExecutionLedger::open_live(&ledger_path).unwrap());
+            let positions = PositionStore::from_ledger(Arc::clone(&ledger)).unwrap();
+            let service = RecoveryService::local(
+                Arc::clone(&ledger),
+                Arc::clone(&positions),
+                dir.path().join("execution-halt.json"),
+            );
+            let gateway = ScriptedCancelGateway::new(
+                Arc::clone(&ledger),
+                vec![RemoteOrderEvidence::Live],
+                CancelAttemptEvidence::Canceled,
+            );
+
+            let inspection = service
+                .reconcile(&gateway, intent_id)
+                .await
+                .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+
+            assert_eq!(gateway.cancel_calls.load(Ordering::SeqCst), 0, "{label}");
+            assert_eq!(gateway.reconcile_calls.load(Ordering::SeqCst), 1, "{label}");
+            assert_eq!(inspection.action, None, "{label}");
+            assert!(positions.is_empty(), "{label}");
+            assert_eq!(
+                ledger.projection().sequence,
+                before + if reconciliation_started { 1 } else { 2 },
+                "{label}"
+            );
+            assert_eq!(
+                ledger.projection().active.unwrap().state,
+                ActiveIntentState::ReconciledLive,
+                "{label}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn services_sharing_a_ledger_hold_reconcile_until_cancel_records_response_and_follow_up()
+    {
+        let (dir, ledger, positions, intent_id) = active_service();
+        let first = RecoveryService::local(
+            Arc::clone(&ledger),
+            Arc::clone(&positions),
+            dir.path().join("first-halt.json"),
+        );
+        let second = RecoveryService::local(
+            Arc::clone(&ledger),
+            positions,
+            dir.path().join("second-halt.json"),
+        );
+        let delete_entered = Arc::new(Notify::new());
+        let release_delete = Arc::new(Notify::new());
+        let reconcile_entered = Arc::new(Notify::new());
+        let gateway = Arc::new(PausingCancelGateway {
+            ledger: Arc::clone(&ledger),
+            reconcile_results: Mutex::new(vec![
+                RemoteOrderEvidence::Live,
+                RemoteOrderEvidence::Live,
+                RemoteOrderEvidence::Live,
+            ]),
+            reconcile_calls: AtomicUsize::new(0),
+            cancel_calls: AtomicUsize::new(0),
+            delete_entered: Arc::clone(&delete_entered),
+            release_delete: Arc::clone(&release_delete),
+            reconcile_entered,
+        });
+        let confirmation = first
+            .prepare_cancel(gateway.as_ref(), intent_id)
+            .await
+            .unwrap();
+        let delete_wait = delete_entered.notified();
+        let cancel_gateway = Arc::clone(&gateway);
+        let cancel = tokio::spawn(async move {
+            first
+                .cancel(cancel_gateway.as_ref(), intent_id, confirmation.as_str())
+                .await
+        });
+        delete_wait.await;
+
+        let reconcile_gateway = Arc::clone(&gateway);
+        let reconcile = tokio::spawn(async move {
+            second
+                .reconcile(reconcile_gateway.as_ref(), intent_id)
+                .await
+        });
+        assert!(timeout(
+            Duration::from_millis(100),
+            gateway.reconcile_entered.notified()
+        )
+        .await
+        .is_err());
+        assert_eq!(gateway.reconcile_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            ledger.projection().active.unwrap().state,
+            ActiveIntentState::CancelStarted
+        );
+
+        release_delete.notify_one();
+        let cancelled = cancel.await.unwrap().unwrap();
+        assert_eq!(
+            ledger.projection().active.unwrap().state,
+            ActiveIntentState::ReconciledLive
+        );
+        assert_eq!(cancelled.action, None);
+        let resumed = reconcile.await.unwrap().unwrap();
+        assert_eq!(gateway.cancel_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(gateway.reconcile_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(resumed.action, None);
+    }
+
+    #[tokio::test]
     async fn prepare_cancel_freshly_reconciles_only_the_exact_active_identity_and_challenges_live()
     {
         let (dir, ledger, positions, intent_id) = active_service();
@@ -1304,8 +1492,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_cancel_refuses_pending_or_uncertain_without_a_challenge() {
+    async fn prepare_cancel_refuses_every_fresh_non_live_classification_without_a_challenge() {
         let cases = [
+            (
+                RemoteOrderEvidence::Matched {
+                    making_micros: 2_000_000,
+                    taking_micros: 4_000_000,
+                    trade_ids: vec![],
+                },
+                ActiveIntentState::ReconciledMatched,
+            ),
+            (
+                RemoteOrderEvidence::NoFill {
+                    status: TerminalNoFillStatus::Canceled,
+                },
+                ActiveIntentState::ReconciledNoFill,
+            ),
             (
                 RemoteOrderEvidence::Pending,
                 ActiveIntentState::ReconciledPending,
@@ -1578,6 +1780,217 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_observes_every_response_class_then_performs_one_follow_up_classification() {
+        let responses = [
+            (
+                "canceled",
+                Ok(CancelAttemptEvidence::Canceled),
+                CancelResponseClass::Canceled,
+            ),
+            (
+                "not_canceled",
+                Ok(CancelAttemptEvidence::NotCanceled),
+                CancelResponseClass::NotCanceled,
+            ),
+            (
+                "not_found",
+                Ok(CancelAttemptEvidence::Uncertain {
+                    code: CancelUncertainCode::NotFound,
+                }),
+                CancelResponseClass::Uncertain {
+                    code: CancelUncertainCode::NotFound,
+                },
+            ),
+            (
+                "timeout",
+                Ok(CancelAttemptEvidence::Uncertain {
+                    code: CancelUncertainCode::Timeout,
+                }),
+                CancelResponseClass::Uncertain {
+                    code: CancelUncertainCode::Timeout,
+                },
+            ),
+            (
+                "transport",
+                Ok(CancelAttemptEvidence::Uncertain {
+                    code: CancelUncertainCode::Transport,
+                }),
+                CancelResponseClass::Uncertain {
+                    code: CancelUncertainCode::Transport,
+                },
+            ),
+            (
+                "malformed_response",
+                Ok(CancelAttemptEvidence::Uncertain {
+                    code: CancelUncertainCode::MalformedResponse,
+                }),
+                CancelResponseClass::Uncertain {
+                    code: CancelUncertainCode::MalformedResponse,
+                },
+            ),
+            (
+                "response_mismatch",
+                Ok(CancelAttemptEvidence::Uncertain {
+                    code: CancelUncertainCode::ResponseMismatch,
+                }),
+                CancelResponseClass::Uncertain {
+                    code: CancelUncertainCode::ResponseMismatch,
+                },
+            ),
+            (
+                "gateway_error",
+                Err(RecoveryError::Initialization),
+                CancelResponseClass::Uncertain {
+                    code: CancelUncertainCode::Transport,
+                },
+            ),
+        ];
+        let follow_ups = [
+            (
+                "matched",
+                RemoteOrderEvidence::Matched {
+                    making_micros: 2_000_000,
+                    taking_micros: 4_000_000,
+                    trade_ids: vec![TradeId::from_exact("trade-1").unwrap()],
+                },
+                ActiveIntentState::ReconciledMatched,
+                Some(RecoveryAction::Apply),
+            ),
+            (
+                "no_fill",
+                RemoteOrderEvidence::NoFill {
+                    status: TerminalNoFillStatus::Canceled,
+                },
+                ActiveIntentState::ReconciledNoFill,
+                Some(RecoveryAction::Acknowledge),
+            ),
+            (
+                "live",
+                RemoteOrderEvidence::Live,
+                ActiveIntentState::ReconciledLive,
+                None,
+            ),
+            (
+                "pending",
+                RemoteOrderEvidence::Pending,
+                ActiveIntentState::ReconciledPending,
+                None,
+            ),
+            (
+                "uncertain",
+                RemoteOrderEvidence::Uncertain {
+                    code: ReconcileUncertainCode::Timeout,
+                },
+                ActiveIntentState::ReconciledUncertain,
+                None,
+            ),
+        ];
+
+        for (response_label, response, expected_response) in responses {
+            for (follow_up_label, follow_up, expected_state, expected_action) in &follow_ups {
+                let (dir, ledger, positions, intent_id) = active_service();
+                let service = RecoveryService::local(
+                    Arc::clone(&ledger),
+                    Arc::clone(&positions),
+                    dir.path().join("execution-halt.json"),
+                );
+                let gateway = ScriptedCancelGateway::with_results(
+                    Arc::clone(&ledger),
+                    vec![Ok(RemoteOrderEvidence::Live), Ok(follow_up.clone())],
+                    vec![response.clone()],
+                );
+
+                let confirmation = service.prepare_cancel(&gateway, intent_id).await.unwrap();
+                let inspection = service
+                    .cancel(&gateway, intent_id, confirmation.as_str())
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("{response_label}/{follow_up_label}: {error:?}")
+                    });
+
+                assert_eq!(gateway.cancel_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(gateway.reconcile_calls.load(Ordering::SeqCst), 2);
+                assert_eq!(ledger.projection().event_count, 8);
+                assert_eq!(
+                    ledger.projection().active.unwrap().state,
+                    *expected_state,
+                    "{response_label}/{follow_up_label}"
+                );
+                assert_eq!(
+                    inspection.action, *expected_action,
+                    "{response_label}/{follow_up_label}"
+                );
+                assert!(positions.is_empty(), "{response_label}/{follow_up_label}");
+                let journal =
+                    fs::read_to_string(dir.path().join("execution-ledger.jsonl")).unwrap();
+                let events = journal
+                    .lines()
+                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(events[5]["kind"], "cancel_response_observed");
+                assert_eq!(
+                    events[5]["payload"]["result"],
+                    serde_json::to_value(expected_response).unwrap(),
+                    "{response_label}/{follow_up_label}"
+                );
+                assert_eq!(events[6]["kind"], "reconciliation_started");
+            }
+        }
+    }
+
+    #[test]
+    fn every_cancel_uncertain_code_survives_json_and_ledger_replay() {
+        let cases = [
+            CancelUncertainCode::NotFound,
+            CancelUncertainCode::Timeout,
+            CancelUncertainCode::Transport,
+            CancelUncertainCode::MalformedResponse,
+            CancelUncertainCode::ResponseMismatch,
+        ];
+
+        for code in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("execution-ledger.jsonl");
+            let intent_id = IntentId(uuid::Uuid::from_u128(701));
+            let ledger = ExecutionLedger::open_live(&path).unwrap();
+            ledger
+                .append(intent_id, LedgerPayload::IntentPrepared(prepared()))
+                .unwrap();
+            ledger
+                .append(intent_id, LedgerPayload::SubmitStarted)
+                .unwrap();
+            ledger
+                .append(intent_id, LedgerPayload::ReconciliationStarted)
+                .unwrap();
+            ledger
+                .append(intent_id, LedgerPayload::ReconciledLive)
+                .unwrap();
+            ledger
+                .append(intent_id, LedgerPayload::CancelStarted)
+                .unwrap();
+            ledger
+                .append(
+                    intent_id,
+                    LedgerPayload::CancelResponseObserved {
+                        result: CancelResponseClass::Uncertain { code },
+                    },
+                )
+                .unwrap();
+            let journal = fs::read_to_string(&path).unwrap();
+            assert!(journal.contains(&serde_json::to_string(&code).unwrap()));
+            drop(ledger);
+
+            let replayed = ExecutionLedger::open_live(path).unwrap();
+            let active = replayed.projection().active.unwrap();
+            assert_eq!(active.state, ActiveIntentState::CancelResponseObserved);
+            assert_eq!(
+                active.evidence,
+                ActiveEvidence::CancelResponseObserved(CancelResponseClass::Uncertain { code })
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn cancel_timeout_is_observed_then_reconciled_once_without_a_retry() {
         let (dir, ledger, positions, intent_id) = active_service();
         let service = RecoveryService::local(
@@ -1704,7 +2117,7 @@ mod tests {
         let (_dir, ledger, positions, intent_id, service) = reconciled_matched_service();
         let confirmation = service.prepare_apply(intent_id).unwrap();
         let sequence = ledger.projection().sequence;
-        let _operation = service.operation.lock().await;
+        let _operation = ledger.lock_recovery_operation().await;
 
         assert_eq!(
             service.apply(intent_id, confirmation.as_str()).unwrap_err(),
@@ -1712,6 +2125,58 @@ mod tests {
         );
         assert_eq!(ledger.projection().sequence, sequence);
         assert!(positions.is_empty());
+        drop(_operation);
+
+        assert_eq!(
+            service
+                .apply(intent_id, confirmation.as_str())
+                .unwrap()
+                .status,
+            super::RecoveryApplyStatus::Applied
+        );
+        assert!(!positions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn synchronous_acknowledge_fails_closed_while_an_async_recovery_operation_is_in_flight() {
+        let (dir, ledger, positions, intent_id) = active_service();
+        ledger
+            .append(intent_id, LedgerPayload::ReconciliationStarted)
+            .unwrap();
+        ledger
+            .append(
+                intent_id,
+                LedgerPayload::ReconciledNoFill {
+                    status: TerminalNoFillStatus::Canceled,
+                },
+            )
+            .unwrap();
+        let service = RecoveryService::local(
+            Arc::clone(&ledger),
+            positions,
+            dir.path().join("execution-halt.json"),
+        );
+        let confirmation = service.prepare_acknowledge(intent_id).unwrap();
+        let sequence = ledger.projection().sequence;
+        let operation = ledger.lock_recovery_operation().await;
+
+        assert_eq!(
+            service
+                .acknowledge(intent_id, confirmation.as_str())
+                .unwrap_err(),
+            RecoveryServiceError::OperationBusy
+        );
+        assert_eq!(ledger.projection().sequence, sequence);
+        drop(operation);
+
+        assert_eq!(
+            service
+                .acknowledge(intent_id, confirmation.as_str())
+                .unwrap(),
+            super::RecoveryAcknowledgeStatus::Acknowledged
+        );
+        assert!(ledger.projection().active.is_none());
+        assert!(ledger.projection().cleanup_pending.is_none());
     }
 
     #[test]

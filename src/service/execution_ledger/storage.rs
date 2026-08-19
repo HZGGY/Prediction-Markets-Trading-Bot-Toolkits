@@ -11,6 +11,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 use uuid::Uuid;
 
 use super::{
@@ -99,6 +100,7 @@ impl LedgerPaths {
 
 pub struct ExecutionLedger {
     state: Mutex<LedgerState>,
+    recovery_operation: AsyncMutex<()>,
     lock_file: File,
     #[cfg(unix)]
     parent_lock_file: File,
@@ -178,6 +180,7 @@ impl ExecutionLedger {
                 projection,
                 fatal: false,
             }),
+            recovery_operation: AsyncMutex::new(()),
             lock_file,
             #[cfg(unix)]
             parent_lock_file,
@@ -281,6 +284,14 @@ impl ExecutionLedger {
 
     pub fn projection(&self) -> LedgerProjectionSnapshot {
         self.state.lock().projection.snapshot()
+    }
+
+    pub(crate) async fn lock_recovery_operation(&self) -> AsyncMutexGuard<'_, ()> {
+        self.recovery_operation.lock().await
+    }
+
+    pub(crate) fn try_lock_recovery_operation(&self) -> Option<AsyncMutexGuard<'_, ()>> {
+        self.recovery_operation.try_lock().ok()
     }
 
     pub(crate) fn event(&self, event_id: EventId) -> Option<LedgerEvent> {
