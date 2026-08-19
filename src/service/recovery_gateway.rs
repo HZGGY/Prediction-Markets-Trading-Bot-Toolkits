@@ -12,6 +12,8 @@ use crate::service::{
     order_gateway::PreparedOrderIdentity,
 };
 
+pub(crate) use crate::service::execution_ledger::CancelUncertainCode;
+
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub(crate) struct TradeId(String);
 
@@ -41,15 +43,6 @@ impl fmt::Debug for TradeId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "TradeId({self})")
     }
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub(crate) enum CancelUncertainCode {
-    NotFound,
-    Timeout,
-    Transport,
-    MalformedResponse,
-    ResponseMismatch,
 }
 
 impl fmt::Display for CancelUncertainCode {

@@ -398,11 +398,22 @@ pub enum ReconcileUncertainCode {
     UnknownStatus,
 }
 
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancelUncertainCode {
+    NotFound,
+    Timeout,
+    Transport,
+    MalformedResponse,
+    ResponseMismatch,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CancelResponseClass {
     Canceled,
     NotCanceled,
+    Uncertain { code: CancelUncertainCode },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
