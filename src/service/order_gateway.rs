@@ -129,13 +129,7 @@ impl OrderSubmitError {
     }
 
     pub fn operator_instruction(&self) -> Option<&'static str> {
-        matches!(
-            self,
-            Self::Halted {
-                code: OrderErrorCode::HaltMarkerIo
-            }
-        )
-        .then_some(HALT_MARKER_IO_INSTRUCTION)
+        matches!(self, Self::Halted { .. }).then_some(HALT_MARKER_IO_INSTRUCTION)
     }
 }
 
@@ -152,13 +146,10 @@ impl fmt::Display for OrderSubmitError {
             Self::Uncertain { code } => {
                 write!(formatter, "order result uncertain ({code:?})")
             }
-            Self::Halted {
-                code: OrderErrorCode::HaltMarkerIo,
-            } => write!(
+            Self::Halted { code } => write!(
                 formatter,
-                "order execution halted (HaltMarkerIo); {HALT_MARKER_IO_INSTRUCTION}"
+                "order execution halted ({code:?}); {HALT_MARKER_IO_INSTRUCTION}"
             ),
-            Self::Halted { code } => write!(formatter, "order execution halted ({code:?})"),
         }
     }
 }

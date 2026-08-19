@@ -28,12 +28,11 @@
 
 use crate::config::AppConfig;
 use crate::service::{
-    execution_circuit_breaker::ExecutionCircuitBreaker,
     market_cache::MarketCache,
     midprice::{ClobMidpriceSource, MidpriceSource},
     onchain::{spawn_subscription, LogFilter, RawLog},
-    order_executor::{ExecutionOutcome, OrderExecutor},
-    order_gateway::{order_id_hint, OrderGateway, OrderReceipt, OrderSubmitError},
+    order_executor::{ExecutionOutcome, LiveExecutionRuntime, OrderExecutor},
+    order_gateway::{order_id_hint, OrderReceipt, OrderSubmitError},
     parse::{decode_whale_trade, order_filled_topic},
     position_monitor,
     risk_guard::RiskGuard,
@@ -63,25 +62,26 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
         "starting copy-trading bot"
     );
 
+    let risk = RiskGuard::new(cfg.risk.clone());
+    let executor = OrderExecutor::new(cfg.clone(), Arc::clone(&risk)).await?;
     let http = Client::builder()
         .user_agent("polymarket-toolkits/0.1")
         .build()?;
-    let risk = RiskGuard::new(cfg.risk.clone());
     let markets = MarketCache::new(http.clone(), cfg.site.gamma_api_base.clone());
-    let executor = OrderExecutor::new(cfg.clone(), Arc::clone(&risk), Arc::clone(&markets)).await?;
+    let executor = executor.with_markets(markets);
     let positions = executor.positions();
 
     let mut tp_sl_monitor = None;
-    if let Some((gateway, breaker)) = live_tp_sl_components(&cfg, &executor) {
+    if let Some(runtime) = live_tp_sl_components(&cfg, &executor) {
         let midprice: Arc<dyn MidpriceSource> = Arc::new(ClobMidpriceSource::new(
             http.clone(),
             cfg.site.clob_api_base.clone(),
         ));
         tp_sl_monitor = Some(position_monitor::spawn(
             cfg.tp_sl.clone(),
-            Arc::clone(&positions),
-            gateway,
-            breaker,
+            Arc::clone(&runtime.positions),
+            Arc::clone(&runtime.gateway),
+            Arc::clone(&runtime.breaker),
             midprice,
             cfg.trading.price_buffer,
         ));
@@ -197,11 +197,11 @@ fn pad_address_to_topic(addr: &str) -> Result<String> {
 fn live_tp_sl_components(
     cfg: &AppConfig,
     executor: &OrderExecutor,
-) -> Option<(Arc<dyn OrderGateway>, Arc<ExecutionCircuitBreaker>)> {
+) -> Option<Arc<LiveExecutionRuntime>> {
     if !cfg.tp_sl.enabled || !cfg.live_trading_allowed() {
         return None;
     }
-    executor.live_order_components()
+    executor.live_runtime()
 }
 
 fn log_not_submitted(error: &OrderSubmitError) {
@@ -237,8 +237,11 @@ mod tests {
     use crate::service::execution_ledger::{
         ExecutionLedger, IntentId, IntentPurpose, OrderId, OrderSide, PositionId, TokenId, Venue,
     };
-    use crate::service::order_gateway::{OrderErrorCode, PrePostJournal};
     use crate::service::position_store::{OpenPosition, PositionStore};
+    use crate::service::{
+        execution_circuit_breaker::ExecutionCircuitBreaker,
+        order_gateway::{OrderErrorCode, OrderGateway, PrePostJournal},
+    };
 
     #[tokio::test]
     async fn strict_dry_run_never_exposes_tp_sl_live_components() {
@@ -255,11 +258,50 @@ mod tests {
         cfg.site.clob_api_base = "http://127.0.0.1:9".into();
         let risk = RiskGuard::new(cfg.risk.clone());
         let markets = MarketCache::new(Client::new(), cfg.site.gamma_api_base.clone());
-        let executor = OrderExecutor::new(cfg.clone(), risk, markets)
+        let executor = OrderExecutor::new(cfg.clone(), risk)
             .await
-            .unwrap();
+            .unwrap()
+            .with_markets(markets);
 
         assert!(live_tp_sl_components(&cfg, &executor).is_none());
+    }
+
+    #[tokio::test]
+    async fn live_tp_sl_receives_the_executor_shared_runtime_components() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg: AppConfig = serde_json::from_str(include_str!("../../config.json")).unwrap();
+        cfg.bot.enable_trading = true;
+        cfg.bot.mock_trading = false;
+        cfg.tp_sl.enabled = true;
+        cfg.trading.execution_ledger_path = dir.path().join("execution-ledger.jsonl");
+        cfg.trading.execution_halt_path = dir.path().join("execution-halt.json");
+        cfg.credentials.private_key =
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_owned();
+        cfg.credentials.funder_address = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_owned();
+        cfg.credentials.signature_type = Some(0);
+        cfg.credentials.api_key = Some("00000000-0000-0000-0000-000000000000".to_owned());
+        cfg.credentials.api_secret =
+            Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned());
+        cfg.credentials.api_passphrase = Some("fixture-passphrase".to_owned());
+
+        let executor = OrderExecutor::new(cfg.clone(), RiskGuard::new(cfg.risk.clone()))
+            .await
+            .unwrap();
+        let runtime = live_tp_sl_components(&cfg, &executor)
+            .expect("enabled live TP/SL must use the shared live runtime");
+        let (gateway, breaker) = executor
+            .live_order_components()
+            .expect("live executor must expose its shared components internally");
+
+        assert!(Arc::ptr_eq(&executor.positions(), &runtime.positions));
+        assert!(Arc::ptr_eq(&gateway, &runtime.gateway));
+        assert!(Arc::ptr_eq(&breaker, &runtime.breaker));
+        assert!(Arc::ptr_eq(
+            &runtime.ledger,
+            &runtime.positions.live_ledger().unwrap()
+        ));
+        assert!(Arc::ptr_eq(&runtime.ledger, &runtime.breaker.ledger()));
+        assert_eq!(runtime.ledger.projection().sequence, 0);
     }
 
     #[tokio::test]

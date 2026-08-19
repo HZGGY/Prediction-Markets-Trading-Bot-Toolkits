@@ -107,6 +107,11 @@ impl ExecutionCircuitBreaker {
         self.halted.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
+    pub(crate) fn ledger(&self) -> Arc<ExecutionLedger> {
+        Arc::clone(&self.ledger)
+    }
+
     pub fn check(&self) -> Result<(), OrderSubmitError> {
         let projection = self.ledger.projection();
         if self.is_halted() || projection.cleanup_pending.is_some() {

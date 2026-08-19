@@ -205,6 +205,14 @@ impl PositionStore {
         }))
     }
 
+    #[cfg(test)]
+    pub(crate) fn live_ledger(&self) -> Option<Arc<ExecutionLedger>> {
+        match &self.backend {
+            PositionBackend::Paper(_) => None,
+            PositionBackend::Live(ledger) => Some(Arc::clone(ledger)),
+        }
+    }
+
     pub fn apply_open(&self, position: OpenPosition) -> Result<PositionApply, PositionStoreError> {
         let _guard = self.mutation.lock();
         match &self.backend {

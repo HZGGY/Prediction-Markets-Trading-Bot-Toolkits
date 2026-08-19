@@ -5,9 +5,12 @@
 //! Safety flags are checked here, so individual bots never accidentally
 //! bypass `enable_trading` or `mock_trading`.
 
-use std::sync::Arc;
+use std::{str::FromStr as _, sync::Arc};
 
-use crate::config::AppConfig;
+use alloy_signer_local::PrivateKeySigner;
+use polymarket_client_sdk_v2::{types::Address, POLYGON};
+
+use crate::config::{AppConfig, OFFICIAL_CLOB_V2_HOST};
 use crate::models::{OrderType, PlannedOrder, Side, WhaleTrade};
 use crate::service::clob_sdk_orders::SdkOrderGateway;
 use crate::service::eligibility::{self, Eligibility};
@@ -29,11 +32,28 @@ use uuid::Uuid;
 
 pub struct OrderExecutor {
     cfg: AppConfig,
-    gateway: Option<Arc<dyn OrderGateway>>,
-    breaker: Option<Arc<ExecutionCircuitBreaker>>,
+    runtime: ExecutionRuntime,
     risk: Arc<RiskGuard>,
-    markets: Arc<MarketCache>,
-    positions: Arc<PositionStore>,
+    markets: Option<Arc<MarketCache>>,
+}
+
+/// The one live execution state shared by copy entries and TP/SL exits.
+pub struct LiveExecutionRuntime {
+    pub ledger: Arc<ExecutionLedger>,
+    pub positions: Arc<PositionStore>,
+    pub(crate) gateway: Arc<dyn OrderGateway>,
+    pub breaker: Arc<ExecutionCircuitBreaker>,
+}
+
+enum ExecutionRuntime {
+    Paper(Arc<PositionStore>),
+    Live(Arc<LiveExecutionRuntime>),
+    #[cfg(test)]
+    InjectedLive {
+        positions: Arc<PositionStore>,
+        gateway: Arc<dyn OrderGateway>,
+        breaker: Arc<ExecutionCircuitBreaker>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -71,17 +91,11 @@ pub enum SkipReason {
 }
 
 impl OrderExecutor {
-    pub async fn new(
-        cfg: AppConfig,
-        risk: Arc<RiskGuard>,
-        markets: Arc<MarketCache>,
-    ) -> Result<Self> {
+    pub async fn new(cfg: AppConfig, risk: Arc<RiskGuard>) -> Result<Self> {
         if !cfg.live_trading_allowed() {
-            let positions = PositionStore::new_paper();
-            return Ok(Self::new_with_live_components(
-                cfg, risk, markets, positions, None, None,
-            ));
+            return Ok(Self::new_paper(cfg, risk));
         }
+        validate_live_configuration(&cfg)?;
         let ledger = Arc::new(ExecutionLedger::open_live(
             &cfg.trading.execution_ledger_path,
         )?);
@@ -91,16 +105,34 @@ impl OrderExecutor {
             cfg.trading.execution_halt_path.clone(),
         )?;
         let gateway: Arc<dyn OrderGateway> = Arc::new(SdkOrderGateway::new(&cfg).await?);
-        Ok(Self::new_with_live_components(
+        Ok(Self {
             cfg,
+            runtime: ExecutionRuntime::Live(Arc::new(LiveExecutionRuntime {
+                ledger,
+                positions,
+                gateway,
+                breaker,
+            })),
             risk,
-            markets,
-            positions,
-            Some(gateway),
-            Some(breaker),
-        ))
+            markets: None,
+        })
     }
 
+    fn new_paper(cfg: AppConfig, risk: Arc<RiskGuard>) -> Self {
+        Self {
+            cfg,
+            runtime: ExecutionRuntime::Paper(PositionStore::new_paper()),
+            risk,
+            markets: None,
+        }
+    }
+
+    pub(crate) fn with_markets(mut self, markets: Arc<MarketCache>) -> Self {
+        self.markets = Some(markets);
+        self
+    }
+
+    #[cfg(test)]
     fn new_with_live_components(
         cfg: AppConfig,
         risk: Arc<RiskGuard>,
@@ -109,44 +141,75 @@ impl OrderExecutor {
         gateway: Option<Arc<dyn OrderGateway>>,
         breaker: Option<Arc<ExecutionCircuitBreaker>>,
     ) -> Self {
+        let (gateway, breaker) = match (gateway, breaker) {
+            (Some(gateway), Some(breaker)) => (gateway, breaker),
+            _ => panic!("test live executor requires gateway and breaker"),
+        };
         Self {
             cfg,
-            gateway,
-            breaker,
+            runtime: ExecutionRuntime::InjectedLive {
+                positions,
+                gateway,
+                breaker,
+            },
             risk,
-            markets,
-            positions,
+            markets: Some(markets),
         }
     }
 
     pub(crate) fn live_order_components(
         &self,
     ) -> Option<(Arc<dyn OrderGateway>, Arc<ExecutionCircuitBreaker>)> {
-        Some((
-            self.gateway.as_ref()?.clone(),
-            self.breaker.as_ref()?.clone(),
-        ))
+        match &self.runtime {
+            ExecutionRuntime::Paper(_) => None,
+            ExecutionRuntime::Live(runtime) => {
+                Some((Arc::clone(&runtime.gateway), Arc::clone(&runtime.breaker)))
+            }
+            #[cfg(test)]
+            ExecutionRuntime::InjectedLive {
+                gateway, breaker, ..
+            } => Some((Arc::clone(gateway), Arc::clone(breaker))),
+        }
+    }
+
+    pub(crate) fn live_runtime(&self) -> Option<Arc<LiveExecutionRuntime>> {
+        match &self.runtime {
+            ExecutionRuntime::Live(runtime) => Some(Arc::clone(runtime)),
+            ExecutionRuntime::Paper(_) => None,
+            #[cfg(test)]
+            ExecutionRuntime::InjectedLive { .. } => None,
+        }
     }
 
     pub fn positions(&self) -> Arc<PositionStore> {
-        Arc::clone(&self.positions)
+        match &self.runtime {
+            ExecutionRuntime::Paper(positions) => Arc::clone(positions),
+            ExecutionRuntime::Live(runtime) => Arc::clone(&runtime.positions),
+            #[cfg(test)]
+            ExecutionRuntime::InjectedLive { positions, .. } => Arc::clone(positions),
+        }
     }
 
     pub async fn execute(&self, trade: &WhaleTrade) -> Result<ExecutionOutcome> {
+        let positions = self.positions();
         // 0a. Whale sells are not mirrored — TP/SL is the configured exit path.
         if trade.side == Side::Sell {
             return Ok(ExecutionOutcome::Skipped(SkipReason::WhaleExitIgnored));
         }
         // 0b. Don't pyramid into a market we're already long.
         if TokenId::from_decimal(&trade.token_id)
-            .and_then(|token_id| self.positions.get_by_token(&token_id))
+            .and_then(|token_id| positions.get_by_token(&token_id))
             .is_some()
         {
             return Ok(ExecutionOutcome::Skipped(SkipReason::AlreadyOpen));
         }
 
         // 1. Resolve market metadata for category/tags/closed lookup.
-        let market = match self.markets.by_token_id(&trade.token_id).await {
+        let markets = self
+            .markets
+            .as_ref()
+            .ok_or_else(|| anyhow!("market metadata unavailable during executor initialization"))?;
+        let market = match markets.by_token_id(&trade.token_id).await {
             Ok(m) => m,
             Err(_) => {
                 warn!(token = %trade.token_id, "market metadata lookup failed");
@@ -226,14 +289,9 @@ impl OrderExecutor {
             return Ok(ExecutionOutcome::DryRunPlanned(planned));
         }
 
-        let gateway = self
-            .gateway
-            .as_ref()
-            .ok_or_else(|| anyhow!("live gateway unavailable"))?;
-        let breaker = self
-            .breaker
-            .as_ref()
-            .ok_or_else(|| anyhow!("live breaker unavailable"))?;
+        let (gateway, breaker) = self
+            .live_order_components()
+            .ok_or_else(|| anyhow!("live runtime unavailable"))?;
         let (take_profit_pct, stop_loss_pct) = self.tp_sl_for(&market);
         let purpose = IntentPurpose::Entry(PositionSeed {
             slug: market.slug.clone(),
@@ -266,7 +324,7 @@ impl OrderExecutor {
                 .find(|(k, _)| ci_eq(k, cat))
                 .map(|(_, v)| v)
             {
-                let current = self.positions.open_usd_by_category(cat);
+                let current = self.positions().open_usd_by_category(cat);
                 if current + want_usd > cap {
                     return Some(SkipReason::ExposureCategoryCap {
                         category: cat.clone(),
@@ -284,7 +342,7 @@ impl OrderExecutor {
                 .find(|(k, _)| ci_eq(k, tag))
                 .map(|(_, v)| v)
             {
-                let current = self.positions.open_usd_by_tag(tag);
+                let current = self.positions().open_usd_by_tag(tag);
                 if current + want_usd > cap {
                     return Some(SkipReason::ExposureTagCap {
                         tag: tag.clone(),
@@ -323,7 +381,7 @@ impl OrderExecutor {
             stop_loss_bps: bps_from_pct(sl_pct)?,
             opened_at: Utc::now(),
         };
-        self.positions.apply_open(pos)?;
+        self.positions().apply_open(pos)?;
         Ok(())
     }
 
@@ -340,12 +398,12 @@ impl OrderExecutor {
             return Err(anyhow!("confirmed receipt contains zero fill"));
         }
         let order_id = receipt.order_id.clone();
-        let (opening_intent_id, position_id) = self
-            .positions
-            .pending_entry_identity(&order_id)
-            .ok_or_else(|| anyhow!("confirmed receipt has no journaled entry intent"))?;
+        let (opening_intent_id, position_id) =
+            self.positions()
+                .pending_entry_identity(&order_id)
+                .ok_or_else(|| anyhow!("confirmed receipt has no journaled entry intent"))?;
         let (tp_pct, sl_pct) = self.tp_sl_for(market);
-        self.positions.apply_open(OpenPosition {
+        self.positions().apply_open(OpenPosition {
             position_id,
             opening_intent_id,
             opening_order_id: order_id,
@@ -445,6 +503,58 @@ fn paper_order_id(intent_id: IntentId) -> OrderId {
         .expect("paper UUID expansion is a canonical order identifier")
 }
 
+fn validate_live_configuration(cfg: &AppConfig) -> Result<(), OrderSubmitError> {
+    let preflight = |code| {
+        Err(OrderSubmitError::Preflight {
+            stage: crate::service::order_gateway::OrderStage::Initialization,
+            code,
+        })
+    };
+
+    if cfg.site.clob_api_base != OFFICIAL_CLOB_V2_HOST {
+        return preflight(crate::service::order_gateway::OrderErrorCode::InvalidHost);
+    }
+    if cfg.exchange.chain_id != POLYGON {
+        return preflight(crate::service::order_gateway::OrderErrorCode::InvalidChain);
+    }
+    if cfg.credentials.signature_type != Some(0) {
+        return preflight(crate::service::order_gateway::OrderErrorCode::UnsupportedSignatureType);
+    }
+    let signer = match PrivateKeySigner::from_str(cfg.credentials.private_key.trim()) {
+        Ok(signer) => signer,
+        Err(_) => {
+            return preflight(crate::service::order_gateway::OrderErrorCode::MissingCredentials)
+        }
+    };
+    let funder = match Address::from_str(&cfg.credentials.funder_address) {
+        Ok(funder) => funder,
+        Err(_) => return preflight(crate::service::order_gateway::OrderErrorCode::FunderMismatch),
+    };
+    if signer.address() != funder {
+        return preflight(crate::service::order_gateway::OrderErrorCode::FunderMismatch);
+    }
+    if cfg
+        .credentials
+        .api_key
+        .as_deref()
+        .and_then(|key| uuid::Uuid::parse_str(key).ok())
+        .is_none()
+        || cfg
+            .credentials
+            .api_secret
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        || cfg
+            .credentials
+            .api_passphrase
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        return preflight(crate::service::order_gateway::OrderErrorCode::MissingCredentials);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::sync::Arc;
@@ -456,7 +566,7 @@ pub(crate) mod test_support {
     use crate::service::position_store::PositionStore;
     use crate::service::risk_guard::RiskGuard;
 
-    use super::OrderExecutor;
+    use super::{ExecutionRuntime, OrderExecutor};
 
     pub(crate) fn new_with_live_components(
         cfg: AppConfig,
@@ -466,7 +576,20 @@ pub(crate) mod test_support {
         gateway: Option<Arc<dyn OrderGateway>>,
         breaker: Option<Arc<ExecutionCircuitBreaker>>,
     ) -> OrderExecutor {
-        OrderExecutor::new_with_live_components(cfg, risk, markets, positions, gateway, breaker)
+        let (gateway, breaker) = match (gateway, breaker) {
+            (Some(gateway), Some(breaker)) => (gateway, breaker),
+            _ => panic!("test live executor requires gateway and breaker"),
+        };
+        OrderExecutor {
+            cfg,
+            runtime: ExecutionRuntime::InjectedLive {
+                positions,
+                gateway,
+                breaker,
+            },
+            risk,
+            markets: Some(markets),
+        }
     }
 }
 
@@ -580,7 +703,10 @@ mod tests {
 
         let risk = RiskGuard::new(cfg.risk.clone());
         let markets = MarketCache::new(reqwest::Client::new(), cfg.site.gamma_api_base.clone());
-        let executor = OrderExecutor::new(cfg, risk, markets).await.unwrap();
+        let executor = OrderExecutor::new(cfg, risk)
+            .await
+            .unwrap()
+            .with_markets(markets);
         let positions = executor.positions();
 
         let outcome = executor.execute(&trade).await.unwrap();
@@ -607,9 +733,10 @@ mod tests {
     async fn strict_dry_run_skips_live_components_and_records_planned_position() {
         let (mut cfg, markets, server) = fixture_runtime(false).await;
         blank_signing_and_api_credentials(&mut cfg);
-        let executor = OrderExecutor::new(cfg, RiskGuard::new(test_cfg()), markets)
+        let executor = OrderExecutor::new(cfg, RiskGuard::new(test_cfg()))
             .await
-            .unwrap();
+            .unwrap()
+            .with_markets(markets);
         let positions = executor.positions();
 
         assert!(executor.live_order_components().is_none());
@@ -624,23 +751,86 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strict_dry_run_does_not_validate_or_open_the_live_ledger_path() {
+    async fn strict_paper_bypasses_live_ledger_and_credentials() {
         let dir = tempfile::tempdir().unwrap();
         let missing_parent = dir.path().join("paper-must-not-create-live-state");
         let mut cfg: AppConfig = serde_json::from_str(include_str!("../../config.json")).unwrap();
-        blank_signing_and_api_credentials(&mut cfg);
+        cfg.credentials.private_key = "malformed-paper-private-key".to_owned();
+        cfg.credentials.funder_address = "malformed-paper-funder".to_owned();
+        cfg.credentials.signature_type = Some(99);
+        cfg.credentials.api_key = Some("malformed-paper-api-key".to_owned());
+        cfg.credentials.api_secret = Some(String::new());
+        cfg.credentials.api_passphrase = Some(String::new());
         cfg.bot.enable_trading = false;
         cfg.bot.mock_trading = true;
         cfg.trading.execution_ledger_path = missing_parent.join("execution-ledger.jsonl");
         let markets = MarketCache::new(reqwest::Client::new(), cfg.site.gamma_api_base.clone());
 
-        let executor = OrderExecutor::new(cfg, RiskGuard::new(test_cfg()), markets)
+        let executor = OrderExecutor::new(cfg, RiskGuard::new(test_cfg()))
             .await
-            .unwrap();
+            .unwrap()
+            .with_markets(markets);
 
         assert!(executor.live_order_components().is_none());
         assert!(executor.positions().is_empty());
         assert!(!missing_parent.exists());
+    }
+
+    #[tokio::test]
+    async fn live_initialization_validates_local_credentials_before_opening_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_parent = dir.path().join("live-ledger-must-not-open-first");
+        let mut cfg: AppConfig = serde_json::from_str(include_str!("../../config.json")).unwrap();
+        cfg.bot.enable_trading = true;
+        cfg.bot.mock_trading = false;
+        cfg.credentials.signature_type = Some(0);
+        cfg.trading.execution_ledger_path = missing_parent.join("execution-ledger.jsonl");
+
+        let error = match OrderExecutor::new(cfg, RiskGuard::new(test_cfg())).await {
+            Ok(_) => panic!("malformed live credentials must fail local initialization"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error.downcast_ref::<OrderSubmitError>(),
+            Some(OrderSubmitError::Preflight {
+                stage: OrderStage::Initialization,
+                code: OrderErrorCode::MissingCredentials,
+            })
+        ));
+        assert!(!missing_parent.exists());
+    }
+
+    #[tokio::test]
+    async fn live_initialization_fails_closed_without_healing_an_unresolved_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = valid_live_config(dir.path());
+        let order_id = OrderId::from_hex(format!("0x{}", "ef".repeat(32))).unwrap();
+        {
+            let ledger = ExecutionLedger::open_live(&cfg.trading.execution_ledger_path).unwrap();
+            prepare_matched_entry(&ledger, order_id);
+        }
+        let before = directory_bytes(dir.path());
+
+        let error = match OrderExecutor::new(cfg.clone(), RiskGuard::new(test_cfg())).await {
+            Ok(_) => panic!("unresolved durable intent must block live startup"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error.downcast_ref::<OrderSubmitError>(),
+            Some(OrderSubmitError::Halted {
+                code: OrderErrorCode::ExecutionHalted,
+            })
+        ));
+        assert_eq!(
+            error
+                .downcast_ref::<OrderSubmitError>()
+                .and_then(OrderSubmitError::operator_instruction),
+            Some("do not restart until manual reconciliation is complete")
+        );
+        assert_eq!(directory_bytes(dir.path()), before);
+        assert!(!cfg.trading.execution_halt_path.exists());
     }
 
     #[test]
@@ -891,6 +1081,38 @@ mod tests {
         cfg.credentials.api_key = None;
         cfg.credentials.api_secret = None;
         cfg.credentials.api_passphrase = None;
+    }
+
+    fn valid_live_config(dir: &std::path::Path) -> AppConfig {
+        let mut cfg: AppConfig = serde_json::from_str(include_str!("../../config.json")).unwrap();
+        cfg.bot.enable_trading = true;
+        cfg.bot.mock_trading = false;
+        cfg.trading.execution_ledger_path = dir.join("execution-ledger.jsonl");
+        cfg.trading.execution_halt_path = dir.join("execution-halt.json");
+        cfg.credentials.private_key =
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_owned();
+        cfg.credentials.funder_address = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_owned();
+        cfg.credentials.signature_type = Some(0);
+        cfg.credentials.api_key = Some("00000000-0000-0000-0000-000000000000".to_owned());
+        cfg.credentials.api_secret =
+            Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned());
+        cfg.credentials.api_passphrase = Some("fixture-passphrase".to_owned());
+        cfg
+    }
+
+    fn directory_bytes(path: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+        let mut files = std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        files
     }
 
     fn test_live_components(
