@@ -153,11 +153,41 @@ async fn run_auth(
 }
 
 fn load_config_for_command(cli: &Cli) -> Result<AppConfig> {
-    let mut cfg = AppConfig::load_public(&cli.config)?;
+    let recovery_command = is_recovery_command(&cli.command);
+    let mut cfg = AppConfig::load_public(&cli.config).map_err(|error| {
+        if recovery_command {
+            anyhow::anyhow!(
+                "recovery failed code=public_config_unavailable instruction=check_recovery_public_config"
+            )
+        } else {
+            error
+        }
+    })?;
     if command_needs_credentials(&cli.command, &cfg) {
-        cfg.load_credentials(&cli.credentials)?;
+        cfg.load_credentials(&cli.credentials).map_err(|error| {
+            if recovery_command {
+                anyhow::anyhow!(
+                    "recovery failed code=credentials_unavailable instruction=check_recovery_credentials"
+                )
+            } else {
+                error
+            }
+        })?;
     }
     Ok(cfg)
+}
+
+fn is_recovery_command(command: &Option<Command>) -> bool {
+    matches!(command, Some(Command::Recovery { .. }))
+}
+
+fn load_config_for_operator(cli: &Cli) -> Result<AppConfig> {
+    let config = load_config_for_command(cli);
+    if is_recovery_command(&cli.command) {
+        config
+    } else {
+        config.context("loading configuration")
+    }
 }
 
 fn command_needs_credentials(command: &Option<Command>, cfg: &AppConfig) -> bool {
@@ -179,7 +209,7 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let cfg = load_config_for_command(&cli).context("loading configuration")?;
+    let cfg = load_config_for_operator(&cli)?;
     let credentials_path = cli.credentials.clone();
 
     info!(
@@ -228,7 +258,58 @@ mod tests {
     }
 
     fn load_config_at_main_seam(cli: &Cli) -> Result<AppConfig> {
-        load_config_for_command(cli)
+        load_config_for_operator(cli)
+    }
+
+    #[test]
+    fn local_recovery_public_config_failure_has_only_a_static_operator_message() {
+        let path_sentinel = "RECOVERY_PUBLIC_CONFIG_PATH_SENTINEL";
+        let cli = Cli::try_parse_from([
+            "polymarket-toolkits",
+            "--config",
+            path_sentinel,
+            "recovery",
+            "inspect",
+        ])
+        .unwrap();
+
+        let output = load_config_at_main_seam(&cli).unwrap_err().to_string();
+
+        assert_eq!(
+            output,
+            "recovery failed code=public_config_unavailable instruction=check_recovery_public_config"
+        );
+        assert!(!output.contains(path_sentinel));
+        assert!(!output.contains("The system cannot find"));
+    }
+
+    #[test]
+    fn network_recovery_credentials_failure_has_only_a_static_operator_message() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("public.json");
+        let credentials_sentinel = "RECOVERY_CREDENTIALS_PATH_SENTINEL";
+        std::fs::write(&config_path, include_str!("../config.json")).unwrap();
+        let cli = Cli::try_parse_from([
+            "polymarket-toolkits".to_owned(),
+            "--config".to_owned(),
+            config_path.to_string_lossy().into_owned(),
+            "--credentials".to_owned(),
+            credentials_sentinel.to_owned(),
+            "recovery".to_owned(),
+            "reconcile".to_owned(),
+            "--intent".to_owned(),
+            "123e4567-e89b-12d3-a456-426614174000".to_owned(),
+        ])
+        .unwrap();
+
+        let output = load_config_at_main_seam(&cli).unwrap_err().to_string();
+
+        assert_eq!(
+            output,
+            "recovery failed code=credentials_unavailable instruction=check_recovery_credentials"
+        );
+        assert!(!output.contains(credentials_sentinel));
+        assert!(!output.contains("The system cannot find"));
     }
 
     #[test]
