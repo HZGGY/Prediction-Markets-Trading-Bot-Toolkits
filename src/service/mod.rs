@@ -74,6 +74,28 @@
 //!     let _ = executor.live_order_components();
 //! }
 //! ```
+//!
+//! Recovery is likewise an internal exact-only capability. Downstream crates
+//! cannot obtain its neutral trait or construct the official SDK adapter:
+//!
+//! ```compile_fail
+//! use polymarket_toolkits::service::recovery_gateway::RecoveryGateway;
+//!
+//! fn obtain_raw_recovery_trait(gateway: &dyn RecoveryGateway) {
+//!     let _ = gateway;
+//! }
+//! ```
+//!
+//! ```compile_fail
+//! use polymarket_toolkits::{
+//!     config::AppConfig,
+//!     service::clob_sdk_recovery::SdkRecoveryGateway,
+//! };
+//!
+//! async fn construct_recovery_gateway(cfg: &AppConfig) {
+//!     let _ = SdkRecoveryGateway::new(cfg).await;
+//! }
+//! ```
 
 pub mod clob_auth;
 pub mod clob_sdk_orders;

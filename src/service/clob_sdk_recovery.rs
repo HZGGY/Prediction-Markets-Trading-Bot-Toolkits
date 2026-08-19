@@ -8,7 +8,7 @@ use std::{str::FromStr as _, time::Duration};
 use alloy_signer_local::PrivateKeySigner;
 use async_trait::async_trait;
 use polymarket_client_sdk_v2::{
-    auth::{state::Authenticated, Credentials, Normal, Signer as _, Uuid},
+    auth::{state::Authenticated, state::Unauthenticated, Credentials, Normal, Signer as _, Uuid},
     clob::{
         types::{
             request::TradesRequest,
@@ -18,7 +18,7 @@ use polymarket_client_sdk_v2::{
         },
         Client, Config as SdkConfig,
     },
-    error::{Error as SdkError, Status as SdkStatus},
+    error::{EmptyResponse, Error as SdkError, Status as SdkStatus},
     types::{Address, Decimal},
     POLYGON,
 };
@@ -47,12 +47,25 @@ impl SdkRecoveryGateway {
         if cfg.site.clob_api_base != OFFICIAL_CLOB_V2_HOST {
             return Err(RecoveryError::Initialization);
         }
-        Self::new_with_host(cfg, &cfg.site.clob_api_base, Duration::from_secs(15)).await
+        let client = Client::new(OFFICIAL_CLOB_V2_HOST, SdkConfig::default())
+            .map_err(|_| RecoveryError::Initialization)?;
+        Self::authenticate(cfg, client, Duration::from_secs(15)).await
     }
 
+    #[cfg(test)]
     async fn new_with_host(
         cfg: &AppConfig,
         host: &str,
+        request_timeout: Duration,
+    ) -> Result<Self, RecoveryError> {
+        let client =
+            Client::new(host, SdkConfig::default()).map_err(|_| RecoveryError::Initialization)?;
+        Self::authenticate(cfg, client, request_timeout).await
+    }
+
+    async fn authenticate(
+        cfg: &AppConfig,
+        client: Client<Unauthenticated>,
         request_timeout: Duration,
     ) -> Result<Self, RecoveryError> {
         let signer = PrivateKeySigner::from_str(cfg.credentials.private_key.trim())
@@ -84,8 +97,7 @@ impl SdkRecoveryGateway {
             .clone()
             .filter(|value| !value.trim().is_empty())
             .ok_or(RecoveryError::Initialization)?;
-        let client = Client::new(host, SdkConfig::default())
-            .map_err(|_| RecoveryError::Initialization)?
+        let client = client
             .authentication_builder(&signer)
             .credentials(Credentials::new(key, secret, passphrase))
             .authenticate()
@@ -225,6 +237,9 @@ fn cancel_error_code(error: &SdkError) -> CancelUncertainCode {
 }
 
 fn is_decode_error(error: &SdkError) -> bool {
+    if error.downcast_ref::<EmptyResponse>().is_some() {
+        return true;
+    }
     let mut source: Option<&(dyn std::error::Error + 'static)> = error
         .inner()
         .map(|value| value as &(dyn std::error::Error + 'static));
@@ -388,18 +403,33 @@ fn classify_trade(
     {
         return Err(ReconcileUncertainCode::Mismatch);
     }
+    let exact_order_id = expected.order_id.as_str();
     let (size, price) = match &trade.trader_side {
-        TraderSide::Taker if trade.taker_order_id == expected.order_id.as_str() => {
+        TraderSide::Taker
+            if trade.taker_order_id == exact_order_id
+                && !trade
+                    .maker_orders
+                    .iter()
+                    .any(|maker| maker.order_id == exact_order_id) =>
+        {
             (trade.size, trade.price)
         }
         TraderSide::Maker => {
-            let mut matching = trade.maker_orders.iter().filter(|maker| {
-                maker.order_id == expected.order_id.as_str()
-                    && maker.asset_id == expected.token_id.as_u256()
-                    && maker.side == expected_side
-            });
-            let maker = matching.next().ok_or(ReconcileUncertainCode::Mismatch)?;
-            if matching.next().is_some() || maker.matched_amount <= Decimal::ZERO {
+            if trade.taker_order_id == exact_order_id {
+                return Err(ReconcileUncertainCode::Mismatch);
+            }
+            let mut exact_makers = trade
+                .maker_orders
+                .iter()
+                .filter(|maker| maker.order_id == exact_order_id);
+            let maker = exact_makers
+                .next()
+                .ok_or(ReconcileUncertainCode::Mismatch)?;
+            if exact_makers.next().is_some()
+                || maker.asset_id != expected.token_id.as_u256()
+                || maker.side != expected_side
+                || maker.matched_amount <= Decimal::ZERO
+            {
                 return Err(ReconcileUncertainCode::Mismatch);
             }
             (maker.matched_amount, maker.price)
@@ -989,14 +1019,588 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn contradictory_taker_or_maker_membership_is_mismatch_without_replay() {
+        let expected = expected_buy();
+        let exact_path = format!("GET /data/order/{}", expected.order_id.as_str());
+        let maker = maker_order(&expected, expected.order_id.as_str(), "40");
+        let cases = [
+            (
+                "taker_also_lists_exact_maker",
+                taker_trade_page(&expected, "trade-1", "LTE=").replacen(
+                    "\"maker_orders\":[]",
+                    &format!("\"maker_orders\":[{maker}]"),
+                    1,
+                ),
+            ),
+            (
+                "maker_also_names_exact_taker",
+                maker_trade_page(
+                    &expected,
+                    "trade-1",
+                    expected.order_id.as_str(),
+                    &maker,
+                    "LTE=",
+                    1,
+                ),
+            ),
+            (
+                "maker_lists_exact_child_twice",
+                maker_trade_page(
+                    &expected,
+                    "trade-1",
+                    "another-order",
+                    &format!("{maker},{maker}"),
+                    "LTE=",
+                    1,
+                ),
+            ),
+        ];
+
+        for (name, trade_body) in cases {
+            let (host, server) = spawn_scripted_server(vec![
+                (
+                    exact_path.clone(),
+                    "200 OK".to_owned(),
+                    order_body(&expected, "MATCHED", "40", r#"["trade-1"]"#),
+                ),
+                (
+                    "GET /data/trades?id=trade-1".to_owned(),
+                    "200 OK".to_owned(),
+                    trade_body,
+                ),
+            ])
+            .await;
+            let gateway =
+                SdkRecoveryGateway::new_with_host(&fixture_config(), &host, Duration::from_secs(1))
+                    .await
+                    .unwrap();
+
+            assert_eq!(
+                gateway.reconcile_exact(&expected).await.unwrap(),
+                RemoteOrderEvidence::Uncertain {
+                    code: crate::service::execution_ledger::ReconcileUncertainCode::Mismatch,
+                },
+                "{name}"
+            );
+            assert_eq!(
+                server.await.unwrap(),
+                vec![exact_path.clone(), "GET /data/trades?id=trade-1".to_owned()],
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_null_order_is_malformed_without_retry() {
+        let expected = expected_buy();
+        let exact_path = format!("GET /data/order/{}", expected.order_id.as_str());
+        let (host, server) = spawn_scripted_server(vec![(
+            exact_path.clone(),
+            "200 OK".to_owned(),
+            "null".to_owned(),
+        )])
+        .await;
+        let gateway =
+            SdkRecoveryGateway::new_with_host(&fixture_config(), &host, Duration::from_secs(1))
+                .await
+                .unwrap();
+
+        assert_eq!(
+            gateway.reconcile_exact(&expected).await.unwrap(),
+            RemoteOrderEvidence::Uncertain {
+                code: crate::service::execution_ledger::ReconcileUncertainCode::MalformedResponse,
+            }
+        );
+        assert_eq!(server.await.unwrap(), vec![exact_path]);
+    }
+
+    #[tokio::test]
+    async fn successful_null_trade_is_malformed_without_retry() {
+        let expected = expected_buy();
+        let exact_path = format!("GET /data/order/{}", expected.order_id.as_str());
+        let (host, server) = spawn_scripted_server(vec![
+            (
+                exact_path.clone(),
+                "200 OK".to_owned(),
+                order_body(&expected, "MATCHED", "40", r#"["trade-1"]"#),
+            ),
+            (
+                "GET /data/trades?id=trade-1".to_owned(),
+                "200 OK".to_owned(),
+                "null".to_owned(),
+            ),
+        ])
+        .await;
+        let gateway =
+            SdkRecoveryGateway::new_with_host(&fixture_config(), &host, Duration::from_secs(1))
+                .await
+                .unwrap();
+
+        assert_eq!(
+            gateway.reconcile_exact(&expected).await.unwrap(),
+            RemoteOrderEvidence::Uncertain {
+                code: crate::service::execution_ledger::ReconcileUncertainCode::MalformedResponse,
+            }
+        );
+        assert_eq!(
+            server.await.unwrap(),
+            vec![exact_path, "GET /data/trades?id=trade-1".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_null_cancel_is_malformed_without_retry() {
+        let expected = expected_buy();
+        let (host, server) = spawn_scripted_server(vec![(
+            "DELETE /order".to_owned(),
+            "200 OK".to_owned(),
+            "null".to_owned(),
+        )])
+        .await;
+        let gateway =
+            SdkRecoveryGateway::new_with_host(&fixture_config(), &host, Duration::from_secs(1))
+                .await
+                .unwrap();
+
+        assert_eq!(
+            gateway.cancel_exact(&expected.order_id).await.unwrap(),
+            super::CancelAttemptEvidence::Uncertain {
+                code: super::CancelUncertainCode::MalformedResponse,
+            }
+        );
+        assert_eq!(server.await.unwrap(), vec!["DELETE /order".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn cancel_response_shapes_are_conservative_and_never_retried() {
+        let expected = expected_buy();
+        let cases = [
+            (
+                "exact_not_canceled",
+                format!(
+                    r#"{{"canceled":[],"not_canceled":{{"{}":"still open"}}}}"#,
+                    expected.order_id.as_str()
+                ),
+                super::CancelAttemptEvidence::NotCanceled,
+            ),
+            (
+                "mixed_exact_ids",
+                format!(
+                    r#"{{"canceled":["{}"],"not_canceled":{{"{}":"still open"}}}}"#,
+                    expected.order_id.as_str(),
+                    expected.order_id.as_str()
+                ),
+                super::CancelAttemptEvidence::Uncertain {
+                    code: super::CancelUncertainCode::ResponseMismatch,
+                },
+            ),
+            (
+                "extra_canceled_id",
+                format!(
+                    r#"{{"canceled":["{}","other-order"],"not_canceled":{{}}}}"#,
+                    expected.order_id.as_str()
+                ),
+                super::CancelAttemptEvidence::Uncertain {
+                    code: super::CancelUncertainCode::ResponseMismatch,
+                },
+            ),
+            (
+                "extra_not_canceled_id",
+                format!(
+                    r#"{{"canceled":[],"not_canceled":{{"{}":"still open","other-order":"still open"}}}}"#,
+                    expected.order_id.as_str()
+                ),
+                super::CancelAttemptEvidence::Uncertain {
+                    code: super::CancelUncertainCode::ResponseMismatch,
+                },
+            ),
+        ];
+
+        for (name, body, want) in cases {
+            let (host, server) = spawn_scripted_server(vec![(
+                "DELETE /order".to_owned(),
+                "200 OK".to_owned(),
+                body,
+            )])
+            .await;
+            let gateway =
+                SdkRecoveryGateway::new_with_host(&fixture_config(), &host, Duration::from_secs(1))
+                    .await
+                    .unwrap();
+
+            assert_eq!(
+                gateway.cancel_exact(&expected.order_id).await.unwrap(),
+                want,
+                "{name}"
+            );
+            assert_eq!(
+                server.await.unwrap(),
+                vec!["DELETE /order".to_owned()],
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_malformed_transport_timeout_and_redirect_are_uncertain_once() {
+        let expected = expected_buy();
+        let cases = [
+            (
+                "malformed",
+                "200 OK".to_owned(),
+                "{not-json".to_owned(),
+                super::CancelUncertainCode::MalformedResponse,
+            ),
+            (
+                "unexpected_http",
+                "503 Service Unavailable".to_owned(),
+                r#"{"error":"RAW_SDK_BODY_ERROR_SENTINEL"}"#.to_owned(),
+                super::CancelUncertainCode::Transport,
+            ),
+        ];
+        for (name, status, body, code) in cases {
+            let (host, server) =
+                spawn_scripted_server(vec![("DELETE /order".to_owned(), status, body)]).await;
+            let gateway =
+                SdkRecoveryGateway::new_with_host(&fixture_config(), &host, Duration::from_secs(1))
+                    .await
+                    .unwrap();
+            let evidence = gateway.cancel_exact(&expected.order_id).await.unwrap();
+
+            assert_eq!(
+                evidence,
+                super::CancelAttemptEvidence::Uncertain { code },
+                "{name}"
+            );
+            assert!(!format!("{evidence:?} {evidence}").contains("RAW_SDK_BODY_ERROR_SENTINEL"));
+            assert_eq!(
+                server.await.unwrap(),
+                vec!["DELETE /order".to_owned()],
+                "{name}"
+            );
+        }
+
+        let cases = [
+            (
+                OneRequestServerMode::Disconnect,
+                Duration::from_secs(1),
+                super::CancelUncertainCode::Transport,
+            ),
+            (
+                OneRequestServerMode::Withhold(Duration::from_millis(100)),
+                Duration::from_millis(20),
+                super::CancelUncertainCode::Timeout,
+            ),
+        ];
+        for (mode, timeout, code) in cases {
+            let (host, server) = spawn_one_request_server(mode).await;
+            let gateway = SdkRecoveryGateway::new_with_host(&fixture_config(), &host, timeout)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                gateway.cancel_exact(&expected.order_id).await.unwrap(),
+                super::CancelAttemptEvidence::Uncertain { code }
+            );
+            assert_eq!(server.await.unwrap(), vec!["DELETE /order".to_owned()]);
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_redirect_is_not_followed_or_replayed() {
+        let expected = expected_buy();
+        let exact_path = format!("GET /data/order/{}", expected.order_id.as_str());
+        let (host, server) = spawn_redirect_server(exact_path.clone()).await;
+        let gateway =
+            SdkRecoveryGateway::new_with_host(&fixture_config(), &host, Duration::from_secs(1))
+                .await
+                .unwrap();
+
+        assert_eq!(
+            gateway.reconcile_exact(&expected).await.unwrap(),
+            RemoteOrderEvidence::Uncertain {
+                code: crate::service::execution_ledger::ReconcileUncertainCode::Transport,
+            }
+        );
+        assert_eq!(server.await.unwrap(), vec![exact_path]);
+    }
+
+    #[tokio::test]
+    async fn distinct_exact_trades_are_each_queried_once_and_aggregate_exactly() {
+        let expected = expected_buy();
+        let exact_path = format!("GET /data/order/{}", expected.order_id.as_str());
+        let (host, server) = spawn_scripted_server(vec![
+            (
+                exact_path.clone(),
+                "200 OK".to_owned(),
+                order_body(&expected, "MATCHED", "40", r#"["trade-1","trade-2"]"#),
+            ),
+            (
+                "GET /data/trades?id=trade-1".to_owned(),
+                "200 OK".to_owned(),
+                trade_page(&taker_trade_record(&expected, "trade-1", "20"), "LTE=", 1),
+            ),
+            (
+                "GET /data/trades?id=trade-2".to_owned(),
+                "200 OK".to_owned(),
+                trade_page(&taker_trade_record(&expected, "trade-2", "20"), "LTE=", 1),
+            ),
+        ])
+        .await;
+        let gateway =
+            SdkRecoveryGateway::new_with_host(&fixture_config(), &host, Duration::from_secs(1))
+                .await
+                .unwrap();
+
+        assert_eq!(
+            gateway.reconcile_exact(&expected).await.unwrap(),
+            RemoteOrderEvidence::Matched {
+                making_micros: 20_000_000,
+                taking_micros: 40_000_000,
+                trade_ids: vec![
+                    TradeId::from_exact("trade-1").unwrap(),
+                    TradeId::from_exact("trade-2").unwrap(),
+                ],
+            }
+        );
+        assert_eq!(
+            server.await.unwrap(),
+            vec![
+                exact_path,
+                "GET /data/trades?id=trade-1".to_owned(),
+                "GET /data/trades?id=trade-2".to_owned(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_associations_and_ambiguous_trade_pages_stop_without_following() {
+        let expected = expected_buy();
+        let exact_path = format!("GET /data/order/{}", expected.order_id.as_str());
+        let duplicate_association =
+            order_body(&expected, "MATCHED", "40", r#"["trade-1","trade-1"]"#);
+        let (host, server) = spawn_scripted_server(vec![(
+            exact_path.clone(),
+            "200 OK".to_owned(),
+            duplicate_association,
+        )])
+        .await;
+        let gateway =
+            SdkRecoveryGateway::new_with_host(&fixture_config(), &host, Duration::from_secs(1))
+                .await
+                .unwrap();
+        assert_eq!(
+            gateway.reconcile_exact(&expected).await.unwrap(),
+            RemoteOrderEvidence::Uncertain {
+                code: crate::service::execution_ledger::ReconcileUncertainCode::Mismatch,
+            }
+        );
+        assert_eq!(server.await.unwrap(), vec![exact_path.clone()]);
+
+        let record = taker_trade_record(&expected, "trade-1", "40");
+        let pages = [
+            trade_page(&format!("{record},{record}"), "LTE=", 2),
+            trade_page(&record, "LTE=", 2),
+        ];
+        for page in pages {
+            let (host, server) = spawn_scripted_server(vec![
+                (
+                    exact_path.clone(),
+                    "200 OK".to_owned(),
+                    order_body(&expected, "MATCHED", "40", r#"["trade-1"]"#),
+                ),
+                (
+                    "GET /data/trades?id=trade-1".to_owned(),
+                    "200 OK".to_owned(),
+                    page,
+                ),
+            ])
+            .await;
+            let gateway =
+                SdkRecoveryGateway::new_with_host(&fixture_config(), &host, Duration::from_secs(1))
+                    .await
+                    .unwrap();
+            assert_eq!(
+                gateway.reconcile_exact(&expected).await.unwrap(),
+                RemoteOrderEvidence::Uncertain {
+                    code: crate::service::execution_ledger::ReconcileUncertainCode::Mismatch,
+                }
+            );
+            assert_eq!(
+                server.await.unwrap(),
+                vec![exact_path.clone(), "GET /data/trades?id=trade-1".to_owned()]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_exact_trade_fields_and_relations_are_mismatch_without_search() {
+        let expected = expected_buy();
+        let exact_path = format!("GET /data/order/{}", expected.order_id.as_str());
+        let base = taker_trade_page(&expected, "trade-1", "LTE=");
+        let cases = [
+            (
+                "wrong_id",
+                base.replacen("\"id\":\"trade-1\"", "\"id\":\"trade-other\"", 1),
+            ),
+            (
+                "wrong_asset",
+                base.replacen("\"asset_id\":\"12345\"", "\"asset_id\":\"999\"", 1),
+            ),
+            (
+                "wrong_side",
+                base.replacen("\"side\":\"BUY\"", "\"side\":\"SELL\"", 1),
+            ),
+            (
+                "wrong_status",
+                base.replacen("\"status\":\"CONFIRMED\"", "\"status\":\"MATCHED\"", 1),
+            ),
+            (
+                "wrong_taker_relation",
+                base.replacen(
+                    &format!("\"taker_order_id\":\"{}\"", expected.order_id.as_str()),
+                    "\"taker_order_id\":\"another-order\"",
+                    1,
+                ),
+            ),
+            (
+                "amount_mismatch",
+                base.replacen("\"size\":\"40\"", "\"size\":\"39\"", 1),
+            ),
+        ];
+
+        for (name, trade_body) in cases {
+            let (host, server) = spawn_scripted_server(vec![
+                (
+                    exact_path.clone(),
+                    "200 OK".to_owned(),
+                    order_body(&expected, "MATCHED", "40", r#"["trade-1"]"#),
+                ),
+                (
+                    "GET /data/trades?id=trade-1".to_owned(),
+                    "200 OK".to_owned(),
+                    trade_body,
+                ),
+            ])
+            .await;
+            let gateway =
+                SdkRecoveryGateway::new_with_host(&fixture_config(), &host, Duration::from_secs(1))
+                    .await
+                    .unwrap();
+            assert_eq!(
+                gateway.reconcile_exact(&expected).await.unwrap(),
+                RemoteOrderEvidence::Uncertain {
+                    code: crate::service::execution_ledger::ReconcileUncertainCode::Mismatch,
+                },
+                "{name}"
+            );
+            assert_eq!(
+                server.await.unwrap(),
+                vec![exact_path.clone(), "GET /data/trades?id=trade-1".to_owned()],
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn multiple_exact_trades_with_inexact_total_are_mismatch_without_replay() {
+        let expected = expected_buy();
+        let exact_path = format!("GET /data/order/{}", expected.order_id.as_str());
+        let (host, server) = spawn_scripted_server(vec![
+            (
+                exact_path.clone(),
+                "200 OK".to_owned(),
+                order_body(&expected, "MATCHED", "40", r#"["trade-1","trade-2"]"#),
+            ),
+            (
+                "GET /data/trades?id=trade-1".to_owned(),
+                "200 OK".to_owned(),
+                trade_page(&taker_trade_record(&expected, "trade-1", "20"), "LTE=", 1),
+            ),
+            (
+                "GET /data/trades?id=trade-2".to_owned(),
+                "200 OK".to_owned(),
+                trade_page(&taker_trade_record(&expected, "trade-2", "19"), "LTE=", 1),
+            ),
+        ])
+        .await;
+        let gateway =
+            SdkRecoveryGateway::new_with_host(&fixture_config(), &host, Duration::from_secs(1))
+                .await
+                .unwrap();
+
+        assert_eq!(
+            gateway.reconcile_exact(&expected).await.unwrap(),
+            RemoteOrderEvidence::Uncertain {
+                code: crate::service::execution_ledger::ReconcileUncertainCode::Mismatch,
+            }
+        );
+        assert_eq!(
+            server.await.unwrap(),
+            vec![
+                exact_path,
+                "GET /data/trades?id=trade-1".to_owned(),
+                "GET /data/trades?id=trade-2".to_owned(),
+            ]
+        );
+    }
+
     fn taker_trade_page(
         expected: &PreparedOrderIdentity,
         trade_id: &str,
         next_cursor: &str,
     ) -> String {
+        trade_page(
+            &taker_trade_record(expected, trade_id, "40"),
+            next_cursor,
+            1,
+        )
+    }
+
+    fn taker_trade_record(expected: &PreparedOrderIdentity, trade_id: &str, size: &str) -> String {
+        let side = match expected.side {
+            OrderSide::Buy => "BUY",
+            OrderSide::Sell => "SELL",
+        };
         format!(
-            r#"{{"data":[{{"id":"{trade_id}","taker_order_id":"{}","market":"0x0000000000000000000000000000000000000000000000000000000000000001","asset_id":"12345","side":"BUY","size":"40","fee_rate_bps":"0","price":"0.5","status":"CONFIRMED","match_time":"1770000000","last_update":"1770000001","outcome":"Yes","bucket_index":0,"owner":"00000000-0000-0000-0000-000000000000","maker_address":"0x0000000000000000000000000000000000000001","maker_orders":[],"transaction_hash":"0x0000000000000000000000000000000000000000000000000000000000000002","trader_side":"TAKER","error_msg":null}}],"next_cursor":"{next_cursor}","limit":1,"count":1}}"#,
-            expected.order_id.as_str()
+            r#"{{"id":"{trade_id}","taker_order_id":"{}","market":"0x0000000000000000000000000000000000000000000000000000000000000001","asset_id":"12345","side":"{side}","size":"{size}","fee_rate_bps":"0","price":"0.5","status":"CONFIRMED","match_time":"1770000000","last_update":"1770000001","outcome":"Yes","bucket_index":0,"owner":"00000000-0000-0000-0000-000000000000","maker_address":"0x0000000000000000000000000000000000000001","maker_orders":[],"transaction_hash":"0x0000000000000000000000000000000000000000000000000000000000000002","trader_side":"TAKER","error_msg":null}}"#,
+            expected.order_id.as_str(),
+        )
+    }
+
+    fn trade_page(records: &str, next_cursor: &str, count: usize) -> String {
+        format!(r#"{{"data":[{records}],"next_cursor":"{next_cursor}","limit":1,"count":{count}}}"#)
+    }
+
+    fn maker_order(
+        expected: &PreparedOrderIdentity,
+        order_id: &str,
+        matched_amount: &str,
+    ) -> String {
+        let side = match expected.side {
+            OrderSide::Buy => "BUY",
+            OrderSide::Sell => "SELL",
+        };
+        format!(
+            r#"{{"order_id":"{order_id}","owner":"00000000-0000-0000-0000-000000000000","maker_address":"0x0000000000000000000000000000000000000001","matched_amount":"{matched_amount}","price":"0.5","fee_rate_bps":"0","asset_id":"12345","outcome":"Yes","side":"{side}"}}"#
+        )
+    }
+
+    fn maker_trade_page(
+        expected: &PreparedOrderIdentity,
+        trade_id: &str,
+        taker_order_id: &str,
+        maker_orders: &str,
+        next_cursor: &str,
+        count: usize,
+    ) -> String {
+        let side = match expected.side {
+            OrderSide::Buy => "BUY",
+            OrderSide::Sell => "SELL",
+        };
+        format!(
+            r#"{{"data":[{{"id":"{trade_id}","taker_order_id":"{taker_order_id}","market":"0x0000000000000000000000000000000000000000000000000000000000000001","asset_id":"12345","side":"{side}","size":"40","fee_rate_bps":"0","price":"0.5","status":"CONFIRMED","match_time":"1770000000","last_update":"1770000001","outcome":"Yes","bucket_index":0,"owner":"00000000-0000-0000-0000-000000000000","maker_address":"0x0000000000000000000000000000000000000001","maker_orders":[{maker_orders}],"transaction_hash":"0x0000000000000000000000000000000000000000000000000000000000000002","trader_side":"MAKER","error_msg":null}}],"next_cursor":"{next_cursor}","limit":1,"count":{count}}}"#
         )
     }
 
@@ -1071,6 +1675,29 @@ mod tests {
             let raw = read_raw_request(&mut stream).await;
             write_json_response(&mut stream, "200 OK", &body).await;
             raw
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    async fn spawn_redirect_server(
+        expected_request: String,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request_line(&mut stream).await;
+            assert_eq!(request, expected_request, "unexpected loopback request");
+            let response = "HTTP/1.1 307 Temporary Redirect\r\nLocation: /redirect-target\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+            if let Ok(Ok((mut extra, _))) =
+                tokio::time::timeout(Duration::from_millis(100), listener.accept()).await
+            {
+                let extra = read_request_line(&mut extra).await;
+                panic!("redirect was followed or replayed: {extra}");
+            }
+            vec![request]
         });
         (format!("http://{address}"), handle)
     }
