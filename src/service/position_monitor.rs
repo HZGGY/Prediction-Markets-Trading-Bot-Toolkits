@@ -44,7 +44,7 @@ pub fn check_exit(pos: &OpenPosition, midprice: f64) -> Option<ExitReason> {
 
 /// Spawns the live monitor. Any uncertain or halted execution terminates the
 /// task so that no further exit evaluation can submit an order.
-pub fn spawn(
+pub(crate) fn spawn(
     cfg: TpSlConfig,
     positions: Arc<PositionStore>,
     gateway: Arc<dyn OrderGateway>,

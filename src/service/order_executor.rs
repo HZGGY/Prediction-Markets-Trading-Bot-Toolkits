@@ -119,7 +119,7 @@ impl OrderExecutor {
         }
     }
 
-    pub fn live_order_components(
+    pub(crate) fn live_order_components(
         &self,
     ) -> Option<(Arc<dyn OrderGateway>, Arc<ExecutionCircuitBreaker>)> {
         Some((

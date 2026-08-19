@@ -153,7 +153,7 @@ impl ExecutionCircuitBreaker {
         })
     }
 
-    pub async fn submit_fok(
+    pub(crate) async fn submit_fok(
         &self,
         gateway: &dyn OrderGateway,
         planned: &PlannedOrder,

@@ -166,7 +166,7 @@ impl fmt::Display for OrderSubmitError {
 impl Error for OrderSubmitError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PreparedOrderIdentity {
+pub(crate) struct PreparedOrderIdentity {
     pub order_id: OrderId,
     pub protocol_version: u8,
     pub venue: Venue,
@@ -178,12 +178,12 @@ pub struct PreparedOrderIdentity {
     pub expected_taker_micros: u128,
 }
 
-pub trait PrePostJournal: Send + Sync {
+pub(crate) trait PrePostJournal: Send + Sync {
     fn before_post(&self, identity: &PreparedOrderIdentity) -> Result<(), OrderSubmitError>;
 }
 
 #[async_trait]
-pub trait OrderGateway: Send + Sync {
+pub(crate) trait OrderGateway: Send + Sync {
     async fn submit_fok(
         &self,
         planned: &PlannedOrder,

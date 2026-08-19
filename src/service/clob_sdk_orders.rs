@@ -31,7 +31,7 @@ use crate::service::order_gateway::{
 
 type AuthenticatedClient = Client<Authenticated<Normal>>;
 
-pub struct SdkOrderGateway {
+pub(crate) struct SdkOrderGateway {
     client: AuthenticatedClient,
     signer: PrivateKeySigner,
     post_timeout: Duration,
@@ -59,7 +59,7 @@ impl fmt::Debug for PreparedOrder {
 }
 
 impl SdkOrderGateway {
-    pub async fn new(cfg: &AppConfig) -> Result<Self, OrderSubmitError> {
+    pub(crate) async fn new(cfg: &AppConfig) -> Result<Self, OrderSubmitError> {
         if cfg.site.clob_api_base != OFFICIAL_CLOB_V2_HOST {
             return Err(preflight(
                 OrderStage::Initialization,
