@@ -38,6 +38,7 @@ use crate::service::{
     risk_guard::RiskGuard,
 };
 use anyhow::{anyhow, Result};
+use async_trait::async_trait;
 use reqwest::Client;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -46,6 +47,10 @@ use tracing::{error, info, warn};
 const LOG_CHANNEL_CAPACITY: usize = 256;
 
 pub async fn run(cfg: AppConfig) -> Result<()> {
+    run_with_factory(cfg, &ProductionRuntimeFactory).await
+}
+
+async fn run_with_factory(cfg: AppConfig, factory: &dyn CopyRuntimeFactory) -> Result<()> {
     let whale = cfg
         .bot
         .wallets_to_track
@@ -63,59 +68,27 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
     );
 
     let risk = RiskGuard::new(cfg.risk.clone());
-    let executor = OrderExecutor::new(cfg.clone(), Arc::clone(&risk)).await?;
-    let http = Client::builder()
-        .user_agent("polymarket-toolkits/0.1")
-        .build()?;
-    let markets = MarketCache::new(http.clone(), cfg.site.gamma_api_base.clone());
-    let executor = executor.with_markets(markets);
-    let positions = executor.positions();
-
-    let mut tp_sl_monitor = None;
-    if let Some(runtime) = live_tp_sl_components(&cfg, &executor) {
-        let midprice: Arc<dyn MidpriceSource> = Arc::new(ClobMidpriceSource::new(
-            http.clone(),
-            cfg.site.clob_api_base.clone(),
-        ));
-        tp_sl_monitor = Some(position_monitor::spawn(
-            cfg.tp_sl.clone(),
-            Arc::clone(&runtime.positions),
-            Arc::clone(&runtime.gateway),
-            Arc::clone(&runtime.breaker),
-            midprice,
-            cfg.trading.price_buffer,
-        ));
-        info!(
-            poll_interval_secs = cfg.tp_sl.poll_interval_secs,
-            "TP/SL monitor spawned"
-        );
-    } else if cfg.tp_sl.enabled {
-        info!("TP/SL CLOB monitoring inactive in strict dry-run");
-    }
-
-    let filter = build_filter(&cfg, &whale)?;
-    let (tx, mut rx) = mpsc::channel::<RawLog>(LOG_CHANNEL_CAPACITY);
-    let _sub = spawn_subscription(cfg.site.polygon_ws_url.clone(), filter, tx);
+    let mut runtime = initialize_runtime(&cfg, &whale, risk, factory).await?;
 
     let mut shutdown = Box::pin(tokio::signal::ctrl_c());
 
     loop {
         tokio::select! {
             biased;
-            monitor_result = supervise_tp_sl_monitor(&mut tp_sl_monitor) => {
+            monitor_result = supervise_tp_sl_monitor(&mut runtime.tp_sl_monitor) => {
                 error!("TP/SL monitor terminated; copy bot stopping");
                 return monitor_result;
             }
             _ = &mut shutdown => {
-                info!(open_positions = positions.len(), "shutdown signal received");
+                info!(open_positions = runtime.positions.len(), "shutdown signal received");
                 return Ok(());
             }
-            maybe_log = rx.recv() => {
+            maybe_log = runtime.rx.recv() => {
                 let Some(log) = maybe_log else {
                     warn!("on-chain subscription channel closed");
                     return Ok(());
                 };
-                if let Err(error) = handle_log(&executor, &whale, &log).await {
+                if let Err(error) = handle_log(&runtime.executor, &whale, &log).await {
                     let fatal = error
                         .downcast_ref::<OrderSubmitError>()
                         .is_some_and(|order_error| matches!(
@@ -131,6 +104,139 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
             }
         }
     }
+}
+
+enum RuntimeHttp {
+    Production(Client),
+    #[cfg(test)]
+    Inert,
+}
+
+#[async_trait]
+trait CopyRuntimeFactory: Send + Sync {
+    async fn executor(&self, cfg: AppConfig, risk: Arc<RiskGuard>) -> Result<OrderExecutor>;
+    fn http(&self) -> Result<RuntimeHttp>;
+    fn attach_gamma(
+        &self,
+        executor: OrderExecutor,
+        http: &RuntimeHttp,
+        cfg: &AppConfig,
+    ) -> OrderExecutor;
+    fn midpoint(&self, http: &RuntimeHttp, cfg: &AppConfig) -> Arc<dyn MidpriceSource>;
+    fn polygon(
+        &self,
+        cfg: &AppConfig,
+        filter: LogFilter,
+        tx: mpsc::Sender<RawLog>,
+    ) -> Box<dyn Send>;
+}
+
+struct ProductionRuntimeFactory;
+
+#[async_trait]
+impl CopyRuntimeFactory for ProductionRuntimeFactory {
+    async fn executor(&self, cfg: AppConfig, risk: Arc<RiskGuard>) -> Result<OrderExecutor> {
+        OrderExecutor::new(cfg, risk).await
+    }
+
+    fn http(&self) -> Result<RuntimeHttp> {
+        Ok(RuntimeHttp::Production(
+            Client::builder()
+                .user_agent("polymarket-toolkits/0.1")
+                .build()?,
+        ))
+    }
+
+    fn attach_gamma(
+        &self,
+        executor: OrderExecutor,
+        http: &RuntimeHttp,
+        cfg: &AppConfig,
+    ) -> OrderExecutor {
+        let http = match http {
+            RuntimeHttp::Production(http) => http,
+            #[cfg(test)]
+            RuntimeHttp::Inert => panic!("production factory received inert HTTP"),
+        };
+        executor.with_markets(MarketCache::new(
+            http.clone(),
+            cfg.site.gamma_api_base.clone(),
+        ))
+    }
+
+    fn midpoint(&self, http: &RuntimeHttp, cfg: &AppConfig) -> Arc<dyn MidpriceSource> {
+        let http = match http {
+            RuntimeHttp::Production(http) => http,
+            #[cfg(test)]
+            RuntimeHttp::Inert => panic!("production factory received inert HTTP"),
+        };
+        Arc::new(ClobMidpriceSource::new(
+            http.clone(),
+            cfg.site.clob_api_base.clone(),
+        ))
+    }
+
+    fn polygon(
+        &self,
+        cfg: &AppConfig,
+        filter: LogFilter,
+        tx: mpsc::Sender<RawLog>,
+    ) -> Box<dyn Send> {
+        Box::new(spawn_subscription(
+            cfg.site.polygon_ws_url.clone(),
+            filter,
+            tx,
+        ))
+    }
+}
+
+struct InitializedRuntime {
+    executor: OrderExecutor,
+    positions: Arc<crate::service::position_store::PositionStore>,
+    tp_sl_monitor: Option<tokio::task::JoinHandle<Result<()>>>,
+    rx: mpsc::Receiver<RawLog>,
+    _subscription: Box<dyn Send>,
+}
+
+async fn initialize_runtime(
+    cfg: &AppConfig,
+    whale: &str,
+    risk: Arc<RiskGuard>,
+    factory: &dyn CopyRuntimeFactory,
+) -> Result<InitializedRuntime> {
+    let executor = factory.executor(cfg.clone(), risk).await?;
+    let http = factory.http()?;
+    let executor = factory.attach_gamma(executor, &http, cfg);
+    let positions = executor.positions();
+
+    let mut tp_sl_monitor = None;
+    if let Some(runtime) = live_tp_sl_components(cfg, &executor) {
+        tp_sl_monitor = Some(position_monitor::spawn(
+            cfg.tp_sl.clone(),
+            Arc::clone(&runtime.positions),
+            Arc::clone(&runtime.gateway),
+            Arc::clone(&runtime.breaker),
+            factory.midpoint(&http, cfg),
+            cfg.trading.price_buffer,
+        ));
+        info!(
+            poll_interval_secs = cfg.tp_sl.poll_interval_secs,
+            "TP/SL monitor spawned"
+        );
+    } else if cfg.tp_sl.enabled {
+        info!("TP/SL CLOB monitoring inactive in strict dry-run");
+    }
+
+    let filter = build_filter(cfg, whale)?;
+    let (tx, rx) = mpsc::channel::<RawLog>(LOG_CHANNEL_CAPACITY);
+    let subscription = factory.polygon(cfg, filter, tx);
+    Ok(InitializedRuntime {
+        executor,
+        positions,
+        tp_sl_monitor,
+        rx,
+        _subscription: subscription,
+    })
 }
 
 async fn supervise_tp_sl_monitor(
@@ -237,6 +343,7 @@ mod tests {
     use crate::service::execution_ledger::{
         ExecutionLedger, IntentId, IntentPurpose, OrderId, OrderSide, PositionId, TokenId, Venue,
     };
+    use crate::service::order_executor::LiveGatewayFactory;
     use crate::service::position_store::{OpenPosition, PositionStore};
     use crate::service::{
         execution_circuit_breaker::ExecutionCircuitBreaker,
@@ -256,14 +363,19 @@ mod tests {
         cfg.bot.enable_trading = false;
         cfg.bot.mock_trading = true;
         cfg.site.clob_api_base = "http://127.0.0.1:9".into();
-        let risk = RiskGuard::new(cfg.risk.clone());
-        let markets = MarketCache::new(Client::new(), cfg.site.gamma_api_base.clone());
-        let executor = OrderExecutor::new(cfg.clone(), risk)
-            .await
-            .unwrap()
-            .with_markets(markets);
+        let factory = InertRuntimeFactory::default();
+        let mut runtime = initialize_runtime(
+            &cfg,
+            "0x1111111111111111111111111111111111111111",
+            RiskGuard::new(cfg.risk.clone()),
+            &factory,
+        )
+        .await
+        .unwrap();
 
-        assert!(live_tp_sl_components(&cfg, &executor).is_none());
+        assert!(live_tp_sl_components(&cfg, &runtime.executor).is_none());
+        assert_eq!(factory.counts(), ComponentCounts::new(0, 0, 1, 1, 1));
+        runtime.tp_sl_monitor.take();
     }
 
     #[tokio::test]
@@ -284,16 +396,26 @@ mod tests {
             Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned());
         cfg.credentials.api_passphrase = Some("fixture-passphrase".to_owned());
 
-        let executor = OrderExecutor::new(cfg.clone(), RiskGuard::new(cfg.risk.clone()))
-            .await
-            .unwrap();
-        let runtime = live_tp_sl_components(&cfg, &executor)
+        let factory = InertRuntimeFactory::default();
+        let mut initialized = initialize_runtime(
+            &cfg,
+            "0x1111111111111111111111111111111111111111",
+            RiskGuard::new(cfg.risk.clone()),
+            &factory,
+        )
+        .await
+        .unwrap();
+        let runtime = live_tp_sl_components(&cfg, &initialized.executor)
             .expect("enabled live TP/SL must use the shared live runtime");
-        let (gateway, breaker) = executor
+        let (gateway, breaker) = initialized
+            .executor
             .live_order_components()
             .expect("live executor must expose its shared components internally");
 
-        assert!(Arc::ptr_eq(&executor.positions(), &runtime.positions));
+        assert!(Arc::ptr_eq(
+            &initialized.executor.positions(),
+            &runtime.positions
+        ));
         assert!(Arc::ptr_eq(&gateway, &runtime.gateway));
         assert!(Arc::ptr_eq(&breaker, &runtime.breaker));
         assert!(Arc::ptr_eq(
@@ -302,6 +424,47 @@ mod tests {
         ));
         assert!(Arc::ptr_eq(&runtime.ledger, &runtime.breaker.ledger()));
         assert_eq!(runtime.ledger.projection().sequence, 0);
+        assert_eq!(factory.counts(), ComponentCounts::new(1, 1, 1, 1, 1));
+        initialized
+            .tp_sl_monitor
+            .take()
+            .expect("live TP/SL must have a monitor")
+            .abort();
+    }
+
+    #[tokio::test]
+    async fn failed_live_preflight_constructs_no_network_capable_components() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = live_cfg(dir.path());
+        cfg.credentials.api_secret = Some("not URL-safe base64".to_owned());
+
+        assert_failed_initialization_has_zero_component_construction(cfg).await;
+    }
+
+    #[tokio::test]
+    async fn failed_ledger_snapshot_and_marker_startup_construct_no_network_capable_components() {
+        let ledger_dir = tempfile::tempdir().unwrap();
+        let ledger_cfg = live_cfg(ledger_dir.path());
+        std::fs::write(&ledger_cfg.trading.execution_ledger_path, b"{\n").unwrap();
+        assert_failed_initialization_has_zero_component_construction(ledger_cfg).await;
+
+        let snapshot_dir = tempfile::tempdir().unwrap();
+        let snapshot_cfg = live_cfg(snapshot_dir.path());
+        std::fs::write(&snapshot_cfg.trading.execution_ledger_path, b"").unwrap();
+        std::fs::write(
+            snapshot_cfg
+                .trading
+                .execution_ledger_path
+                .with_extension("jsonl.active.json"),
+            br#"{"schema_version":1,"sequence":1,"head_hash":"0000000000000000000000000000000000000000000000000000000000000000","active_intent":null}"#,
+        )
+        .unwrap();
+        assert_failed_initialization_has_zero_component_construction(snapshot_cfg).await;
+
+        let marker_dir = tempfile::tempdir().unwrap();
+        let marker_cfg = live_cfg(marker_dir.path());
+        std::fs::write(&marker_cfg.trading.execution_halt_path, b"fixture marker").unwrap();
+        assert_failed_initialization_has_zero_component_construction(marker_cfg).await;
     }
 
     #[tokio::test]
@@ -409,6 +572,147 @@ mod tests {
     impl MidpriceSource for FixedMidprice {
         async fn midprice(&self, _token_id: &str) -> Result<f64> {
             Ok(self.0)
+        }
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct ComponentCounts {
+        gateway: usize,
+        midpoint: usize,
+        http: usize,
+        gamma: usize,
+        polygon: usize,
+    }
+
+    impl ComponentCounts {
+        const fn new(
+            gateway: usize,
+            midpoint: usize,
+            http: usize,
+            gamma: usize,
+            polygon: usize,
+        ) -> Self {
+            Self {
+                gateway,
+                midpoint,
+                http,
+                gamma,
+                polygon,
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct InertRuntimeFactory {
+        gateway: AtomicUsize,
+        midpoint: AtomicUsize,
+        http: AtomicUsize,
+        gamma: AtomicUsize,
+        polygon: AtomicUsize,
+    }
+
+    impl InertRuntimeFactory {
+        fn counts(&self) -> ComponentCounts {
+            ComponentCounts::new(
+                self.gateway.load(Ordering::SeqCst),
+                self.midpoint.load(Ordering::SeqCst),
+                self.http.load(Ordering::SeqCst),
+                self.gamma.load(Ordering::SeqCst),
+                self.polygon.load(Ordering::SeqCst),
+            )
+        }
+    }
+
+    async fn assert_failed_initialization_has_zero_component_construction(cfg: AppConfig) {
+        let factory = InertRuntimeFactory::default();
+        let result = initialize_runtime(
+            &cfg,
+            "0x1111111111111111111111111111111111111111",
+            RiskGuard::new(cfg.risk.clone()),
+            &factory,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(factory.counts(), ComponentCounts::new(0, 0, 0, 0, 0));
+    }
+
+    fn live_cfg(dir: &std::path::Path) -> AppConfig {
+        let mut cfg: AppConfig = serde_json::from_str(include_str!("../../config.json")).unwrap();
+        cfg.bot.enable_trading = true;
+        cfg.bot.mock_trading = false;
+        cfg.tp_sl.enabled = true;
+        cfg.trading.execution_ledger_path = dir.join("execution-ledger.jsonl");
+        cfg.trading.execution_halt_path = dir.join("execution-halt.json");
+        cfg.credentials.private_key =
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_owned();
+        cfg.credentials.funder_address = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_owned();
+        cfg.credentials.signature_type = Some(0);
+        cfg.credentials.api_key = Some("00000000-0000-0000-0000-000000000000".to_owned());
+        cfg.credentials.api_secret =
+            Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned());
+        cfg.credentials.api_passphrase = Some("fixture-passphrase".to_owned());
+        cfg
+    }
+
+    #[async_trait]
+    impl LiveGatewayFactory for InertRuntimeFactory {
+        async fn build(
+            &self,
+            _cfg: &AppConfig,
+        ) -> std::result::Result<Arc<dyn OrderGateway>, OrderSubmitError> {
+            self.gateway.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::new(InertGateway))
+        }
+    }
+
+    #[async_trait]
+    impl CopyRuntimeFactory for InertRuntimeFactory {
+        async fn executor(&self, cfg: AppConfig, risk: Arc<RiskGuard>) -> Result<OrderExecutor> {
+            OrderExecutor::new_with_test_gateway_factory(cfg, risk, self).await
+        }
+
+        fn http(&self) -> Result<RuntimeHttp> {
+            self.http.fetch_add(1, Ordering::SeqCst);
+            Ok(RuntimeHttp::Inert)
+        }
+
+        fn attach_gamma(
+            &self,
+            executor: OrderExecutor,
+            _http: &RuntimeHttp,
+            _cfg: &AppConfig,
+        ) -> OrderExecutor {
+            self.gamma.fetch_add(1, Ordering::SeqCst);
+            executor
+        }
+
+        fn midpoint(&self, _http: &RuntimeHttp, _cfg: &AppConfig) -> Arc<dyn MidpriceSource> {
+            self.midpoint.fetch_add(1, Ordering::SeqCst);
+            Arc::new(FixedMidprice(0.50))
+        }
+
+        fn polygon(
+            &self,
+            _cfg: &AppConfig,
+            _filter: LogFilter,
+            _tx: mpsc::Sender<RawLog>,
+        ) -> Box<dyn Send> {
+            self.polygon.fetch_add(1, Ordering::SeqCst);
+            Box::new(())
+        }
+    }
+
+    struct InertGateway;
+
+    #[async_trait]
+    impl OrderGateway for InertGateway {
+        async fn submit_fok(
+            &self,
+            _planned: &PlannedOrder,
+            _journal: &dyn PrePostJournal,
+        ) -> std::result::Result<OrderReceipt, OrderSubmitError> {
+            panic!("inert startup gateway cannot submit an order")
         }
     }
 

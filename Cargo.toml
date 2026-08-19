@@ -50,6 +50,7 @@ ratatui = "0.28"
 crossterm = "0.28"
 
 # Misc
+base64 = "0.22"
 rand = "0.8"
 parking_lot = "0.12"
 sha2 = "0.10"

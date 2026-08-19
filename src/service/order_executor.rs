@@ -5,10 +5,13 @@
 //! Safety flags are checked here, so individual bots never accidentally
 //! bypass `enable_trading` or `mock_trading`.
 
-use std::{str::FromStr as _, sync::Arc};
+use std::{error::Error, fmt, str::FromStr as _, sync::Arc};
 
 use alloy_signer_local::PrivateKeySigner;
+use async_trait::async_trait;
+use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 use polymarket_client_sdk_v2::{types::Address, POLYGON};
+use reqwest::header::HeaderValue;
 
 use crate::config::{AppConfig, OFFICIAL_CLOB_V2_HOST};
 use crate::models::{OrderType, PlannedOrder, Side, WhaleTrade};
@@ -16,12 +19,14 @@ use crate::service::clob_sdk_orders::SdkOrderGateway;
 use crate::service::eligibility::{self, Eligibility};
 use crate::service::execution_circuit_breaker::ExecutionCircuitBreaker;
 use crate::service::execution_ledger::{
-    ExecutionLedger, IntentId, IntentPurpose, OrderId, OrderSide, PositionId, PositionSeed,
-    TokenId, Venue,
+    ExecutionLedger, IntentId, IntentPurpose, LedgerError, LedgerErrorCode, OrderId, OrderSide,
+    PositionId, PositionSeed, TokenId, Venue,
 };
 use crate::service::market_cache::{MarketCache, MarketInfo};
 use crate::service::order_gateway::{OrderGateway, OrderReceipt, OrderSubmitError};
-use crate::service::position_store::{OpenPosition, PositionStore};
+use crate::service::position_store::{
+    OpenPosition, PositionStore, PositionStoreError, PositionStoreErrorCode,
+};
 use crate::service::risk_guard::{BlockReason, RiskCheck, RiskGuard};
 use crate::service::strategy;
 use crate::utils;
@@ -44,6 +49,115 @@ pub struct LiveExecutionRuntime {
     pub(crate) gateway: Arc<dyn OrderGateway>,
     pub breaker: Arc<ExecutionCircuitBreaker>,
 }
+
+/// The only construction seam for the network/signing order gateway.
+/// Tests inject an inert gateway here; production owns the SDK implementation.
+#[async_trait]
+pub(crate) trait LiveGatewayFactory: Send + Sync {
+    async fn build(&self, cfg: &AppConfig) -> Result<Arc<dyn OrderGateway>, OrderSubmitError>;
+}
+
+struct SdkLiveGatewayFactory;
+
+#[async_trait]
+impl LiveGatewayFactory for SdkLiveGatewayFactory {
+    async fn build(&self, cfg: &AppConfig) -> Result<Arc<dyn OrderGateway>, OrderSubmitError> {
+        Ok(Arc::new(SdkOrderGateway::new(cfg).await?))
+    }
+}
+
+/// A redacted, stable reason why durable live startup was denied.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LiveStartupCode {
+    LedgerLocked,
+    LedgerCorrupt,
+    LedgerUnsupported,
+    LedgerTruncated,
+    SnapshotInconsistent,
+    LedgerUnavailable,
+    PositionRebuildInvalid,
+    ActiveUnresolved,
+    HaltMarkerPresent,
+    HaltMarkerUnavailable,
+}
+
+impl LiveStartupCode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LedgerLocked => "ledger_locked",
+            Self::LedgerCorrupt => "ledger_corrupt",
+            Self::LedgerUnsupported => "ledger_unsupported",
+            Self::LedgerTruncated => "ledger_truncated",
+            Self::SnapshotInconsistent => "snapshot_inconsistent",
+            Self::LedgerUnavailable => "ledger_unavailable",
+            Self::PositionRebuildInvalid => "position_rebuild_invalid",
+            Self::ActiveUnresolved => "active_unresolved",
+            Self::HaltMarkerPresent => "halt_marker_present",
+            Self::HaltMarkerUnavailable => "halt_marker_unavailable",
+        }
+    }
+
+    fn instruction(self) -> &'static str {
+        match self {
+            Self::LedgerLocked => {
+                "stop startup and identify the other process holding the ledger lock"
+            }
+            Self::LedgerCorrupt | Self::LedgerUnsupported | Self::LedgerTruncated => {
+                "preserve and inspect the ledger; do not edit it or retry startup"
+            }
+            Self::SnapshotInconsistent => {
+                "inspect the snapshot and ledger; do not overwrite either file"
+            }
+            Self::LedgerUnavailable => {
+                "inspect durable ledger availability before any manual recovery"
+            }
+            Self::PositionRebuildInvalid => {
+                "inspect durable position events; do not overwrite or heal them"
+            }
+            Self::ActiveUnresolved | Self::HaltMarkerPresent => {
+                "manual recovery and reconciliation are required before restart"
+            }
+            Self::HaltMarkerUnavailable => {
+                "inspect the halt-marker storage before any manual recovery"
+            }
+        }
+    }
+}
+
+/// Startup diagnostics deliberately carry only a typed category and static guidance.
+/// The raw filesystem error is not rendered at this boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LiveStartupFailure {
+    code: LiveStartupCode,
+}
+
+impl LiveStartupFailure {
+    fn new(code: LiveStartupCode) -> Self {
+        Self { code }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn code(&self) -> LiveStartupCode {
+        self.code
+    }
+
+    pub(crate) fn instruction(&self) -> &'static str {
+        self.code.instruction()
+    }
+}
+
+impl fmt::Display for LiveStartupFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "live startup blocked (code={}): {}",
+            self.code.as_str(),
+            self.instruction()
+        )
+    }
+}
+
+impl Error for LiveStartupFailure {}
 
 enum ExecutionRuntime {
     Paper(Arc<PositionStore>),
@@ -92,19 +206,30 @@ pub enum SkipReason {
 
 impl OrderExecutor {
     pub async fn new(cfg: AppConfig, risk: Arc<RiskGuard>) -> Result<Self> {
+        Self::new_with_gateway_factory(cfg, risk, &SdkLiveGatewayFactory).await
+    }
+
+    async fn new_with_gateway_factory(
+        cfg: AppConfig,
+        risk: Arc<RiskGuard>,
+        gateway_factory: &dyn LiveGatewayFactory,
+    ) -> Result<Self> {
         if !cfg.live_trading_allowed() {
             return Ok(Self::new_paper(cfg, risk));
         }
         validate_live_configuration(&cfg)?;
-        let ledger = Arc::new(ExecutionLedger::open_live(
-            &cfg.trading.execution_ledger_path,
-        )?);
-        let positions = PositionStore::from_ledger(Arc::clone(&ledger))?;
+        let ledger = Arc::new(
+            ExecutionLedger::open_live(&cfg.trading.execution_ledger_path)
+                .map_err(map_ledger_startup_failure)?,
+        );
+        let positions = PositionStore::from_ledger(Arc::clone(&ledger))
+            .map_err(map_position_startup_failure)?;
         let breaker = ExecutionCircuitBreaker::new_live(
             Arc::clone(&ledger),
             cfg.trading.execution_halt_path.clone(),
-        )?;
-        let gateway: Arc<dyn OrderGateway> = Arc::new(SdkOrderGateway::new(&cfg).await?);
+        )
+        .map_err(map_breaker_startup_failure)?;
+        let gateway = gateway_factory.build(&cfg).await?;
         Ok(Self {
             cfg,
             runtime: ExecutionRuntime::Live(Arc::new(LiveExecutionRuntime {
@@ -116,6 +241,15 @@ impl OrderExecutor {
             risk,
             markets: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn new_with_test_gateway_factory(
+        cfg: AppConfig,
+        risk: Arc<RiskGuard>,
+        gateway_factory: &dyn LiveGatewayFactory,
+    ) -> Result<Self> {
+        Self::new_with_gateway_factory(cfg, risk, gateway_factory).await
     }
 
     fn new_paper(cfg: AppConfig, risk: Arc<RiskGuard>) -> Self {
@@ -533,26 +667,78 @@ fn validate_live_configuration(cfg: &AppConfig) -> Result<(), OrderSubmitError> 
     if signer.address() != funder {
         return preflight(crate::service::order_gateway::OrderErrorCode::FunderMismatch);
     }
-    if cfg
+    let key_valid = cfg
         .credentials
         .api_key
         .as_deref()
-        .and_then(|key| uuid::Uuid::parse_str(key).ok())
-        .is_none()
-        || cfg
-            .credentials
-            .api_secret
-            .as_deref()
-            .is_none_or(|value| value.trim().is_empty())
-        || cfg
-            .credentials
-            .api_passphrase
-            .as_deref()
-            .is_none_or(|value| value.trim().is_empty())
-    {
+        .is_some_and(|key| uuid::Uuid::parse_str(key).is_ok());
+    let secret_valid = cfg
+        .credentials
+        .api_secret
+        .as_deref()
+        .is_some_and(|secret| !secret.trim().is_empty() && URL_SAFE.decode(secret).is_ok());
+    let passphrase_valid = cfg
+        .credentials
+        .api_passphrase
+        .as_deref()
+        .is_some_and(|passphrase| {
+            !passphrase.trim().is_empty() && HeaderValue::from_str(passphrase).is_ok()
+        });
+    if !key_valid || !secret_valid || !passphrase_valid {
         return preflight(crate::service::order_gateway::OrderErrorCode::MissingCredentials);
     }
     Ok(())
+}
+
+fn map_ledger_startup_failure(error: LedgerError) -> LiveStartupFailure {
+    use LedgerErrorCode as Code;
+
+    let code = match error.code() {
+        Code::Locked => LiveStartupCode::LedgerLocked,
+        Code::TruncatedTail => LiveStartupCode::LedgerTruncated,
+        Code::UnsupportedEventKind | Code::UnsupportedSchema | Code::UnsupportedSnapshotSchema => {
+            LiveStartupCode::LedgerUnsupported
+        }
+        Code::SnapshotMissing | Code::InvalidSnapshot | Code::SnapshotMismatch => {
+            LiveStartupCode::SnapshotInconsistent
+        }
+        Code::InvalidJson
+        | Code::EventHashMismatch
+        | Code::SequenceMismatch
+        | Code::PreviousHashMismatch
+        | Code::IdentityConflict
+        | Code::IntentMismatch
+        | Code::IllegalTransition
+        | Code::EvidenceConflict => LiveStartupCode::LedgerCorrupt,
+        _ => LiveStartupCode::LedgerUnavailable,
+    };
+    LiveStartupFailure::new(code)
+}
+
+fn map_position_startup_failure(error: PositionStoreError) -> LiveStartupFailure {
+    map_position_startup_code(error.code())
+}
+
+fn map_position_startup_code(code: PositionStoreErrorCode) -> LiveStartupFailure {
+    match code {
+        PositionStoreErrorCode::Ledger(code) => map_ledger_startup_failure(LedgerError::new(code)),
+        PositionStoreErrorCode::IdempotencyConflict | PositionStoreErrorCode::PositionConflict => {
+            LiveStartupFailure::new(LiveStartupCode::PositionRebuildInvalid)
+        }
+    }
+}
+
+fn map_breaker_startup_failure(error: OrderSubmitError) -> LiveStartupFailure {
+    let code = match error.code() {
+        crate::service::order_gateway::OrderErrorCode::ExecutionHalted => {
+            LiveStartupCode::ActiveUnresolved
+        }
+        crate::service::order_gateway::OrderErrorCode::HaltMarkerPresent => {
+            LiveStartupCode::HaltMarkerPresent
+        }
+        _ => LiveStartupCode::HaltMarkerUnavailable,
+    };
+    LiveStartupFailure::new(code)
 }
 
 #[cfg(test)]
@@ -765,15 +951,18 @@ mod tests {
         cfg.bot.mock_trading = true;
         cfg.trading.execution_ledger_path = missing_parent.join("execution-ledger.jsonl");
         let markets = MarketCache::new(reqwest::Client::new(), cfg.site.gamma_api_base.clone());
+        let factory = CountingGatewayFactory::default();
 
-        let executor = OrderExecutor::new(cfg, RiskGuard::new(test_cfg()))
-            .await
-            .unwrap()
-            .with_markets(markets);
+        let executor =
+            OrderExecutor::new_with_test_gateway_factory(cfg, RiskGuard::new(test_cfg()), &factory)
+                .await
+                .unwrap()
+                .with_markets(markets);
 
         assert!(executor.live_order_components().is_none());
         assert!(executor.positions().is_empty());
         assert!(!missing_parent.exists());
+        assert_eq!(factory.constructions(), 0);
     }
 
     #[tokio::test]
@@ -785,8 +974,15 @@ mod tests {
         cfg.bot.mock_trading = false;
         cfg.credentials.signature_type = Some(0);
         cfg.trading.execution_ledger_path = missing_parent.join("execution-ledger.jsonl");
+        let factory = CountingGatewayFactory::default();
 
-        let error = match OrderExecutor::new(cfg, RiskGuard::new(test_cfg())).await {
+        let error = match OrderExecutor::new_with_test_gateway_factory(
+            cfg,
+            RiskGuard::new(test_cfg()),
+            &factory,
+        )
+        .await
+        {
             Ok(_) => panic!("malformed live credentials must fail local initialization"),
             Err(error) => error,
         };
@@ -799,6 +995,80 @@ mod tests {
             })
         ));
         assert!(!missing_parent.exists());
+        assert_eq!(factory.constructions(), 0);
+    }
+
+    #[tokio::test]
+    async fn live_initialization_rejects_malformed_api_secret_before_opening_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_parent = dir.path().join("secret-must-not-open-live-state");
+        let mut cfg = valid_live_config(&missing_parent);
+        cfg.credentials.api_secret = Some("not URL-safe base64".to_owned());
+        let factory = CountingGatewayFactory::default();
+
+        let error = match OrderExecutor::new_with_test_gateway_factory(
+            cfg,
+            RiskGuard::new(test_cfg()),
+            &factory,
+        )
+        .await
+        {
+            Ok(_) => panic!("malformed SDK secret must fail before ledger initialization"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error.downcast_ref::<OrderSubmitError>(),
+            Some(OrderSubmitError::Preflight {
+                stage: OrderStage::Initialization,
+                code: OrderErrorCode::MissingCredentials,
+            })
+        ));
+        assert!(!missing_parent.exists());
+        assert_eq!(factory.constructions(), 0);
+    }
+
+    #[tokio::test]
+    async fn live_initialization_rejects_invalid_header_passphrase_before_opening_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_parent = dir.path().join("passphrase-must-not-open-live-state");
+        let mut cfg = valid_live_config(&missing_parent);
+        cfg.credentials.api_passphrase = Some("invalid\nheader".to_owned());
+        let factory = CountingGatewayFactory::default();
+
+        let error = match OrderExecutor::new_with_test_gateway_factory(
+            cfg,
+            RiskGuard::new(test_cfg()),
+            &factory,
+        )
+        .await
+        {
+            Ok(_) => panic!("invalid SDK passphrase must fail before ledger initialization"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error.downcast_ref::<OrderSubmitError>(),
+            Some(OrderSubmitError::Preflight {
+                stage: OrderStage::Initialization,
+                code: OrderErrorCode::MissingCredentials,
+            })
+        ));
+        assert!(!missing_parent.exists());
+        assert_eq!(factory.constructions(), 0);
+    }
+
+    #[test]
+    fn public_live_credential_fixture_matches_sdk_parsing_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = valid_live_config(dir.path());
+
+        assert!(validate_live_configuration(&cfg).is_ok());
+        assert!(uuid::Uuid::parse_str(cfg.credentials.api_key.as_deref().unwrap()).is_ok());
+        assert!(URL_SAFE
+            .decode(cfg.credentials.api_secret.as_deref().unwrap())
+            .is_ok());
+        assert!(HeaderValue::from_str(cfg.credentials.api_passphrase.as_deref().unwrap()).is_ok());
     }
 
     #[tokio::test]
@@ -810,27 +1080,139 @@ mod tests {
             let ledger = ExecutionLedger::open_live(&cfg.trading.execution_ledger_path).unwrap();
             prepare_matched_entry(&ledger, order_id);
         }
-        let before = directory_bytes(dir.path());
+        let before = durable_state_bytes(dir.path());
+        let factory = CountingGatewayFactory::default();
 
-        let error = match OrderExecutor::new(cfg.clone(), RiskGuard::new(test_cfg())).await {
+        let error = match OrderExecutor::new_with_test_gateway_factory(
+            cfg.clone(),
+            RiskGuard::new(test_cfg()),
+            &factory,
+        )
+        .await
+        {
             Ok(_) => panic!("unresolved durable intent must block live startup"),
             Err(error) => error,
         };
 
-        assert!(matches!(
-            error.downcast_ref::<OrderSubmitError>(),
-            Some(OrderSubmitError::Halted {
-                code: OrderErrorCode::ExecutionHalted,
-            })
-        ));
+        let startup = error
+            .downcast_ref::<LiveStartupFailure>()
+            .expect("unresolved live state must be rendered as a startup diagnostic");
+        assert_eq!(startup.code(), LiveStartupCode::ActiveUnresolved);
         assert_eq!(
-            error
-                .downcast_ref::<OrderSubmitError>()
-                .and_then(OrderSubmitError::operator_instruction),
-            Some("do not restart until manual reconciliation is complete")
+            startup.instruction(),
+            "manual recovery and reconciliation are required before restart"
         );
-        assert_eq!(directory_bytes(dir.path()), before);
+        assert_eq!(durable_state_bytes(dir.path()), before);
         assert!(!cfg.trading.execution_halt_path.exists());
+        assert_eq!(factory.constructions(), 0);
+    }
+
+    #[tokio::test]
+    async fn locked_ledger_is_redacted_and_does_not_construct_a_gateway() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = valid_live_config(dir.path());
+        let held_ledger = ExecutionLedger::open_live(&cfg.trading.execution_ledger_path).unwrap();
+        let before = durable_state_bytes(dir.path());
+        let factory = CountingGatewayFactory::default();
+
+        let error = match OrderExecutor::new_with_test_gateway_factory(
+            cfg,
+            RiskGuard::new(test_cfg()),
+            &factory,
+        )
+        .await
+        {
+            Ok(_) => panic!("locked ledger must block startup"),
+            Err(error) => error,
+        };
+
+        let startup = error.downcast_ref::<LiveStartupFailure>().unwrap();
+        assert_eq!(startup.code(), LiveStartupCode::LedgerLocked);
+        assert_eq!(
+            startup.instruction(),
+            "stop startup and identify the other process holding the ledger lock"
+        );
+        assert_eq!(factory.constructions(), 0);
+        assert_eq!(durable_state_bytes(dir.path()), before);
+        drop(held_ledger);
+    }
+
+    #[tokio::test]
+    async fn corrupt_ledger_is_redacted_and_does_not_construct_or_heal() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = valid_live_config(dir.path());
+        std::fs::write(&cfg.trading.execution_ledger_path, b"{\n").unwrap();
+        let before = durable_state_bytes(dir.path());
+        let factory = CountingGatewayFactory::default();
+
+        let error = match OrderExecutor::new_with_test_gateway_factory(
+            cfg,
+            RiskGuard::new(test_cfg()),
+            &factory,
+        )
+        .await
+        {
+            Ok(_) => panic!("corrupt ledger must block startup"),
+            Err(error) => error,
+        };
+
+        let startup = error.downcast_ref::<LiveStartupFailure>().unwrap();
+        assert_eq!(startup.code(), LiveStartupCode::LedgerCorrupt);
+        assert_eq!(
+            startup.instruction(),
+            "preserve and inspect the ledger; do not edit it or retry startup"
+        );
+        assert_eq!(factory.constructions(), 0);
+        assert_eq!(durable_state_bytes(dir.path()), before);
+    }
+
+    #[tokio::test]
+    async fn mismatched_snapshot_is_redacted_and_does_not_construct_or_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = valid_live_config(dir.path());
+        std::fs::write(&cfg.trading.execution_ledger_path, b"").unwrap();
+        std::fs::write(
+            cfg.trading.execution_ledger_path.with_extension("jsonl.active.json"),
+            br#"{"schema_version":1,"sequence":1,"head_hash":"0000000000000000000000000000000000000000000000000000000000000000","active_intent":null}"#,
+        )
+        .unwrap();
+        let before = durable_state_bytes(dir.path());
+        let factory = CountingGatewayFactory::default();
+
+        let error = match OrderExecutor::new_with_test_gateway_factory(
+            cfg,
+            RiskGuard::new(test_cfg()),
+            &factory,
+        )
+        .await
+        {
+            Ok(_) => panic!("mismatched snapshot must block startup"),
+            Err(error) => error,
+        };
+
+        let startup = error.downcast_ref::<LiveStartupFailure>().unwrap();
+        assert_eq!(startup.code(), LiveStartupCode::SnapshotInconsistent);
+        assert_eq!(
+            startup.instruction(),
+            "inspect the snapshot and ledger; do not overwrite either file"
+        );
+        assert_eq!(factory.constructions(), 0);
+        assert_eq!(durable_state_bytes(dir.path()), before);
+    }
+
+    #[test]
+    fn invalid_position_rebuild_has_static_redacted_instruction() {
+        let startup = map_position_startup_code(PositionStoreErrorCode::PositionConflict);
+
+        assert_eq!(startup.code(), LiveStartupCode::PositionRebuildInvalid);
+        assert_eq!(
+            startup.instruction(),
+            "inspect durable position events; do not overwrite or heal them"
+        );
+        assert_eq!(
+            format!("{startup}"),
+            "live startup blocked (code=position_rebuild_invalid): inspect durable position events; do not overwrite or heal them"
+        );
     }
 
     #[test]
@@ -1100,15 +1482,13 @@ mod tests {
         cfg
     }
 
-    fn directory_bytes(path: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    fn durable_state_bytes(path: &std::path::Path) -> Vec<(String, Vec<u8>)> {
         let mut files = std::fs::read_dir(path)
             .unwrap()
-            .map(|entry| {
+            .filter_map(|entry| {
                 let entry = entry.unwrap();
-                (
-                    entry.file_name().to_string_lossy().into_owned(),
-                    std::fs::read(entry.path()).unwrap(),
-                )
+                let name = entry.file_name().to_string_lossy().into_owned();
+                (!name.ends_with(".lock")).then(|| (name, std::fs::read(entry.path()).unwrap()))
             })
             .collect::<Vec<_>>();
         files.sort_by(|left, right| left.0.cmp(&right.0));
@@ -1175,6 +1555,30 @@ mod tests {
         result: Result<OrderReceipt, OrderSubmitError>,
         calls: AtomicUsize,
         plans: Mutex<Vec<PlannedOrder>>,
+    }
+
+    #[derive(Default)]
+    struct CountingGatewayFactory {
+        constructions: AtomicUsize,
+    }
+
+    impl CountingGatewayFactory {
+        fn constructions(&self) -> usize {
+            self.constructions.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl LiveGatewayFactory for CountingGatewayFactory {
+        async fn build(&self, _cfg: &AppConfig) -> Result<Arc<dyn OrderGateway>, OrderSubmitError> {
+            self.constructions.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::new(FakeGateway::returning(Err(
+                OrderSubmitError::Preflight {
+                    stage: OrderStage::Initialization,
+                    code: OrderErrorCode::SdkBuild,
+                },
+            ))))
+        }
     }
 
     impl FakeGateway {

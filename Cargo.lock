@@ -3337,6 +3337,7 @@ dependencies = [
  "alloy-sol-types 1.6.1",
  "anyhow",
  "async-trait",
+ "base64",
  "chrono",
  "clap",
  "crossterm",
