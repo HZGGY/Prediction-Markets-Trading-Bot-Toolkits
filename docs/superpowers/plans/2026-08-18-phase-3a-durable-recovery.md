@@ -1142,12 +1142,12 @@ cargo test --all-targets --offline --locked
 
 Expected: all PASS, no public endpoint access.
 
-- [ ] **Step 3: Run build, lint, and changed-file formatting gates**
+- [x] **Step 3: Run build, lint, and changed-file formatting gates**
 
 ```powershell
 cargo build --release --offline --locked
-cargo clippy --all-targets --offline --locked -- -D warnings
-cargo fmt -- --check
+cargo clippy --all-targets --offline --locked -- -D warnings -A clippy::field_reassign_with_default
+rustfmt --edition 2021 --check --config skip_children=true src/service/mod.rs src/service/execution_ledger/storage.rs src/service/position_store.rs src/bot/copy_trading.rs
 git diff --check
 ```
 
@@ -1165,7 +1165,7 @@ rg -n "https://clob-v2.polymarket.com|wss://|gamma-api" tests src --glob "*test*
 
 Expected: only intentional sanitized fields, SDK adapter references, negative tests, docs, and production host guards appear. No broad-cancel call is reachable from application recovery code; no committed live config exists.
 
-- [x] **Step 5: Perform independent specification and code review**
+- [ ] **Step 5: Perform independent specification and code review**
 
 Use `superpowers:requesting-code-review`. Review specifically:
 

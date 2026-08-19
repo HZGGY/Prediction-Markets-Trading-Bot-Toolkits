@@ -75,6 +75,109 @@
 //! }
 //! ```
 //!
+//! Durable ledger mutation is internal orchestration state. Downstream crates
+//! cannot forge reconciliation, recovery, acknowledgement, or cleanup events:
+//!
+//! ```compile_fail,E0624
+//! use polymarket_toolkits::service::execution_ledger::{
+//!     ExecutionLedger, IntentId, LedgerPayload, MatchedAmounts,
+//! };
+//!
+//! fn append_reconciled_match(
+//!     ledger: &ExecutionLedger,
+//!     intent_id: IntentId,
+//!     amounts: MatchedAmounts,
+//! ) {
+//!     let _ = ledger.append(intent_id, LedgerPayload::ReconciledMatched(amounts));
+//! }
+//! ```
+//!
+//! ```compile_fail,E0624
+//! use polymarket_toolkits::service::execution_ledger::{
+//!     ExecutionLedger, IntentId, LedgerPayload, TerminalNoFillStatus,
+//! };
+//!
+//! fn append_reconciled_no_fill(
+//!     ledger: &ExecutionLedger,
+//!     intent_id: IntentId,
+//!     status: TerminalNoFillStatus,
+//! ) {
+//!     let _ = ledger.append(intent_id, LedgerPayload::ReconciledNoFill { status });
+//! }
+//! ```
+//!
+//! ```compile_fail,E0624
+//! use polymarket_toolkits::service::execution_ledger::{
+//!     EventId, ExecutionLedger, IntentId, LedgerPayload,
+//! };
+//!
+//! fn append_recovery_applied(
+//!     ledger: &ExecutionLedger,
+//!     intent_id: IntentId,
+//!     position_event_id: EventId,
+//! ) {
+//!     let _ = ledger.append(intent_id, LedgerPayload::RecoveryApplied { position_event_id });
+//! }
+//! ```
+//!
+//! ```compile_fail,E0624
+//! use polymarket_toolkits::service::execution_ledger::{
+//!     AcknowledgeReason, ExecutionLedger, IntentId, LedgerPayload,
+//! };
+//!
+//! fn append_acknowledged(
+//!     ledger: &ExecutionLedger,
+//!     intent_id: IntentId,
+//!     reason: AcknowledgeReason,
+//! ) {
+//!     let _ = ledger.append(intent_id, LedgerPayload::Acknowledged { reason });
+//! }
+//! ```
+//!
+//! ```compile_fail,E0624
+//! use polymarket_toolkits::service::execution_ledger::{
+//!     ExecutionLedger, IntentId, LedgerPayload,
+//! };
+//!
+//! fn append_cleanup_completed(ledger: &ExecutionLedger, intent_id: IntentId) {
+//!     let _ = ledger.append(intent_id, LedgerPayload::HaltMarkerCleanupCompleted);
+//! }
+//! ```
+//!
+//! A durable [`position_store::PositionStore`] is likewise constructed and
+//! mutated only by internal executor/recovery orchestration:
+//!
+//! ```compile_fail,E0624
+//! use std::sync::Arc;
+//! use polymarket_toolkits::service::{
+//!     execution_ledger::ExecutionLedger,
+//!     position_store::PositionStore,
+//! };
+//!
+//! fn construct_durable_store(ledger: Arc<ExecutionLedger>) {
+//!     let _ = PositionStore::from_ledger(ledger);
+//! }
+//! ```
+//!
+//! ```compile_fail,E0624
+//! use polymarket_toolkits::service::position_store::{OpenPosition, PositionStore};
+//!
+//! fn mutate_durable_open(store: &PositionStore, position: OpenPosition) {
+//!     let _ = store.apply_open(position);
+//! }
+//! ```
+//!
+//! ```compile_fail,E0624
+//! use polymarket_toolkits::service::{
+//!     execution_ledger::PositionClose,
+//!     position_store::PositionStore,
+//! };
+//!
+//! fn mutate_durable_close(store: &PositionStore, close: PositionClose) {
+//!     let _ = store.apply_close(close);
+//! }
+//! ```
+//!
 //! Recovery is likewise an internal exact-only capability. Downstream crates
 //! cannot obtain its neutral trait or construct the official SDK adapter:
 //!

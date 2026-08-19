@@ -193,7 +193,9 @@ impl PositionStore {
         })
     }
 
-    pub fn from_ledger(ledger: Arc<ExecutionLedger>) -> Result<Arc<Self>, PositionStoreError> {
+    pub(crate) fn from_ledger(
+        ledger: Arc<ExecutionLedger>,
+    ) -> Result<Arc<Self>, PositionStoreError> {
         for position in ledger.projection().positions.values() {
             if position.is_open() {
                 OpenPosition::from_durable(position)?;
@@ -213,7 +215,10 @@ impl PositionStore {
         }
     }
 
-    pub fn apply_open(&self, position: OpenPosition) -> Result<PositionApply, PositionStoreError> {
+    pub(crate) fn apply_open(
+        &self,
+        position: OpenPosition,
+    ) -> Result<PositionApply, PositionStoreError> {
         let _guard = self.mutation.lock();
         match &self.backend {
             PositionBackend::Paper(positions) => {
@@ -241,7 +246,10 @@ impl PositionStore {
         }
     }
 
-    pub fn apply_close(&self, close: PositionClose) -> Result<PositionApply, PositionStoreError> {
+    pub(crate) fn apply_close(
+        &self,
+        close: PositionClose,
+    ) -> Result<PositionApply, PositionStoreError> {
         let _guard = self.mutation.lock();
         match &self.backend {
             PositionBackend::Paper(positions) => {

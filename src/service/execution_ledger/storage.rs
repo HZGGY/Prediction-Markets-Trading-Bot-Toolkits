@@ -203,7 +203,7 @@ impl ExecutionLedger {
         }
     }
 
-    pub fn append(
+    pub(crate) fn append(
         &self,
         intent_id: IntentId,
         payload: LedgerPayload,

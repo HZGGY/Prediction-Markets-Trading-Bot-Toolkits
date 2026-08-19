@@ -153,9 +153,11 @@ impl CopyRuntimeFactory for ProductionRuntimeFactory {
         http: &RuntimeHttp,
         cfg: &AppConfig,
     ) -> OrderExecutor {
+        #[cfg(not(test))]
+        let RuntimeHttp::Production(http) = http;
+        #[cfg(test)]
         let http = match http {
             RuntimeHttp::Production(http) => http,
-            #[cfg(test)]
             RuntimeHttp::Inert => panic!("production factory received inert HTTP"),
         };
         executor.with_markets(MarketCache::new(
@@ -165,9 +167,11 @@ impl CopyRuntimeFactory for ProductionRuntimeFactory {
     }
 
     fn midpoint(&self, http: &RuntimeHttp, cfg: &AppConfig) -> Arc<dyn MidpriceSource> {
+        #[cfg(not(test))]
+        let RuntimeHttp::Production(http) = http;
+        #[cfg(test)]
         let http = match http {
             RuntimeHttp::Production(http) => http,
-            #[cfg(test)]
             RuntimeHttp::Inert => panic!("production factory received inert HTTP"),
         };
         Arc::new(ClobMidpriceSource::new(
