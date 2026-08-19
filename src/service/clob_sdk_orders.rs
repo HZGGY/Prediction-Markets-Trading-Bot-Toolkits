@@ -518,6 +518,7 @@ mod tests {
 
     use alloy_sol_types::SolStruct as _;
     use alloy_sol_types_v1::{eip712_domain, SolStruct as _};
+    use chrono::{TimeZone as _, Utc};
     use polymarket_client_sdk_v2::clob::types::response::PostOrderResponse;
     use polymarket_client_sdk_v2::clob::types::{
         OrderSignature, OrderStatusType, OrderType as SdkOrderType, OrderV2, Side as SdkSide,
@@ -530,8 +531,10 @@ mod tests {
     use crate::models::{OrderType, PlannedOrder, VenueId};
     use crate::service::execution_circuit_breaker::ExecutionCircuitBreaker;
     use crate::service::execution_ledger::{
-        ExecutionLedger, IntentPurpose, LedgerEvent, LedgerPayload, OrderId, PositionSeed,
+        ExecutionLedger, IntentPurpose, LedgerEvent, LedgerPayload, OrderId, OrderSide,
+        PositionSeed, TokenId, Venue,
     };
+    use crate::service::position_store::{OpenPosition, PositionStore};
 
     use super::*;
 
@@ -740,6 +743,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ledger_path = dir.path().join("execution-ledger.jsonl");
         let ledger = Arc::new(ExecutionLedger::open_live(&ledger_path).unwrap());
+        let positions = PositionStore::from_ledger(Arc::clone(&ledger)).unwrap();
         let breaker = ExecutionCircuitBreaker::new_live(
             Arc::clone(&ledger),
             dir.path().join("execution-halt.json"),
@@ -756,7 +760,34 @@ mod tests {
                 &gateway,
                 &planned_order(false),
                 fixture_intent_purpose(),
-                |_receipt| Ok(()),
+                |receipt| {
+                    let (intent_id, position_id) = positions
+                        .pending_entry_identity(&receipt.order_id)
+                        .ok_or(())?;
+                    positions
+                        .apply_open(OpenPosition {
+                            position_id,
+                            opening_intent_id: intent_id,
+                            opening_order_id: receipt.order_id.clone(),
+                            venue: Venue::PolymarketClob,
+                            token_id: TokenId::from_decimal("12345").ok_or(())?,
+                            slug: "journal-loopback".to_owned(),
+                            category: "testing".to_owned(),
+                            tags: vec!["offline".to_owned()],
+                            neg_risk: false,
+                            side: OrderSide::Buy,
+                            shares_micros: receipt.filled_shares_micros,
+                            usd_notional_micros: receipt.filled_usd_micros,
+                            take_profit_bps: 1_000,
+                            stop_loss_bps: 500,
+                            opened_at: Utc
+                                .with_ymd_and_hms(2026, 8, 18, 12, 0, 0)
+                                .single()
+                                .ok_or(())?,
+                        })
+                        .map(|_| ())
+                        .map_err(|_| ())
+                },
             )
             .await
             .unwrap();

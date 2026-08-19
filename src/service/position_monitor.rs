@@ -229,6 +229,7 @@ mod tests {
     use crate::service::order_executor::test_support;
     use crate::service::order_gateway::{
         OrderErrorCode, OrderGateway, OrderReceipt, OrderSubmitError, PrePostJournal,
+        PreparedOrderIdentity,
     };
     use crate::service::risk_guard::RiskGuard;
 
@@ -356,11 +357,11 @@ mod tests {
 
     #[tokio::test]
     async fn matched_sell_exit_closes_position_with_fok_for_open_shares() {
-        let positions = PositionStore::new_paper();
         let position = pos(0.50, 30.0, 20.0, Side::Buy);
-        positions.apply_open(position.clone()).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let breaker = test_breaker(dir.path().join("execution-halt.json"));
+        let marker = dir.path().join("execution-halt.json");
+        let (ledger, positions) = live_positions_with_open_entry(dir.path(), &position);
+        let breaker = ExecutionCircuitBreaker::new_live(ledger, marker).unwrap();
         let gateway = Arc::new(FakeGateway::returning(Ok(OrderReceipt {
             order_id: OrderId::from_hex(format!("0x{}", "31".repeat(32))).unwrap(),
             filled_shares_micros: 100_000_000,
@@ -465,11 +466,11 @@ mod tests {
 
     #[tokio::test]
     async fn rejected_exit_keeps_position_and_breaker_open() {
-        let positions = PositionStore::new_paper();
         let position = pos(0.50, 30.0, 20.0, Side::Buy);
-        positions.apply_open(position.clone()).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let breaker = test_breaker(dir.path().join("execution-halt.json"));
+        let marker = dir.path().join("execution-halt.json");
+        let (ledger, positions) = live_positions_with_open_entry(dir.path(), &position);
+        let breaker = ExecutionCircuitBreaker::new_live(ledger, marker).unwrap();
         let gateway = Arc::new(FakeGateway::returning(Err(OrderSubmitError::Rejected {
             http_status: Some(409),
             code: OrderErrorCode::HttpRejected,
@@ -534,12 +535,11 @@ mod tests {
 
     #[tokio::test]
     async fn uncertain_exit_keeps_position_persists_halt_and_blocks_later_entry() {
-        let positions = PositionStore::new_paper();
         let position = pos(0.50, 30.0, 20.0, Side::Buy);
-        positions.apply_open(position.clone()).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("execution-halt.json");
-        let breaker = test_breaker(marker.clone());
+        let (ledger, positions) = live_positions_with_open_entry(dir.path(), &position);
+        let breaker = ExecutionCircuitBreaker::new_live(ledger, marker.clone()).unwrap();
         let gateway_fake = Arc::new(FakeGateway::returning(Err(OrderSubmitError::Uncertain {
             code: OrderErrorCode::PostTransport,
         })));
@@ -661,12 +661,102 @@ mod tests {
         async fn submit_fok(
             &self,
             planned: &PlannedOrder,
-            _journal: &dyn PrePostJournal,
+            journal: &dyn PrePostJournal,
         ) -> Result<OrderReceipt, OrderSubmitError> {
+            if !matches!(self.result, Err(OrderSubmitError::Preflight { .. })) {
+                journal.before_post(&prepared_identity_for(planned, &self.result))?;
+            }
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.plans.lock().push(planned.clone());
             self.result.clone()
         }
+    }
+
+    fn prepared_identity_for(
+        planned: &PlannedOrder,
+        result: &Result<OrderReceipt, OrderSubmitError>,
+    ) -> PreparedOrderIdentity {
+        let order_id = match result {
+            Ok(receipt) => receipt.order_id.clone(),
+            Err(_) => OrderId::from_hex(format!("0x{}", "ee".repeat(32))).unwrap(),
+        };
+        let shares_micros = (planned.shares * 1_000_000.0) as u128;
+        let usd_micros = result
+            .as_ref()
+            .ok()
+            .map(|receipt| receipt.filled_usd_micros)
+            .unwrap_or_else(|| (planned.usd_notional * 1_000_000.0) as u128);
+        let (expected_maker_micros, expected_taker_micros) = match planned.side {
+            Side::Buy => (usd_micros, shares_micros),
+            Side::Sell => (shares_micros, usd_micros),
+        };
+        PreparedOrderIdentity {
+            order_id,
+            protocol_version: ORDER_PROTOCOL_VERSION,
+            venue: Venue::PolymarketClob,
+            token_id: TokenId::from_decimal(&planned.token_id).unwrap(),
+            neg_risk: planned.neg_risk,
+            side: match planned.side {
+                Side::Buy => OrderSide::Buy,
+                Side::Sell => OrderSide::Sell,
+            },
+            order_type: LedgerOrderType::Fok,
+            expected_maker_micros,
+            expected_taker_micros,
+        }
+    }
+
+    fn live_positions_with_open_entry(
+        path: &std::path::Path,
+        position: &OpenPosition,
+    ) -> (Arc<ExecutionLedger>, Arc<PositionStore>) {
+        let ledger =
+            Arc::new(ExecutionLedger::open_live(path.join("execution-ledger.jsonl")).unwrap());
+        let positions = PositionStore::from_ledger(Arc::clone(&ledger)).unwrap();
+        ledger
+            .append(
+                position.opening_intent_id,
+                LedgerPayload::IntentPrepared(PreparedIntent {
+                    order_id: position.opening_order_id.clone(),
+                    protocol_version: ORDER_PROTOCOL_VERSION,
+                    venue: position.venue,
+                    token_id: position.token_id,
+                    neg_risk: position.neg_risk,
+                    side: position.side,
+                    order_type: LedgerOrderType::Fok,
+                    expected_maker_micros: position.usd_notional_micros,
+                    expected_taker_micros: position.shares_micros,
+                    source_hash: None,
+                    purpose: IntentPurpose::Entry(PositionSeed {
+                        slug: position.slug.clone(),
+                        category: position.category.clone(),
+                        tags: position.tags.clone(),
+                        take_profit_bps: position.take_profit_bps,
+                        stop_loss_bps: position.stop_loss_bps,
+                    }),
+                }),
+            )
+            .unwrap();
+        ledger
+            .append(position.opening_intent_id, LedgerPayload::SubmitStarted)
+            .unwrap();
+        ledger
+            .append(
+                position.opening_intent_id,
+                LedgerPayload::RemoteMatched(MatchedAmounts {
+                    shares_micros: position.shares_micros,
+                    usd_micros: position.usd_notional_micros,
+                }),
+            )
+            .unwrap();
+        positions.apply_open(position.clone()).unwrap();
+        ledger
+            .append(
+                position.opening_intent_id,
+                LedgerPayload::SubmissionCommitted,
+            )
+            .unwrap();
+        (ledger, positions)
     }
 
     struct ApplyCloseBeforeReceiptGateway {

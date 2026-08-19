@@ -498,6 +498,7 @@ mod tests {
     use crate::service::onchain::RawLog;
     use crate::service::order_gateway::{
         OrderErrorCode, OrderGateway, OrderReceipt, OrderStage, OrderSubmitError, PrePostJournal,
+        PreparedOrderIdentity,
     };
     use crate::service::parse::{decode_whale_trade, order_filled_topic};
     use crate::service::position_store::PositionStore;
@@ -674,10 +675,9 @@ mod tests {
         let (mut cfg, markets, server) = fixture_runtime(true).await;
         let halt_dir = tempfile::tempdir().unwrap();
         cfg.trading.execution_halt_path = halt_dir.path().join("execution-halt.json");
-        let (ledger, positions, breaker) =
+        let (_ledger, positions, breaker) =
             test_live_components(cfg.trading.execution_halt_path.clone());
         let order_id = OrderId::from_hex(format!("0x{}", "ab".repeat(32))).unwrap();
-        prepare_matched_entry(&ledger, order_id.clone());
         let gateway = Arc::new(FakeGateway::returning(Ok(OrderReceipt {
             order_id: order_id.clone(),
             filled_shares_micros: 39_000_000,
@@ -974,11 +974,48 @@ mod tests {
         async fn submit_fok(
             &self,
             planned: &PlannedOrder,
-            _journal: &dyn PrePostJournal,
+            journal: &dyn PrePostJournal,
         ) -> Result<OrderReceipt, OrderSubmitError> {
+            if !matches!(self.result, Err(OrderSubmitError::Preflight { .. })) {
+                journal.before_post(&prepared_identity_for(planned, &self.result))?;
+            }
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.plans.lock().push(planned.clone());
             self.result.clone()
+        }
+    }
+
+    fn prepared_identity_for(
+        planned: &PlannedOrder,
+        result: &Result<OrderReceipt, OrderSubmitError>,
+    ) -> PreparedOrderIdentity {
+        let order_id = match result {
+            Ok(receipt) => receipt.order_id.clone(),
+            Err(_) => OrderId::from_hex(format!("0x{}", "dd".repeat(32))).unwrap(),
+        };
+        let shares_micros = (planned.shares * 1_000_000.0) as u128;
+        let usd_micros = result
+            .as_ref()
+            .ok()
+            .map(|receipt| receipt.filled_usd_micros)
+            .unwrap_or_else(|| (planned.usd_notional * 1_000_000.0) as u128);
+        let (expected_maker_micros, expected_taker_micros) = match planned.side {
+            Side::Buy => (usd_micros, shares_micros),
+            Side::Sell => (shares_micros, usd_micros),
+        };
+        PreparedOrderIdentity {
+            order_id,
+            protocol_version: ORDER_PROTOCOL_VERSION,
+            venue: Venue::PolymarketClob,
+            token_id: TokenId::from_decimal(&planned.token_id).unwrap(),
+            neg_risk: planned.neg_risk,
+            side: match planned.side {
+                Side::Buy => OrderSide::Buy,
+                Side::Sell => OrderSide::Sell,
+            },
+            order_type: LedgerOrderType::Fok,
+            expected_maker_micros,
+            expected_taker_micros,
         }
     }
 

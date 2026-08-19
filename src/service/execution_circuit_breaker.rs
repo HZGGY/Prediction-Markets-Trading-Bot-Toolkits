@@ -13,13 +13,34 @@ use serde::{Deserialize, Serialize};
 use crate::{
     models::PlannedOrder,
     service::execution_ledger::{
-        ExecutionLedger, IntentId, IntentPurpose, LedgerPayload, PreparedIntent,
+        ExecutionLedger, IntentId, IntentPurpose, LedgerPayload, MatchedAmounts, PreparedIntent,
+        RemoteRejectCode, UncertainCode,
     },
     service::order_gateway::{
         OrderErrorCode, OrderGateway, OrderReceipt, OrderStage, OrderSubmitError, PrePostJournal,
         PreparedOrderIdentity,
     },
 };
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CrashPoint {
+    BeforePreparedAppend,
+    AfterPreparedAppend,
+    BeforeSubmitStartedAppend,
+    AfterSubmitStartedAppend,
+    BeforePostInvocation,
+    AfterPostInvocation,
+    BeforeRemoteEvidenceAppend,
+    AfterRemoteEvidenceAppend,
+    BeforePositionEvent,
+    AfterPositionEvent,
+    BeforeTerminalAppend,
+    AfterTerminalAppend,
+}
+
+#[cfg(test)]
+type CrashHook = Arc<dyn Fn(CrashPoint) + Send + Sync>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionHaltMarker {
@@ -37,6 +58,8 @@ pub struct ExecutionCircuitBreaker {
     ledger: Arc<ExecutionLedger>,
     path: PathBuf,
     submit_lock: tokio::sync::Mutex<()>,
+    #[cfg(test)]
+    crash_hook: parking_lot::Mutex<Option<CrashHook>>,
 }
 
 impl ExecutionCircuitBreaker {
@@ -74,6 +97,8 @@ impl ExecutionCircuitBreaker {
             ledger,
             path,
             submit_lock: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            crash_hook: parking_lot::Mutex::new(None),
         }))
     }
 
@@ -88,6 +113,18 @@ impl ExecutionCircuitBreaker {
             })
         } else {
             Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn install_crash_hook(&self, hook: CrashHook) {
+        *self.crash_hook.lock() = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn crash(&self, point: CrashPoint) {
+        if let Some(hook) = self.crash_hook.lock().as_ref() {
+            hook(point);
         }
     }
 
@@ -166,7 +203,41 @@ impl ExecutionCircuitBreaker {
             LedgerSubmissionJournal::new(self, planned, IntentId(uuid::Uuid::new_v4()), purpose);
         match gateway.submit_fok(planned, &journal).await {
             Ok(receipt) => {
-                if complete_post_fill(&receipt).is_err() {
+                #[cfg(test)]
+                self.crash(CrashPoint::BeforeRemoteEvidenceAppend);
+                let completed = journal.started()
+                    && self
+                        .ledger
+                        .append(
+                            journal.intent_id,
+                            LedgerPayload::RemoteMatched(MatchedAmounts {
+                                shares_micros: receipt.filled_shares_micros,
+                                usd_micros: receipt.filled_usd_micros,
+                            }),
+                        )
+                        .is_ok()
+                    && {
+                        #[cfg(test)]
+                        self.crash(CrashPoint::AfterRemoteEvidenceAppend);
+                        #[cfg(test)]
+                        self.crash(CrashPoint::BeforePositionEvent);
+                        let completed = complete_post_fill(&receipt).is_ok();
+                        #[cfg(test)]
+                        self.crash(CrashPoint::AfterPositionEvent);
+                        completed
+                    }
+                    && {
+                        #[cfg(test)]
+                        self.crash(CrashPoint::BeforeTerminalAppend);
+                        let completed = self
+                            .ledger
+                            .append(journal.intent_id, LedgerPayload::SubmissionCommitted)
+                            .is_ok();
+                        #[cfg(test)]
+                        self.crash(CrashPoint::AfterTerminalAppend);
+                        completed
+                    };
+                if !completed {
                     let error = self
                         .halt_uncertain(planned, OrderErrorCode::ExecutionHalted)
                         .err()
@@ -177,12 +248,73 @@ impl ExecutionCircuitBreaker {
                 }
                 Ok(receipt)
             }
+            Err(error @ OrderSubmitError::Rejected { code, .. }) if journal.started() => {
+                let completed = self
+                    .ledger
+                    .append(
+                        journal.intent_id,
+                        LedgerPayload::RemoteRejected {
+                            code: remote_reject_code(code),
+                        },
+                    )
+                    .is_ok()
+                    && self
+                        .ledger
+                        .append(journal.intent_id, LedgerPayload::SubmissionCommittedNoFill)
+                        .is_ok();
+                if !completed {
+                    let error = self
+                        .halt_uncertain(planned, OrderErrorCode::ExecutionHalted)
+                        .err()
+                        .unwrap_or(OrderSubmitError::Halted {
+                            code: OrderErrorCode::ExecutionHalted,
+                        });
+                    return Err(error);
+                }
+                Err(error)
+            }
             Err(error @ OrderSubmitError::Uncertain { code }) => {
+                if journal.started()
+                    && self
+                        .ledger
+                        .append(
+                            journal.intent_id,
+                            LedgerPayload::RemoteUncertain {
+                                code: remote_uncertain_code(code),
+                            },
+                        )
+                        .is_err()
+                {
+                    let error = self
+                        .halt_uncertain(planned, OrderErrorCode::ExecutionHalted)
+                        .err()
+                        .unwrap_or(OrderSubmitError::Halted {
+                            code: OrderErrorCode::ExecutionHalted,
+                        });
+                    return Err(error);
+                }
                 self.halt_uncertain(planned, code)?;
                 Err(error)
             }
             Err(error) => Err(error),
         }
+    }
+}
+
+fn remote_reject_code(code: OrderErrorCode) -> RemoteRejectCode {
+    match code {
+        OrderErrorCode::HttpRejected => RemoteRejectCode::HttpRejected,
+        _ => RemoteRejectCode::ServerRejected,
+    }
+}
+
+fn remote_uncertain_code(code: OrderErrorCode) -> UncertainCode {
+    match code {
+        OrderErrorCode::PostTimeout => UncertainCode::Timeout,
+        OrderErrorCode::MalformedResponse => UncertainCode::MalformedResponse,
+        OrderErrorCode::NonFinalStatus => UncertainCode::NonFinalStatus,
+        OrderErrorCode::AmountMismatch => UncertainCode::AmountMismatch,
+        _ => UncertainCode::Transport,
     }
 }
 
@@ -192,6 +324,7 @@ struct LedgerSubmissionJournal<'a> {
     intent_id: IntentId,
     purpose: IntentPurpose,
     called: AtomicBool,
+    started: AtomicBool,
 }
 
 impl<'a> LedgerSubmissionJournal<'a> {
@@ -207,7 +340,12 @@ impl<'a> LedgerSubmissionJournal<'a> {
             intent_id,
             purpose,
             called: AtomicBool::new(false),
+            started: AtomicBool::new(false),
         }
+    }
+
+    fn started(&self) -> bool {
+        self.started.load(Ordering::Acquire)
     }
 
     fn fatal(&self) -> OrderSubmitError {
@@ -241,17 +379,30 @@ impl PrePostJournal for LedgerSubmissionJournal<'_> {
             source_hash: None,
             purpose: self.purpose.clone(),
         };
+        #[cfg(test)]
+        self.breaker.crash(CrashPoint::BeforePreparedAppend);
         self.breaker
             .ledger
             .append(self.intent_id, LedgerPayload::IntentPrepared(prepared))
             .map_err(|_| self.fatal())?;
+        #[cfg(test)]
+        self.breaker.crash(CrashPoint::AfterPreparedAppend);
+        #[cfg(test)]
+        self.breaker.crash(CrashPoint::BeforeSubmitStartedAppend);
         self.breaker
             .ledger
             .append(self.intent_id, LedgerPayload::SubmitStarted)
             .map_err(|_| self.fatal())?;
+        #[cfg(test)]
+        self.breaker.crash(CrashPoint::AfterSubmitStartedAppend);
+        self.started.store(true, Ordering::Release);
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/support/execution_crash_matrix.rs"]
+mod execution_crash_matrix;
 
 #[cfg(test)]
 mod tests {
@@ -640,8 +791,9 @@ mod tests {
         async fn submit_fok(
             &self,
             _planned: &PlannedOrder,
-            _journal: &dyn PrePostJournal,
+            journal: &dyn PrePostJournal,
         ) -> Result<OrderReceipt, OrderSubmitError> {
+            journal.before_post(&fixture_identity())?;
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(OrderReceipt {
                 order_id: crate::service::execution_ledger::OrderId::from_hex(format!(

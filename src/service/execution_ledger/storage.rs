@@ -104,6 +104,8 @@ pub struct ExecutionLedger {
     parent_lock_file: File,
     durability: Arc<dyn DurabilityOps>,
     paths: LedgerPaths,
+    #[cfg(test)]
+    crash_hook: Mutex<Option<LedgerCrashHook>>,
 }
 
 impl fmt::Debug for ExecutionLedger {
@@ -120,6 +122,16 @@ struct LedgerState {
     projection: LedgerProjection,
     fatal: bool,
 }
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LedgerCrashPoint {
+    BeforeSnapshotReplace,
+    AfterSnapshotReplace,
+}
+
+#[cfg(test)]
+type LedgerCrashHook = Arc<dyn Fn(LedgerCrashPoint) + Send + Sync>;
 
 impl ExecutionLedger {
     pub fn open_live(path: impl AsRef<Path>) -> Result<Self, LedgerError> {
@@ -171,7 +183,21 @@ impl ExecutionLedger {
             parent_lock_file,
             durability,
             paths,
+            #[cfg(test)]
+            crash_hook: Mutex::new(None),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_crash_hook(&self, hook: LedgerCrashHook) {
+        *self.crash_hook.lock() = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn crash(&self, point: LedgerCrashPoint) {
+        if let Some(hook) = self.crash_hook.lock().as_ref() {
+            hook(point);
+        }
     }
 
     pub fn append(
@@ -225,8 +251,14 @@ impl ExecutionLedger {
             return Err(LedgerError::new(LedgerErrorCode::SyncFailed));
         }
         let mut snapshot_guard = if let Some(snapshot) = pending_snapshot {
+            #[cfg(test)]
+            self.crash(LedgerCrashPoint::BeforeSnapshotReplace);
             match persist_snapshot(&self.paths, &snapshot, self.durability.as_ref()) {
-                Ok(guard) => Some(guard),
+                Ok(guard) => {
+                    #[cfg(test)]
+                    self.crash(LedgerCrashPoint::AfterSnapshotReplace);
+                    Some(guard)
+                }
                 Err(error) => {
                     state.fatal = true;
                     return Err(error);
