@@ -1165,7 +1165,7 @@ rg -n "https://clob-v2.polymarket.com|wss://|gamma-api" tests src --glob "*test*
 
 Expected: only intentional sanitized fields, SDK adapter references, negative tests, docs, and production host guards appear. No broad-cancel call is reachable from application recovery code; no committed live config exists.
 
-- [ ] **Step 5: Perform independent specification and code review**
+- [x] **Step 5: Perform independent specification and code review**
 
 Use `superpowers:requesting-code-review`. Review specifically:
 
@@ -1181,7 +1181,7 @@ Use `superpowers:requesting-code-review`. Review specifically:
 
 Address every High/Critical issue, rerun affected gates, and preserve the review result.
 
-- [ ] **Step 6: Update Obsidian with safe project facts only**
+- [x] **Step 6: Update Obsidian with safe project facts only**
 
 Record architecture, implementation commit IDs, verified test counts, review outcome, and remaining Phase 3B–3D boundary. Do not store ledger contents, complete order IDs, credentials, signatures, bodies, or raw terminal output.
 
@@ -1207,4 +1207,4 @@ git commit -m "docs: complete phase 3a recovery guidance"
 - [x] Local commands do not load credentials; network commands have narrow explicit authority.
 - [x] Marker deletion cannot bypass an active ledger intent.
 - [x] All acceptance tests are offline or loopback and use no real credentials.
-- [ ] English/Chinese docs and safe Obsidian project memory state that Phase 3A is not live authorization.
+- [x] English/Chinese docs and safe Obsidian project memory state that Phase 3A is not live authorization.
