@@ -2,14 +2,17 @@ use std::{error::Error, fmt};
 
 use async_trait::async_trait;
 
-use crate::models::PlannedOrder;
+use crate::{
+    models::PlannedOrder,
+    service::execution_ledger::{OrderId, OrderSide, OrderType, TokenId, Venue},
+};
 
 pub const HALT_MARKER_IO_INSTRUCTION: &str =
     "do not restart until manual reconciliation is complete";
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct OrderReceipt {
-    pub order_id: String,
+    pub order_id: OrderId,
     pub filled_shares_micros: u128,
     pub filled_usd_micros: u128,
 }
@@ -33,7 +36,7 @@ impl fmt::Debug for OrderReceipt {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("OrderReceipt")
-            .field("order_id_hint", &order_id_hint(&self.order_id))
+            .field("order_id", &self.order_id)
             .field("filled_shares_micros", &self.filled_shares_micros)
             .field("filled_usd_micros", &self.filled_usd_micros)
             .finish()
@@ -79,6 +82,7 @@ pub enum OrderErrorCode {
     SdkBuild,
     SdkSign,
     ExactOrderIdUnavailable,
+    ResponseOrderIdMismatch,
     HttpRejected,
     ServerRejected,
     PostTimeout,
@@ -161,9 +165,30 @@ impl fmt::Display for OrderSubmitError {
 
 impl Error for OrderSubmitError {}
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedOrderIdentity {
+    pub order_id: OrderId,
+    pub protocol_version: u8,
+    pub venue: Venue,
+    pub token_id: TokenId,
+    pub neg_risk: bool,
+    pub side: OrderSide,
+    pub order_type: OrderType,
+    pub expected_maker_micros: u128,
+    pub expected_taker_micros: u128,
+}
+
+pub trait PrePostJournal: Send + Sync {
+    fn before_post(&self, identity: &PreparedOrderIdentity) -> Result<(), OrderSubmitError>;
+}
+
 #[async_trait]
 pub trait OrderGateway: Send + Sync {
-    async fn submit_fok(&self, planned: &PlannedOrder) -> Result<OrderReceipt, OrderSubmitError>;
+    async fn submit_fok(
+        &self,
+        planned: &PlannedOrder,
+        journal: &dyn PrePostJournal,
+    ) -> Result<OrderReceipt, OrderSubmitError>;
 }
 
 #[cfg(test)]
@@ -171,9 +196,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn receipt_reuses_the_closed_order_id_type() {
+        let order_id = OrderId::from_hex(format!("0x{}", "11".repeat(32))).unwrap();
+        let receipt = OrderReceipt {
+            order_id: order_id.clone(),
+            filled_shares_micros: 12_345_678,
+            filled_usd_micros: 6_172_839,
+        };
+
+        let _: &OrderId = &receipt.order_id;
+        assert_eq!(receipt.order_id, order_id);
+    }
+
+    #[test]
     fn receipt_converts_micro_units_only_at_position_boundary() {
         let receipt = OrderReceipt {
-            order_id: "0xabc".to_owned(),
+            order_id: OrderId::from_hex(format!("0x{}", "22".repeat(32))).unwrap(),
             filled_shares_micros: 12_345_678,
             filled_usd_micros: 6_172_839,
         };
@@ -195,17 +233,17 @@ mod tests {
 
     #[test]
     fn receipt_debug_never_contains_the_complete_order_id() {
-        let order_id = "ORDER_ID_DEBUG_SENTINEL_1234567890";
+        let order_id = OrderId::from_hex(format!("0x{}", "33".repeat(32))).unwrap();
         let receipt = OrderReceipt {
-            order_id: order_id.to_owned(),
+            order_id: order_id.clone(),
             filled_shares_micros: 12_000_000,
             filled_usd_micros: 6_000_000,
         };
 
         let rendered = format!("{receipt:?}");
 
-        assert!(!rendered.contains(order_id));
-        assert!(rendered.contains("ORDE"));
-        assert!(rendered.contains("7890"));
+        assert!(!rendered.contains(order_id.as_str()));
+        assert!(rendered.contains("0x3333"));
+        assert!(rendered.contains("3333"));
     }
 }

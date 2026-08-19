@@ -13,7 +13,8 @@ use crate::service::clob_sdk_orders::SdkOrderGateway;
 use crate::service::eligibility::{self, Eligibility};
 use crate::service::execution_circuit_breaker::ExecutionCircuitBreaker;
 use crate::service::execution_ledger::{
-    ExecutionLedger, IntentId, OrderId, OrderSide, PositionId, TokenId, Venue,
+    ExecutionLedger, IntentId, IntentPurpose, OrderId, OrderSide, PositionId, PositionSeed,
+    TokenId, Venue,
 };
 use crate::service::market_cache::{MarketCache, MarketInfo};
 use crate::service::order_gateway::{OrderGateway, OrderReceipt, OrderSubmitError};
@@ -233,8 +234,16 @@ impl OrderExecutor {
             .breaker
             .as_ref()
             .ok_or_else(|| anyhow!("live breaker unavailable"))?;
+        let (take_profit_pct, stop_loss_pct) = self.tp_sl_for(&market);
+        let purpose = IntentPurpose::Entry(PositionSeed {
+            slug: market.slug.clone(),
+            category: market.category.clone().unwrap_or_default(),
+            tags: market.tags.clone(),
+            take_profit_bps: bps_from_pct(take_profit_pct)?,
+            stop_loss_bps: bps_from_pct(stop_loss_pct)?,
+        });
         match breaker
-            .submit_fok(gateway.as_ref(), &planned, |receipt| {
+            .submit_fok(gateway.as_ref(), &planned, purpose, |receipt| {
                 self.record_open_from_receipt(&market, &planned, receipt)
                     .map_err(|_| ())
             })
@@ -330,8 +339,7 @@ impl OrderExecutor {
         if receipt.filled_shares_micros == 0 || receipt.filled_usd_micros == 0 {
             return Err(anyhow!("confirmed receipt contains zero fill"));
         }
-        let order_id = OrderId::from_hex(receipt.order_id.clone())
-            .ok_or_else(|| anyhow!("confirmed receipt has invalid order id"))?;
+        let order_id = receipt.order_id.clone();
         let (opening_intent_id, position_id) = self
             .positions
             .pending_entry_identity(&order_id)
@@ -489,7 +497,7 @@ mod tests {
     };
     use crate::service::onchain::RawLog;
     use crate::service::order_gateway::{
-        OrderErrorCode, OrderGateway, OrderReceipt, OrderStage, OrderSubmitError,
+        OrderErrorCode, OrderGateway, OrderReceipt, OrderStage, OrderSubmitError, PrePostJournal,
     };
     use crate::service::parse::{decode_whale_trade, order_filled_topic};
     use crate::service::position_store::PositionStore;
@@ -636,14 +644,14 @@ mod tests {
 
     #[test]
     fn execution_outcome_debug_never_contains_the_complete_order_id() {
-        let order_id = "EXECUTION_OUTCOME_ORDER_ID_SENTINEL_1234567890";
+        let order_id = OrderId::from_hex(format!("0x{}", "aa".repeat(32))).unwrap();
         let outcome = ExecutionOutcome::Filled(OrderReceipt {
-            order_id: order_id.to_owned(),
+            order_id: order_id.clone(),
             filled_shares_micros: 12_000_000,
             filled_usd_micros: 6_000_000,
         });
 
-        assert!(!format!("{outcome:?}").contains(order_id));
+        assert!(!format!("{outcome:?}").contains(order_id.as_str()));
     }
 
     #[test]
@@ -671,7 +679,7 @@ mod tests {
         let order_id = OrderId::from_hex(format!("0x{}", "ab".repeat(32))).unwrap();
         prepare_matched_entry(&ledger, order_id.clone());
         let gateway = Arc::new(FakeGateway::returning(Ok(OrderReceipt {
-            order_id: order_id.as_str().to_owned(),
+            order_id: order_id.clone(),
             filled_shares_micros: 39_000_000,
             filled_usd_micros: 19_500_000,
         })));
@@ -728,7 +736,7 @@ mod tests {
             positions: Arc::clone(&positions),
             position: conflicting_record,
             receipt: OrderReceipt {
-                order_id: order_id.as_str().to_owned(),
+                order_id: order_id.clone(),
                 filled_shares_micros: 39_000_000,
                 filled_usd_micros: 19_500_000,
             },
@@ -760,7 +768,18 @@ mod tests {
         let planned = gateway.plans.lock()[0].clone();
         assert!(matches!(
             breaker
-                .submit_fok(gateway.as_ref(), &planned, |_receipt| Ok(()))
+                .submit_fok(
+                    gateway.as_ref(),
+                    &planned,
+                    IntentPurpose::Entry(PositionSeed {
+                        slug: "fixture-market".into(),
+                        category: "Politics".into(),
+                        tags: vec!["election".into()],
+                        take_profit_bps: 4_000,
+                        stop_loss_bps: 2_500,
+                    }),
+                    |_receipt| Ok(()),
+                )
                 .await,
             Err(OrderSubmitError::Halted { .. })
         ));
@@ -955,6 +974,7 @@ mod tests {
         async fn submit_fok(
             &self,
             planned: &PlannedOrder,
+            _journal: &dyn PrePostJournal,
         ) -> Result<OrderReceipt, OrderSubmitError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.plans.lock().push(planned.clone());
@@ -981,6 +1001,7 @@ mod tests {
         async fn submit_fok(
             &self,
             planned: &PlannedOrder,
+            _journal: &dyn PrePostJournal,
         ) -> Result<OrderReceipt, OrderSubmitError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.plans.lock().push(planned.clone());

@@ -12,9 +12,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     models::PlannedOrder,
-    service::execution_ledger::ExecutionLedger,
+    service::execution_ledger::{
+        ExecutionLedger, IntentId, IntentPurpose, LedgerPayload, PreparedIntent,
+    },
     service::order_gateway::{
-        OrderErrorCode, OrderGateway, OrderReceipt, OrderStage, OrderSubmitError,
+        OrderErrorCode, OrderGateway, OrderReceipt, OrderStage, OrderSubmitError, PrePostJournal,
+        PreparedOrderIdentity,
     },
 };
 
@@ -31,7 +34,7 @@ pub struct ExecutionHaltMarker {
 
 pub struct ExecutionCircuitBreaker {
     halted: AtomicBool,
-    _ledger: Arc<ExecutionLedger>,
+    ledger: Arc<ExecutionLedger>,
     path: PathBuf,
     submit_lock: tokio::sync::Mutex<()>,
 }
@@ -68,7 +71,7 @@ impl ExecutionCircuitBreaker {
         }
         Ok(Arc::new(Self {
             halted: AtomicBool::new(false),
-            _ledger: ledger,
+            ledger,
             path,
             submit_lock: tokio::sync::Mutex::new(()),
         }))
@@ -154,11 +157,14 @@ impl ExecutionCircuitBreaker {
         &self,
         gateway: &dyn OrderGateway,
         planned: &PlannedOrder,
+        purpose: IntentPurpose,
         complete_post_fill: impl FnOnce(&OrderReceipt) -> Result<(), ()> + Send,
     ) -> Result<OrderReceipt, OrderSubmitError> {
         let _submission_guard = self.submit_lock.lock().await;
         self.check()?;
-        match gateway.submit_fok(planned).await {
+        let journal =
+            LedgerSubmissionJournal::new(self, planned, IntentId(uuid::Uuid::new_v4()), purpose);
+        match gateway.submit_fok(planned, &journal).await {
             Ok(receipt) => {
                 if complete_post_fill(&receipt).is_err() {
                     let error = self
@@ -180,6 +186,73 @@ impl ExecutionCircuitBreaker {
     }
 }
 
+struct LedgerSubmissionJournal<'a> {
+    breaker: &'a ExecutionCircuitBreaker,
+    planned: &'a PlannedOrder,
+    intent_id: IntentId,
+    purpose: IntentPurpose,
+    called: AtomicBool,
+}
+
+impl<'a> LedgerSubmissionJournal<'a> {
+    fn new(
+        breaker: &'a ExecutionCircuitBreaker,
+        planned: &'a PlannedOrder,
+        intent_id: IntentId,
+        purpose: IntentPurpose,
+    ) -> Self {
+        Self {
+            breaker,
+            planned,
+            intent_id,
+            purpose,
+            called: AtomicBool::new(false),
+        }
+    }
+
+    fn fatal(&self) -> OrderSubmitError {
+        match self
+            .breaker
+            .halt_uncertain(self.planned, OrderErrorCode::ExecutionHalted)
+        {
+            Ok(()) => OrderSubmitError::Halted {
+                code: OrderErrorCode::ExecutionHalted,
+            },
+            Err(error) => error,
+        }
+    }
+}
+
+impl PrePostJournal for LedgerSubmissionJournal<'_> {
+    fn before_post(&self, identity: &PreparedOrderIdentity) -> Result<(), OrderSubmitError> {
+        if self.called.swap(true, Ordering::AcqRel) {
+            return Err(self.fatal());
+        }
+        let prepared = PreparedIntent {
+            order_id: identity.order_id.clone(),
+            protocol_version: identity.protocol_version,
+            venue: identity.venue,
+            token_id: identity.token_id,
+            neg_risk: identity.neg_risk,
+            side: identity.side,
+            order_type: identity.order_type,
+            expected_maker_micros: identity.expected_maker_micros,
+            expected_taker_micros: identity.expected_taker_micros,
+            source_hash: None,
+            purpose: self.purpose.clone(),
+        };
+        self.breaker
+            .ledger
+            .append(self.intent_id, LedgerPayload::IntentPrepared(prepared))
+            .map_err(|_| self.fatal())?;
+        self.breaker
+            .ledger
+            .append(self.intent_id, LedgerPayload::SubmitStarted)
+            .map_err(|_| self.fatal())?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -196,8 +269,15 @@ mod tests {
     use super::{ExecutionCircuitBreaker, ExecutionHaltMarker};
     use crate::{
         models::{OrderType, PlannedOrder, Side, VenueId},
-        service::execution_ledger::{AcknowledgeReason, ExecutionLedger, IntentId, LedgerPayload},
-        service::order_gateway::{OrderErrorCode, OrderGateway, OrderReceipt, OrderSubmitError},
+        service::execution_ledger::{
+            AcknowledgeReason, ActiveIntentState, ExecutionLedger, IntentId, IntentPurpose,
+            LedgerPayload, OrderId, OrderSide, OrderType as LedgerOrderType, PositionSeed, TokenId,
+            Venue, ORDER_PROTOCOL_VERSION,
+        },
+        service::order_gateway::{
+            OrderErrorCode, OrderGateway, OrderReceipt, OrderSubmitError, PrePostJournal,
+            PreparedOrderIdentity,
+        },
     };
 
     #[test]
@@ -268,7 +348,7 @@ mod tests {
         let planned = fixture_planned_order();
 
         let first = breaker
-            .submit_fok(&gateway, &planned, |_receipt| Ok(()))
+            .submit_fok(&gateway, &planned, fixture_purpose(), |_receipt| Ok(()))
             .await
             .unwrap_err();
         assert!(first.is_uncertain());
@@ -276,7 +356,7 @@ mod tests {
         assert_eq!(gateway.calls(), 1);
 
         let second = breaker
-            .submit_fok(&gateway, &planned, |_receipt| Ok(()))
+            .submit_fok(&gateway, &planned, fixture_purpose(), |_receipt| Ok(()))
             .await
             .unwrap_err();
         assert!(matches!(second, OrderSubmitError::Halted { .. }));
@@ -328,8 +408,8 @@ mod tests {
         );
         let planned = fixture_planned_order();
         let (first, second) = tokio::join!(
-            breaker.submit_fok(&gateway, &planned, |_receipt| Ok(())),
-            breaker.submit_fok(&gateway, &planned, |_receipt| Ok(())),
+            breaker.submit_fok(&gateway, &planned, fixture_purpose(), |_receipt| Ok(())),
+            breaker.submit_fok(&gateway, &planned, fixture_purpose(), |_receipt| Ok(())),
         );
         assert!(first.is_err());
         assert!(second.is_err());
@@ -352,19 +432,28 @@ mod tests {
         let first_entered = Arc::clone(&post_fill_entered);
         let first = tokio::spawn(async move {
             first_breaker
-                .submit_fok(first_gateway.as_ref(), &first_planned, move |_receipt| {
-                    first_entered.notify_one();
-                    wait_for_release.recv().unwrap();
-                    Err(())
-                })
+                .submit_fok(
+                    first_gateway.as_ref(),
+                    &first_planned,
+                    fixture_purpose(),
+                    move |_receipt| {
+                        first_entered.notify_one();
+                        wait_for_release.recv().unwrap();
+                        Err(())
+                    },
+                )
                 .await
         });
 
         post_fill_entered.notified().await;
         assert_eq!(gateway.calls(), 1);
 
-        let mut second =
-            Box::pin(breaker.submit_fok(gateway.as_ref(), &planned, |_receipt| Ok(())));
+        let mut second = Box::pin(breaker.submit_fok(
+            gateway.as_ref(),
+            &planned,
+            fixture_purpose(),
+            |_receipt| Ok(()),
+        ));
         tokio::select! {
             biased;
             _ = &mut second => panic!("second submission completed before post-fill release"),
@@ -388,6 +477,67 @@ mod tests {
         assert!(breaker.is_halted());
         assert!(marker.is_file());
         assert_eq!(gateway.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn submit_started_second_journal_invocation_is_fatal_before_post() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("execution-halt.json");
+        let ledger = Arc::new(
+            ExecutionLedger::open_live(dir.path().join("execution-ledger.jsonl")).unwrap(),
+        );
+        let breaker =
+            ExecutionCircuitBreaker::new_live(Arc::clone(&ledger), marker.clone()).unwrap();
+        let gateway = DoubleJournalGateway::default();
+
+        let error = breaker
+            .submit_fok(
+                &gateway,
+                &fixture_planned_order(),
+                fixture_purpose(),
+                |_receipt| Ok(()),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, OrderSubmitError::Halted { .. }));
+        assert_eq!(gateway.posts.load(Ordering::SeqCst), 0);
+        assert!(breaker.is_halted());
+        assert!(marker.is_file());
+        let projection = ledger.projection();
+        assert_eq!(projection.event_count, 2);
+        assert_eq!(
+            projection.active.unwrap().state,
+            ActiveIntentState::SubmitStarted
+        );
+    }
+
+    #[tokio::test]
+    async fn journal_append_failure_prevents_post_and_halts() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("execution-halt.json");
+        let ledger = Arc::new(
+            ExecutionLedger::open_live(dir.path().join("execution-ledger.jsonl")).unwrap(),
+        );
+        let breaker =
+            ExecutionCircuitBreaker::new_live(Arc::clone(&ledger), marker.clone()).unwrap();
+        let gateway = InvalidJournalGateway::default();
+
+        let error = breaker
+            .submit_fok(
+                &gateway,
+                &fixture_planned_order(),
+                fixture_purpose(),
+                |_receipt| Ok(()),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, OrderSubmitError::Halted { .. }));
+        assert_eq!(gateway.posts.load(Ordering::SeqCst), 0);
+        assert_eq!(ledger.projection().event_count, 0);
+        assert!(breaker.is_halted());
+        assert!(marker.is_file());
     }
 
     struct FakeGateway {
@@ -426,6 +576,7 @@ mod tests {
         async fn submit_fok(
             &self,
             _planned: &PlannedOrder,
+            _journal: &dyn PrePostJournal,
         ) -> Result<OrderReceipt, OrderSubmitError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(self.delay).await;
@@ -436,6 +587,46 @@ mod tests {
     #[derive(Default)]
     struct ConcurrentAcceptedGateway {
         calls: AtomicUsize,
+    }
+
+    #[derive(Default)]
+    struct DoubleJournalGateway {
+        posts: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl OrderGateway for DoubleJournalGateway {
+        async fn submit_fok(
+            &self,
+            _planned: &PlannedOrder,
+            journal: &dyn PrePostJournal,
+        ) -> Result<OrderReceipt, OrderSubmitError> {
+            let identity = fixture_identity();
+            journal.before_post(&identity)?;
+            journal.before_post(&identity)?;
+            self.posts.fetch_add(1, Ordering::SeqCst);
+            unreachable!("a second journal callback must be fatal")
+        }
+    }
+
+    #[derive(Default)]
+    struct InvalidJournalGateway {
+        posts: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl OrderGateway for InvalidJournalGateway {
+        async fn submit_fok(
+            &self,
+            _planned: &PlannedOrder,
+            journal: &dyn PrePostJournal,
+        ) -> Result<OrderReceipt, OrderSubmitError> {
+            let mut identity = fixture_identity();
+            identity.protocol_version = ORDER_PROTOCOL_VERSION - 1;
+            journal.before_post(&identity)?;
+            self.posts.fetch_add(1, Ordering::SeqCst);
+            unreachable!("a failed durable append must prevent POST")
+        }
     }
 
     impl ConcurrentAcceptedGateway {
@@ -449,10 +640,15 @@ mod tests {
         async fn submit_fok(
             &self,
             _planned: &PlannedOrder,
+            _journal: &dyn PrePostJournal,
         ) -> Result<OrderReceipt, OrderSubmitError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(OrderReceipt {
-                order_id: format!("0x{}", "44".repeat(32)),
+                order_id: crate::service::execution_ledger::OrderId::from_hex(format!(
+                    "0x{}",
+                    "44".repeat(32)
+                ))
+                .unwrap(),
                 filled_shares_micros: 39_000_000,
                 filled_usd_micros: 19_500_000,
             })
@@ -470,6 +666,30 @@ mod tests {
             usd_notional: 20.0,
             order_type: OrderType::Fok,
             source_trade_hash: None,
+        }
+    }
+
+    fn fixture_purpose() -> IntentPurpose {
+        IntentPurpose::Entry(PositionSeed {
+            slug: "breaker-fixture".to_owned(),
+            category: "testing".to_owned(),
+            tags: vec!["offline".to_owned()],
+            take_profit_bps: 1_000,
+            stop_loss_bps: 500,
+        })
+    }
+
+    fn fixture_identity() -> PreparedOrderIdentity {
+        PreparedOrderIdentity {
+            order_id: OrderId::from_hex(format!("0x{}", "55".repeat(32))).unwrap(),
+            protocol_version: ORDER_PROTOCOL_VERSION,
+            venue: Venue::PolymarketClob,
+            token_id: TokenId::from_decimal("12345").unwrap(),
+            neg_risk: false,
+            side: OrderSide::Buy,
+            order_type: LedgerOrderType::Fok,
+            expected_maker_micros: 19_500_000,
+            expected_taker_micros: 39_000_000,
         }
     }
 

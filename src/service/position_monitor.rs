@@ -11,7 +11,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::TpSlConfig;
 use crate::models::{OrderType, PlannedOrder, Side, VenueId};
 use crate::service::execution_circuit_breaker::ExecutionCircuitBreaker;
-use crate::service::execution_ledger::{IntentId, OrderId, OrderSide, PositionClose, Venue};
+use crate::service::execution_ledger::{IntentId, IntentPurpose, OrderSide, PositionClose, Venue};
 use crate::service::midprice::MidpriceSource;
 use crate::service::order_gateway::{OrderGateway, OrderReceipt, OrderSubmitError};
 use crate::service::position_store::{OpenPosition, PositionStore};
@@ -136,9 +136,14 @@ async fn monitor_once(
 
     let planned = exit_plan(pos, mid, price_buffer);
     match breaker
-        .submit_fok(gateway, &planned, |receipt| {
-            apply_filled_close(pos, positions, receipt).map_err(|_| ())
-        })
+        .submit_fok(
+            gateway,
+            &planned,
+            IntentPurpose::Exit {
+                position_id: pos.position_id,
+            },
+            |receipt| apply_filled_close(pos, positions, receipt).map_err(|_| ()),
+        )
         .await
     {
         Ok(receipt) => Ok(ExitOutcome::Filled(receipt)),
@@ -159,8 +164,7 @@ fn apply_filled_close(
             "confirmed exit receipt has conflicting amounts"
         ));
     }
-    let order_id = OrderId::from_hex(receipt.order_id.clone())
-        .ok_or_else(|| anyhow::anyhow!("confirmed exit receipt has invalid order id"))?;
+    let order_id = receipt.order_id.clone();
     let closing_intent_id = if positions.is_paper() {
         IntentId(uuid::Uuid::new_v4())
     } else {
@@ -224,7 +228,7 @@ mod tests {
     use crate::service::market_cache::MarketCache;
     use crate::service::order_executor::test_support;
     use crate::service::order_gateway::{
-        OrderErrorCode, OrderGateway, OrderReceipt, OrderSubmitError,
+        OrderErrorCode, OrderGateway, OrderReceipt, OrderSubmitError, PrePostJournal,
     };
     use crate::service::risk_guard::RiskGuard;
 
@@ -340,14 +344,14 @@ mod tests {
 
     #[test]
     fn exit_outcome_debug_never_contains_the_complete_order_id() {
-        let order_id = "EXIT_OUTCOME_ORDER_ID_SENTINEL_1234567890";
+        let order_id = OrderId::from_hex(format!("0x{}", "30".repeat(32))).unwrap();
         let outcome = ExitOutcome::Filled(OrderReceipt {
-            order_id: order_id.to_owned(),
+            order_id: order_id.clone(),
             filled_shares_micros: 100_000_000,
             filled_usd_micros: 70_000_000,
         });
 
-        assert!(!format!("{outcome:?}").contains(order_id));
+        assert!(!format!("{outcome:?}").contains(order_id.as_str()));
     }
 
     #[tokio::test]
@@ -358,7 +362,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let breaker = test_breaker(dir.path().join("execution-halt.json"));
         let gateway = Arc::new(FakeGateway::returning(Ok(OrderReceipt {
-            order_id: format!("0x{}", "31".repeat(32)),
+            order_id: OrderId::from_hex(format!("0x{}", "31".repeat(32))).unwrap(),
             filled_shares_micros: 100_000_000,
             filled_usd_micros: 70_000_000,
         })));
@@ -402,7 +406,7 @@ mod tests {
                 closed_at: Utc::now() - chrono::Duration::days(1),
             },
             receipt: OrderReceipt {
-                order_id: order_id.as_str().to_owned(),
+                order_id: order_id.clone(),
                 filled_shares_micros: position.shares_micros,
                 filled_usd_micros: 70_000_000,
             },
@@ -445,7 +449,14 @@ mod tests {
         let planned = gateway.plans.lock()[0].clone();
         assert!(matches!(
             breaker
-                .submit_fok(gateway.as_ref(), &planned, |_receipt| Ok(()))
+                .submit_fok(
+                    gateway.as_ref(),
+                    &planned,
+                    IntentPurpose::Exit {
+                        position_id: position.position_id,
+                    },
+                    |_receipt| Ok(()),
+                )
                 .await,
             Err(OrderSubmitError::Halted { .. })
         ));
@@ -488,7 +499,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let breaker = test_breaker(dir.path().join("execution-halt.json"));
         let gateway = Arc::new(FakeGateway::returning(Ok(OrderReceipt {
-            order_id: format!("0x{}", "33".repeat(32)),
+            order_id: OrderId::from_hex(format!("0x{}", "33".repeat(32))).unwrap(),
             filled_shares_micros: position.shares_micros,
             filled_usd_micros: 70_000_000,
         })));
@@ -650,6 +661,7 @@ mod tests {
         async fn submit_fok(
             &self,
             planned: &PlannedOrder,
+            _journal: &dyn PrePostJournal,
         ) -> Result<OrderReceipt, OrderSubmitError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.plans.lock().push(planned.clone());
@@ -676,6 +688,7 @@ mod tests {
         async fn submit_fok(
             &self,
             planned: &PlannedOrder,
+            _journal: &dyn PrePostJournal,
         ) -> Result<OrderReceipt, OrderSubmitError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.plans.lock().push(planned.clone());

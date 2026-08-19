@@ -21,8 +21,12 @@ use polymarket_client_sdk_v2::{contract_config, POLYGON};
 
 use crate::config::{AppConfig, OFFICIAL_CLOB_V2_HOST};
 use crate::models::{OrderType, PlannedOrder, Side};
+use crate::service::execution_ledger::{
+    OrderId, OrderSide, OrderType as LedgerOrderType, TokenId, Venue, ORDER_PROTOCOL_VERSION,
+};
 use crate::service::order_gateway::{
-    OrderErrorCode, OrderGateway, OrderReceipt, OrderStage, OrderSubmitError,
+    OrderErrorCode, OrderGateway, OrderReceipt, OrderStage, OrderSubmitError, PrePostJournal,
+    PreparedOrderIdentity,
 };
 
 type AuthenticatedClient = Client<Authenticated<Normal>>;
@@ -35,6 +39,7 @@ pub struct SdkOrderGateway {
 
 struct PreparedOrder {
     signed: SdkSignedOrder,
+    identity: PreparedOrderIdentity,
     expected_making: Decimal,
     expected_taking: Decimal,
     side: Side,
@@ -45,6 +50,7 @@ impl fmt::Debug for PreparedOrder {
         formatter
             .debug_struct("PreparedOrder")
             .field("signed", &"<redacted>")
+            .field("identity", &self.identity)
             .field("expected_making", &self.expected_making)
             .field("expected_taking", &self.expected_taking)
             .field("side", &self.side)
@@ -149,6 +155,8 @@ impl SdkOrderGateway {
         if planned.order_type != OrderType::Fok {
             return Err(preflight(OrderStage::Build, OrderErrorCode::SdkBuild));
         }
+        let durable_token_id = TokenId::from_decimal(&planned.token_id)
+            .ok_or_else(|| preflight(OrderStage::Build, OrderErrorCode::InvalidTokenId))?;
         let token_id = parse_token_id(&planned.token_id)?;
         let tick = self
             .client
@@ -204,13 +212,30 @@ impl SdkOrderGateway {
         })?;
         let expected_making = u256_micros_to_decimal(order.makerAmount)?;
         let expected_taking = u256_micros_to_decimal(order.takerAmount)?;
+        let expected_maker_micros = u256_to_u128_micros(order.makerAmount)?;
+        let expected_taker_micros = u256_to_u128_micros(order.takerAmount)?;
         let signed = self
             .client
             .sign(&self.signer, signable)
             .await
             .map_err(|_| preflight(OrderStage::Sign, OrderErrorCode::SdkSign))?;
+        let order_id = exact_v2_order_id(&signed, planned.neg_risk)?;
         Ok(PreparedOrder {
             signed,
+            identity: PreparedOrderIdentity {
+                order_id,
+                protocol_version: ORDER_PROTOCOL_VERSION,
+                venue: Venue::PolymarketClob,
+                token_id: durable_token_id,
+                neg_risk: planned.neg_risk,
+                side: match planned.side {
+                    Side::Buy => OrderSide::Buy,
+                    Side::Sell => OrderSide::Sell,
+                },
+                order_type: LedgerOrderType::Fok,
+                expected_maker_micros,
+                expected_taker_micros,
+            },
             expected_making,
             expected_taking,
             side: planned.side,
@@ -222,11 +247,7 @@ fn preflight(stage: OrderStage, code: OrderErrorCode) -> OrderSubmitError {
     OrderSubmitError::Preflight { stage, code }
 }
 
-#[allow(
-    dead_code,
-    reason = "Task 1 proves the ID before later pre-POST wiring"
-)]
-fn exact_v2_order_id(signed: &SdkSignedOrder, neg_risk: bool) -> Result<String, OrderSubmitError> {
+fn exact_v2_order_id(signed: &SdkSignedOrder, neg_risk: bool) -> Result<OrderId, OrderSubmitError> {
     let exchange = contract_config(POLYGON, neg_risk)
         .and_then(|config| config.exchange_v2)
         .ok_or_else(|| preflight(OrderStage::Sign, OrderErrorCode::ExactOrderIdUnavailable))?;
@@ -235,12 +256,14 @@ fn exact_v2_order_id(signed: &SdkSignedOrder, neg_risk: bool) -> Result<String, 
     domain.version = Some(Cow::Borrowed("2"));
     domain.chain_id = Some(U256::from(POLYGON));
     domain.verifying_contract = Some(exchange);
-    Ok(format!(
+    let value = format!(
         "{:#x}",
         signed.v2_order_hash(&domain).map_err(|_| {
             preflight(OrderStage::Sign, OrderErrorCode::ExactOrderIdUnavailable)
         })?
-    ))
+    );
+    OrderId::from_hex(value)
+        .ok_or_else(|| preflight(OrderStage::Sign, OrderErrorCode::ExactOrderIdUnavailable))
 }
 
 fn decimal_from_f64(value: f64, code: OrderErrorCode) -> Result<Decimal, OrderSubmitError> {
@@ -318,14 +341,18 @@ fn exact_decimal_to_micros(
 }
 
 fn u256_micros_to_decimal(value: U256) -> Result<Decimal, OrderSubmitError> {
-    let raw: u128 = value
-        .try_into()
-        .map_err(|_| preflight(OrderStage::Build, OrderErrorCode::AmountConversion))?;
+    let raw = u256_to_u128_micros(value)?;
     let raw: i128 = raw
         .try_into()
         .map_err(|_| preflight(OrderStage::Build, OrderErrorCode::AmountConversion))?;
     Decimal::try_from_i128_with_scale(raw, 6)
         .map(|value| value.normalize())
+        .map_err(|_| preflight(OrderStage::Build, OrderErrorCode::AmountConversion))
+}
+
+fn u256_to_u128_micros(value: U256) -> Result<u128, OrderSubmitError> {
+    value
+        .try_into()
         .map_err(|_| preflight(OrderStage::Build, OrderErrorCode::AmountConversion))
 }
 
@@ -338,6 +365,7 @@ fn map_amounts(side: Side, making: u128, taking: u128) -> (u128, u128) {
 
 fn classify_response(
     response: PostOrderResponse,
+    expected_order_id: &OrderId,
     expected_making: Decimal,
     expected_taking: Decimal,
     side: Side,
@@ -367,6 +395,11 @@ fn classify_response(
             code: OrderErrorCode::AmountMismatch,
         });
     }
+    if response.order_id != expected_order_id.as_str() {
+        return Err(OrderSubmitError::Uncertain {
+            code: OrderErrorCode::ResponseOrderIdMismatch,
+        });
+    }
     let making =
         decimal_to_micros(response.making_amount).map_err(|_| OrderSubmitError::Uncertain {
             code: OrderErrorCode::AmountConversion,
@@ -377,7 +410,7 @@ fn classify_response(
         })?;
     let (filled_shares_micros, filled_usd_micros) = map_amounts(side, making, taking);
     Ok(OrderReceipt {
-        order_id: response.order_id,
+        order_id: expected_order_id.clone(),
         filled_shares_micros,
         filled_usd_micros,
     })
@@ -390,9 +423,10 @@ fn classify_post_error(error: &SdkError) -> OrderSubmitError {
         };
     }
     if let Some(status) = error.downcast_ref::<SdkStatus>() {
-        if status.status_code.is_client_error() || status.status_code.is_server_error() {
+        let code = status.status_code.as_u16();
+        if is_deterministic_pre_acceptance_rejection(code) {
             return OrderSubmitError::Rejected {
-                http_status: Some(status.status_code.as_u16()),
+                http_status: Some(code),
                 code: OrderErrorCode::HttpRejected,
             };
         }
@@ -412,6 +446,33 @@ fn classify_post_error(error: &SdkError) -> OrderSubmitError {
     OrderSubmitError::Uncertain { code }
 }
 
+fn is_deterministic_pre_acceptance_rejection(status: u16) -> bool {
+    matches!(
+        status,
+        400 | 401
+            | 403
+            | 404
+            | 405
+            | 406
+            | 409
+            | 410
+            | 411
+            | 412
+            | 413
+            | 414
+            | 415
+            | 416
+            | 417
+            | 421
+            | 422
+            | 426
+            | 428
+            | 429
+            | 431
+            | 451
+    )
+}
+
 fn sdk_error_has_json_source(error: &SdkError) -> bool {
     let mut source: Option<&(dyn std::error::Error + 'static)> = error
         .inner()
@@ -427,8 +488,13 @@ fn sdk_error_has_json_source(error: &SdkError) -> bool {
 
 #[async_trait]
 impl OrderGateway for SdkOrderGateway {
-    async fn submit_fok(&self, planned: &PlannedOrder) -> Result<OrderReceipt, OrderSubmitError> {
+    async fn submit_fok(
+        &self,
+        planned: &PlannedOrder,
+        journal: &dyn PrePostJournal,
+    ) -> Result<OrderReceipt, OrderSubmitError> {
         let prepared = self.prepare_fok(planned).await?;
+        journal.before_post(&prepared.identity)?;
         let response =
             tokio::time::timeout(self.post_timeout, self.client.post_order(prepared.signed))
                 .await
@@ -438,6 +504,7 @@ impl OrderGateway for SdkOrderGateway {
                 .map_err(|error| classify_post_error(&error))?;
         classify_response(
             response,
+            &prepared.identity.order_id,
             prepared.expected_making,
             prepared.expected_taking,
             prepared.side,
@@ -447,8 +514,7 @@ impl OrderGateway for SdkOrderGateway {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr as _;
-    use std::time::Duration;
+    use std::{path::PathBuf, str::FromStr as _, sync::Arc, time::Duration};
 
     use alloy_sol_types::SolStruct as _;
     use alloy_sol_types_v1::{eip712_domain, SolStruct as _};
@@ -462,6 +528,10 @@ mod tests {
 
     use crate::config::AppConfig;
     use crate::models::{OrderType, PlannedOrder, VenueId};
+    use crate::service::execution_circuit_breaker::ExecutionCircuitBreaker;
+    use crate::service::execution_ledger::{
+        ExecutionLedger, IntentPurpose, LedgerEvent, LedgerPayload, OrderId, PositionSeed,
+    };
 
     use super::*;
 
@@ -473,7 +543,7 @@ mod tests {
         "error_msg":"",
         "makingAmount":"19.5",
         "takingAmount":"39",
-        "orderID":"0xabc",
+        "orderID":"0x1111111111111111111111111111111111111111111111111111111111111111",
         "status":"MATCHED",
         "success":true
     }"#;
@@ -499,6 +569,38 @@ mod tests {
         ($value:literal) => {
             Decimal::from_str(stringify!($value)).unwrap()
         };
+    }
+
+    struct RejectingJournal;
+
+    impl PrePostJournal for RejectingJournal {
+        fn before_post(&self, _identity: &PreparedOrderIdentity) -> Result<(), OrderSubmitError> {
+            Err(OrderSubmitError::Halted {
+                code: OrderErrorCode::ExecutionHalted,
+            })
+        }
+    }
+
+    struct AcceptingJournal;
+
+    impl PrePostJournal for AcceptingJournal {
+        fn before_post(&self, _identity: &PreparedOrderIdentity) -> Result<(), OrderSubmitError> {
+            Ok(())
+        }
+    }
+
+    fn fixture_order_id(byte: &str) -> OrderId {
+        OrderId::from_hex(format!("0x{}", byte.repeat(32))).unwrap()
+    }
+
+    fn fixture_intent_purpose() -> IntentPurpose {
+        IntentPurpose::Entry(PositionSeed {
+            slug: "journal-loopback".to_owned(),
+            category: "testing".to_owned(),
+            tags: vec!["offline".to_owned()],
+            take_profit_bps: 1_000,
+            stop_loss_bps: 500,
+        })
     }
 
     mod independent_v2 {
@@ -556,19 +658,163 @@ mod tests {
 
     #[test]
     fn exact_matched_buy_returns_actual_side_aware_receipt() {
+        let order_id = fixture_order_id("11");
         let response = response(
             true,
             OrderStatusType::Matched,
-            "0xabc",
+            order_id.as_str(),
             dec!(19.5),
             dec!(39),
         );
 
-        let receipt = classify_response(response, dec!(19.5), dec!(39), Side::Buy).unwrap();
+        let receipt =
+            classify_response(response, &order_id, dec!(19.5), dec!(39), Side::Buy).unwrap();
 
-        assert_eq!(receipt.order_id, "0xabc");
+        assert_eq!(receipt.order_id, order_id);
         assert_eq!(receipt.filled_shares_micros, 39_000_000);
         assert_eq!(receipt.filled_usd_micros, 19_500_000);
+    }
+
+    #[test]
+    fn response_order_id_mismatch_is_uncertain() {
+        let expected = OrderId::from_hex(format!("0x{}", "11".repeat(32))).unwrap();
+        let actual = format!("0x{}", "22".repeat(32));
+
+        let error = classify_response(
+            response(
+                true,
+                OrderStatusType::Matched,
+                &actual,
+                dec!(19.5),
+                dec!(39),
+            ),
+            &expected,
+            dec!(19.5),
+            dec!(39),
+            Side::Buy,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            OrderSubmitError::Uncertain {
+                code: OrderErrorCode::ResponseOrderIdMismatch,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn journal_failure_stops_before_post() {
+        let (host, server) = spawn_scripted_server(vec![
+            (
+                "GET /tick-size?token_id=12345",
+                r#"{"minimum_tick_size":"0.01"}"#,
+            ),
+            ("GET /neg-risk?token_id=12345", r#"{"neg_risk":false}"#),
+            ("GET /version", r#"{"version":2}"#),
+        ])
+        .await;
+        let cfg = fixture_config();
+        let gateway = SdkOrderGateway::new_with_host(&cfg, &host, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        let error = gateway
+            .submit_fok(&planned_order(false), &RejectingJournal)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, OrderSubmitError::Halted { .. }));
+        assert_eq!(
+            server.await.unwrap(),
+            vec![
+                "GET /tick-size?token_id=12345",
+                "GET /neg-risk?token_id=12345",
+                "GET /version",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn journal_syncs_intent_prepared_then_submit_started_before_post_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("execution-ledger.jsonl");
+        let ledger = Arc::new(ExecutionLedger::open_live(&ledger_path).unwrap());
+        let breaker = ExecutionCircuitBreaker::new_live(
+            Arc::clone(&ledger),
+            dir.path().join("execution-halt.json"),
+        )
+        .unwrap();
+        let (host, server) = spawn_journal_order_server(ledger_path).await;
+        let cfg = fixture_config();
+        let gateway = SdkOrderGateway::new_with_host(&cfg, &host, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        let receipt = breaker
+            .submit_fok(
+                &gateway,
+                &planned_order(false),
+                fixture_intent_purpose(),
+                |_receipt| Ok(()),
+            )
+            .await
+            .unwrap();
+        let (requests, events) = server.await.unwrap();
+
+        assert_eq!(events.len(), 2);
+        let prepared = match &events[0].payload {
+            LedgerPayload::IntentPrepared(prepared) => prepared,
+            other => panic!("first durable event must be IntentPrepared, got {other:?}"),
+        };
+        assert!(matches!(events[1].payload, LedgerPayload::SubmitStarted));
+        assert_eq!(events[0].sequence, 1);
+        assert_eq!(events[1].sequence, 2);
+        assert_eq!(events[0].intent_id, events[1].intent_id);
+        assert_eq!(receipt.order_id, prepared.order_id);
+        assert_order_request_contract(&requests);
+    }
+
+    #[tokio::test]
+    async fn preflight_failure_before_journal_creates_no_event_or_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Arc::new(
+            ExecutionLedger::open_live(dir.path().join("execution-ledger.jsonl")).unwrap(),
+        );
+        let breaker = ExecutionCircuitBreaker::new_live(
+            Arc::clone(&ledger),
+            dir.path().join("execution-halt.json"),
+        )
+        .unwrap();
+        let cfg = fixture_config();
+        let gateway = SdkOrderGateway::new_with_host(&cfg, &host, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let mut planned = planned_order(false);
+        planned.token_id = "01".to_owned();
+
+        let error = breaker
+            .submit_fok(&gateway, &planned, fixture_intent_purpose(), |_receipt| {
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            OrderSubmitError::Preflight {
+                stage: OrderStage::Build,
+                code: OrderErrorCode::InvalidTokenId,
+            }
+        );
+        assert_eq!(ledger.projection().event_count, 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
     }
 
     #[test]
@@ -581,6 +827,7 @@ mod tests {
                 Decimal::ZERO,
                 Decimal::ZERO,
             ),
+            &fixture_order_id("11"),
             dec!(19.5),
             dec!(39),
             Side::Buy,
@@ -607,6 +854,7 @@ mod tests {
             assert!(matches!(
                 classify_response(
                     response(true, status, "0xabc", dec!(19.5), dec!(39)),
+                    &fixture_order_id("11"),
                     dec!(19.5),
                     dec!(39),
                     Side::Buy,
@@ -638,7 +886,13 @@ mod tests {
             ),
         ] {
             assert!(matches!(
-                classify_response(response, dec!(19.5), dec!(39), Side::Buy),
+                classify_response(
+                    response,
+                    &fixture_order_id("11"),
+                    dec!(19.5),
+                    dec!(39),
+                    Side::Buy,
+                ),
                 Err(OrderSubmitError::Uncertain { .. })
             ));
         }
@@ -646,31 +900,41 @@ mod tests {
 
     #[test]
     fn exact_matched_sell_returns_actual_side_aware_receipt() {
+        let order_id = fixture_order_id("22");
         let receipt = classify_response(
             response(
                 true,
                 OrderStatusType::Matched,
-                "0xsell",
+                order_id.as_str(),
                 dec!(39),
                 dec!(19.5),
             ),
+            &order_id,
             dec!(39),
             dec!(19.5),
             Side::Sell,
         )
         .unwrap();
 
-        assert_eq!(receipt.order_id, "0xsell");
+        assert_eq!(receipt.order_id, order_id);
         assert_eq!(receipt.filled_shares_micros, 39_000_000);
         assert_eq!(receipt.filled_usd_micros, 19_500_000);
     }
 
     #[test]
     fn exact_matched_unrepresentable_amounts_are_uncertain() {
+        let order_id = fixture_order_id("11");
         for amount in [dec!(0.0000001), Decimal::MAX] {
             assert!(matches!(
                 classify_response(
-                    response(true, OrderStatusType::Matched, "0xabc", amount, dec!(1)),
+                    response(
+                        true,
+                        OrderStatusType::Matched,
+                        order_id.as_str(),
+                        amount,
+                        dec!(1),
+                    ),
+                    &order_id,
                     amount,
                     dec!(1),
                     Side::Buy,
@@ -738,7 +1002,13 @@ mod tests {
     }
 
     async fn read_safe_request(stream: &mut tokio::net::TcpStream) -> SafeCapturedRequest {
-        let mut bytes = Vec::new();
+        read_safe_request_with_prefix(stream, Vec::new()).await
+    }
+
+    async fn read_safe_request_with_prefix(
+        stream: &mut tokio::net::TcpStream,
+        mut bytes: Vec<u8>,
+    ) -> SafeCapturedRequest {
         let header_end = loop {
             if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
                 break index;
@@ -866,6 +1136,74 @@ mod tests {
                 }
             }
             requests
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    async fn spawn_journal_order_server(
+        ledger_path: PathBuf,
+    ) -> (
+        String,
+        tokio::task::JoinHandle<(Vec<SafeCapturedRequest>, Vec<LedgerEvent>)>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let metadata = [
+                (
+                    "GET /tick-size?token_id=12345",
+                    r#"{"minimum_tick_size":"0.01"}"#,
+                ),
+                ("GET /neg-risk?token_id=12345", r#"{"neg_risk":false}"#),
+            ];
+            let mut requests = Vec::with_capacity(4);
+            for (expected_line, body) in metadata {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_safe_request(&mut stream).await;
+                assert_eq!(request.line, expected_line);
+                requests.push(request);
+                write_json_response(&mut stream, "200 OK", body).await;
+            }
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let version_request = read_safe_request(&mut stream).await;
+            assert_eq!(version_request.line, "GET /version");
+            requests.push(version_request);
+            write_keep_alive_json_response(&mut stream, r#"{"version":2}"#).await;
+
+            let mut first_post_byte = [0_u8; 1];
+            stream.read_exact(&mut first_post_byte).await.unwrap();
+            let events = std::fs::read_to_string(&ledger_path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<LedgerEvent>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                events.len(),
+                2,
+                "POST bytes arrived before both journal events"
+            );
+            let order_id = match &events[0].payload {
+                LedgerPayload::IntentPrepared(prepared) => prepared.order_id.as_str(),
+                other => panic!("first durable event must be IntentPrepared, got {other:?}"),
+            };
+            assert!(matches!(events[1].payload, LedgerPayload::SubmitStarted));
+
+            let post = read_safe_request_with_prefix(&mut stream, first_post_byte.to_vec()).await;
+            assert_eq!(post.line, "POST /order");
+            requests.push(post);
+            let body = format!(
+                r#"{{"error_msg":"","makingAmount":"19.5","takingAmount":"39","orderID":"{order_id}","status":"MATCHED","success":true}}"#
+            );
+            write_json_response(&mut stream, "200 OK", &body).await;
+
+            if let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(Duration::from_millis(100), listener.accept()).await
+            {
+                let request = read_safe_request(&mut stream).await;
+                panic!("unexpected retry after journaled POST: {}", request.line);
+            }
+            (requests, events)
         });
         (format!("http://{address}"), handle)
     }
@@ -1157,11 +1495,11 @@ mod tests {
                 verifying_contract: exchange,
             };
             let expected = prepared.signed.order().eip712_signing_hash(&domain);
-            let decoded = hex::decode(&id[2..]).unwrap();
+            let decoded = hex::decode(&id.as_str()[2..]).unwrap();
 
-            assert_eq!(id.len(), 66);
-            assert!(id.starts_with("0x"));
-            assert!(id[2..]
+            assert_eq!(id.as_str().len(), 66);
+            assert!(id.as_str().starts_with("0x"));
+            assert!(id.as_str()[2..]
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
             assert!(decoded.as_slice() == expected.as_slice());
@@ -1178,7 +1516,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_matched_post_returns_receipt_after_one_request() {
+    async fn response_order_id_mismatch_is_uncertain_after_one_request() {
         let (host, server) = spawn_order_server(OrderServerResponse::Http {
             status: "200 OK",
             body: MATCHED_RESPONSE,
@@ -1189,12 +1527,18 @@ mod tests {
             .await
             .unwrap();
 
-        let receipt = gateway.submit_fok(&planned_order(false)).await.unwrap();
+        let error = gateway
+            .submit_fok(&planned_order(false), &AcceptingJournal)
+            .await
+            .unwrap_err();
         let requests = server.await.unwrap();
 
-        assert_eq!(receipt.order_id, "0xabc");
-        assert_eq!(receipt.filled_shares_micros, 39_000_000);
-        assert_eq!(receipt.filled_usd_micros, 19_500_000);
+        assert_eq!(
+            error,
+            OrderSubmitError::Uncertain {
+                code: OrderErrorCode::ResponseOrderIdMismatch,
+            }
+        );
         assert_order_request_contract(&requests);
     }
 
@@ -1217,7 +1561,10 @@ mod tests {
             .await
             .unwrap();
 
-        let error = gateway.submit_fok(&planned_order(false)).await.unwrap_err();
+        let error = gateway
+            .submit_fok(&planned_order(false), &AcceptingJournal)
+            .await
+            .unwrap_err();
         let requests = server.await.unwrap();
 
         assert!(matches!(
@@ -1231,12 +1578,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn definitive_http_statuses_are_rejected_without_rendering_body() {
+    async fn deterministic_client_rejections_are_rejected_without_rendering_body() {
         for (status_line, status_code) in [
             ("400 Bad Request", 400),
             ("409 Conflict", 409),
+            ("422 Unprocessable Content", 422),
             ("429 Too Many Requests", 429),
-            ("500 Internal Server Error", 500),
         ] {
             let (host, server) = spawn_order_server(OrderServerResponse::Http {
                 status: status_line,
@@ -1248,7 +1595,10 @@ mod tests {
                 .await
                 .unwrap();
 
-            let error = gateway.submit_fok(&planned_order(false)).await.unwrap_err();
+            let error = gateway
+                .submit_fok(&planned_order(false), &AcceptingJournal)
+                .await
+                .unwrap_err();
             let requests = server.await.unwrap();
             let rendered = format!("{error:?} {error}");
 
@@ -1264,11 +1614,42 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn http_5xx_is_uncertain_without_retry_or_rendering_body() {
+        for status_line in ["500 Internal Server Error", "503 Service Unavailable"] {
+            let (host, server) = spawn_order_server(OrderServerResponse::Http {
+                status: status_line,
+                body: SERVER_BODY_SECRET_SENTINEL,
+            })
+            .await;
+            let cfg = fixture_config();
+            let gateway = SdkOrderGateway::new_with_host(&cfg, &host, Duration::from_secs(1))
+                .await
+                .unwrap();
+
+            let error = gateway
+                .submit_fok(&planned_order(false), &AcceptingJournal)
+                .await
+                .unwrap_err();
+            let requests = server.await.unwrap();
+            let rendered = format!("{error:?} {error}");
+
+            assert_eq!(
+                error,
+                OrderSubmitError::Uncertain {
+                    code: OrderErrorCode::PostTransport,
+                }
+            );
+            assert!(!rendered.contains(SERVER_BODY_SECRET_SENTINEL));
+            assert_order_request_contract(&requests);
+        }
+    }
+
     #[test]
-    fn only_client_and_server_status_classes_are_definitive_rejections() {
+    fn only_deterministic_client_statuses_are_definitive_rejections() {
         use polymarket_client_sdk_v2::error::{Method, StatusCode};
 
-        for status in [100_u16, 199, 300, 399, 600, 799] {
+        for status in [100_u16, 199, 300, 399, 408, 425, 499, 500, 599, 600, 799] {
             let sdk_error = SdkError::status(
                 StatusCode::from_u16(status).unwrap(),
                 Method::POST,
@@ -1285,7 +1666,7 @@ mod tests {
             );
         }
 
-        for status in [400_u16, 499, 500, 599] {
+        for status in [400_u16, 401, 403, 404, 409, 422, 429] {
             let sdk_error = SdkError::status(
                 StatusCode::from_u16(status).unwrap(),
                 Method::POST,
@@ -1316,7 +1697,10 @@ mod tests {
             .await
             .unwrap();
 
-        let error = gateway.submit_fok(&planned_order(false)).await.unwrap_err();
+        let error = gateway
+            .submit_fok(&planned_order(false), &AcceptingJournal)
+            .await
+            .unwrap_err();
         let requests = server.await.unwrap();
 
         assert_eq!(
@@ -1340,7 +1724,9 @@ mod tests {
             .await
             .unwrap();
 
-        let result = gateway.submit_fok(&planned_order(false)).await;
+        let result = gateway
+            .submit_fok(&planned_order(false), &AcceptingJournal)
+            .await;
         let requests = server.await.unwrap();
         let error = result.unwrap_err();
 
@@ -1361,7 +1747,9 @@ mod tests {
             .await
             .unwrap();
 
-        let result = gateway.submit_fok(&planned_order(false)).await;
+        let result = gateway
+            .submit_fok(&planned_order(false), &AcceptingJournal)
+            .await;
         let requests = server.await.unwrap();
         let error = result.unwrap_err();
 
@@ -1382,7 +1770,10 @@ mod tests {
             .await
             .unwrap();
 
-        let error = gateway.submit_fok(&planned_order(false)).await.unwrap_err();
+        let error = gateway
+            .submit_fok(&planned_order(false), &AcceptingJournal)
+            .await
+            .unwrap_err();
         let requests = server.await.unwrap();
 
         assert!(matches!(
@@ -1403,7 +1794,10 @@ mod tests {
             .await
             .unwrap();
 
-        let error = gateway.submit_fok(&planned_order(false)).await.unwrap_err();
+        let error = gateway
+            .submit_fok(&planned_order(false), &AcceptingJournal)
+            .await
+            .unwrap_err();
         let requests = server.await.unwrap();
 
         assert!(matches!(
@@ -1453,7 +1847,10 @@ mod tests {
                 .await
                 .unwrap();
 
-            let error = gateway.submit_fok(&planned_order(false)).await.unwrap_err();
+            let error = gateway
+                .submit_fok(&planned_order(false), &AcceptingJournal)
+                .await
+                .unwrap_err();
             let requests = server.await.unwrap();
 
             assert!(matches!(error, OrderSubmitError::Uncertain { .. }));
@@ -1856,12 +2253,13 @@ mod tests {
 
         let prepared = gateway.prepare_fok(&planned_order(false)).await.unwrap();
         let debug = format!("{prepared:?}");
+        let complete_order_id = prepared.identity.order_id.as_str().to_owned();
         server.await.unwrap();
 
-        assert!(
-            debug
-                == "PreparedOrder { signed: \"<redacted>\", expected_making: 19.5, expected_taking: 39, side: Buy }"
-        );
+        assert!(debug.contains("signed: \"<redacted>\""));
+        assert!(debug.contains("identity: PreparedOrderIdentity"));
+        assert!(!debug.contains(&complete_order_id));
+        assert!(!debug.contains(PUBLIC_HARDHAT_KEY));
     }
 
     #[tokio::test]

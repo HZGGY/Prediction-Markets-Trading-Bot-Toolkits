@@ -218,7 +218,7 @@ fn log_not_submitted(error: &OrderSubmitError) {
 
 fn log_filled(receipt: &OrderReceipt) {
     info!(
-        order_id_hint = %order_id_hint(&receipt.order_id),
+        order_id_hint = %order_id_hint(receipt.order_id.as_str()),
         shares = receipt.filled_shares(),
         usd = receipt.filled_usd(),
         "order fully matched"
@@ -235,9 +235,9 @@ mod tests {
     use super::*;
     use crate::models::{OrderType, PlannedOrder, Side, VenueId};
     use crate::service::execution_ledger::{
-        ExecutionLedger, IntentId, OrderId, OrderSide, PositionId, TokenId, Venue,
+        ExecutionLedger, IntentId, IntentPurpose, OrderId, OrderSide, PositionId, TokenId, Venue,
     };
-    use crate::service::order_gateway::OrderErrorCode;
+    use crate::service::order_gateway::{OrderErrorCode, PrePostJournal};
     use crate::service::position_store::{OpenPosition, PositionStore};
 
     #[tokio::test]
@@ -328,6 +328,9 @@ mod tests {
                     order_type: OrderType::Fok,
                     source_trade_hash: None,
                 },
+                IntentPurpose::Exit {
+                    position_id: position.position_id,
+                },
                 |_receipt| Ok(()),
             )
             .await
@@ -383,6 +386,7 @@ mod tests {
         async fn submit_fok(
             &self,
             _planned: &PlannedOrder,
+            _journal: &dyn PrePostJournal,
         ) -> std::result::Result<OrderReceipt, OrderSubmitError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Err(OrderSubmitError::Uncertain {
